@@ -1,10 +1,14 @@
+use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::ollama::{
     embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, options_to_oai,
     progress_line, staged_blob_path, staged_file, OllamaPullRequest, OllamaPushRequest,
     PushOutcome, StreamedOutcome,
 };
-use super::openai::{apply_reasoning_effort, mlx_embeddings_unsupported_response};
+use super::openai::{
+    apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
+    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
+};
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::*;
@@ -71,7 +75,7 @@ fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
 
 // -- request targets (local backend vs remote provider) -----------------
 
-fn remote_target(base_url: &str) -> Target {
+pub(super) fn remote_target(base_url: &str) -> Target {
     remote_target_on(base_url, Wire::OpenAi)
 }
 
@@ -1212,7 +1216,7 @@ async fn an_unload_is_forwarded_to_every_peer() {
 
 // -- hybrid pairs (one reference, a local and a hosted half) -------------
 
-fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+pub(super) fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in pairs {
         headers.insert(
@@ -1227,8 +1231,8 @@ fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
     crate::hybrid::split_ref(reference).expect("test reference must be a pair")
 }
 
-const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
-const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
+pub(super) const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
+pub(super) const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
 
 /// What comes back is one half's own ordinary reference, with
 /// nothing left for anything downstream to special-case.
@@ -1980,7 +1984,7 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
 
-fn test_state() -> AppState {
+pub(super) fn test_state() -> AppState {
     test_state_at(std::env::temp_dir())
 }
 
@@ -2009,6 +2013,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         runtime: Runtime::Path,
         llama_cpp_version: None,
         vllm_version: None,
+        sglang_version: None,
         ctx_size: None,
         ctx_size_explicit: false,
         hybrid_local_bytes: None,
@@ -2017,6 +2022,7 @@ fn test_inner(store_path: PathBuf) -> Inner {
         split_mode: None,
         num_parallel: None,
         threads: None,
+        cpu_limit: None,
         // usize::MAX, not 0 — 0 now means "admit almost nothing"
         // (see try_admit_against's doc comment), and no test here
         // calls ensure_model (the only caller of try_admit) directly
@@ -2121,6 +2127,8 @@ async fn the_engine_label_names_the_engine_not_the_runtime() {
     for (engine, expected) in [
         (Engine::LlamaServer, "llama-server"),
         (Engine::Vllm, "vllm"),
+        (Engine::VllmOmni, "vllm-omni"),
+        (Engine::Sglang, "sglang"),
         (Engine::Mlx, "mlx"),
     ] {
         assert_eq!(
@@ -2144,6 +2152,10 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
             running_model_fixture_with_engine(Engine::Vllm, None),
         );
         mgr.running.insert(
+            "sglang-model:latest".into(),
+            running_model_fixture_with_engine(Engine::Sglang, Some("sglang-model-latest")),
+        );
+        mgr.running.insert(
             "mlx-model".into(),
             running_model_fixture_with_engine(Engine::Mlx, Some("/cache/mlx-model/abcd")),
         );
@@ -2156,6 +2168,11 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
     assert_eq!(
         backend_wire_model(&state, &Target::Local(0), "vllm-model").await,
         "vllm-model"
+    );
+    // sglang: the colon-free --served-model-name (see sglang_served_model_name).
+    assert_eq!(
+        backend_wire_model(&state, &Target::Local(0), "sglang-model:latest").await,
+        "sglang-model-latest"
     );
     assert_eq!(
             backend_wire_model(&state, &Target::Local(0), "mlx-model").await,
@@ -2229,12 +2246,11 @@ async fn would_use_mlx_is_none_for_an_already_running_non_mlx_model() {
     assert_eq!(would_use_mlx(&state, model_ref).await, None);
 }
 
-/// On any host `use_mlx_for_safetensors` itself doesn't consider
-/// Apple-Silicon-macOS-with-`mlx_lm.server`-on-`PATH` (this test
-/// suite's own CI hosts included), `would_use_mlx` must say `None`
-/// for a model that isn't running yet at all — regardless of
-/// whatever is or isn't actually in the local store for it —
-/// without needing to fake either check to prove it.
+/// `would_use_mlx` must say `None` for a model that isn't running yet
+/// at all: on a host `use_mlx_for_safetensors` rules out (not Apple
+/// Silicon macOS) trivially, and on one it doesn't because the test
+/// state's empty store has nothing to resolve the reference to — in
+/// neither case does it touch a process or install anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn would_use_mlx_is_none_when_not_running_and_this_host_never_uses_mlx() {
     let state = test_state();
@@ -5146,6 +5162,7 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
         .route("/api/chat", echo())
         .route("/api/embed", echo())
         .route("/v1/chat/completions", echo())
+        .route("/gemini/:model/*gemini_path", echo())
         .layer(middleware::from_fn_with_state(state.clone(), record_prompt))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5214,13 +5231,39 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     )
     .await;
 
+    let gemini = r#"{"model":"ignored-body-model","contents":[{"role":"user","parts":[{"text":"describe this"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]}]}"#;
+    let encoded_model = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(PAIR);
+    let base = format!("/gemini/{encoded_model}/v1beta/models/agy-helper-model");
+    assert_eq!(
+        send(&format!("{base}:streamGenerateContent"), gemini, &[]).await,
+        gemini
+    );
+    send(&format!("{base}:countTokens"), gemini, &[]).await;
+    send(
+        "/gemini/invalid!/v1beta/models/m:streamGenerateContent",
+        gemini,
+        &[],
+    )
+    .await;
+
     let entries = crate::promptlog::read(&log).unwrap();
     let _ = std::fs::remove_file(&log);
     let routes: Vec<&str> = entries.iter().map(|e| e.route.as_str()).collect();
-    assert_eq!(routes, ["/api/chat", "/v1/chat/completions"], "{entries:?}");
+    assert_eq!(
+        routes,
+        [
+            "/api/chat",
+            "/v1/chat/completions",
+            "/gemini/:model/*gemini_path"
+        ],
+        "{entries:?}"
+    );
     assert_eq!(entries[0].model, "m");
     assert_eq!(entries[0].prompt, "hello there");
     assert_eq!(entries[0].client.as_deref(), Some("test-agent/1"));
+    assert_eq!(entries[2].model, PAIR);
+    assert_eq!(entries[2].prompt, "describe this");
+    assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
 }
 
 /// An over-limit body is refused as the extractor would refuse it.
@@ -5322,6 +5365,15 @@ async fn a_keyed_daemon_refuses_everything_but_its_own_page_without_the_key() {
         .await
         .unwrap();
     assert_eq!(x_api_key.status(), StatusCode::OK);
+    for (key, expected) in [("k2", StatusCode::OK), ("k3", StatusCode::UNAUTHORIZED)] {
+        let response = client
+            .get(format!("{url}/api/version"))
+            .header("x-goog-api-key", key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
     let scrape = client
         .get(format!("{url}/metrics"))
         .bearer_auth("k2")
@@ -5417,12 +5469,27 @@ async fn the_daemon_key_is_stripped_before_the_handler_sees_the_headers() {
         .get(&url)
         .bearer_auth("daemon-key")
         .header("x-api-key", "daemon-key")
+        .header("x-goog-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .get(&url)
+        .header("x-goog-api-key", "daemon-key")
+        .send()
+        .await
+        .unwrap();
+    client
+        .get(&url)
+        .bearer_auth("daemon-key")
+        .header("x-goog-api-key", "sk-provider")
         .send()
         .await
         .unwrap();
 
     let seen = seen.lock().await;
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 6);
     assert!(seen[0].get("authorization").is_none());
     assert_eq!(client_api_key(Some(&seen[0])), None);
     assert!(seen[1].get("x-api-key").is_none());
@@ -5435,6 +5502,11 @@ async fn the_daemon_key_is_stripped_before_the_handler_sees_the_headers() {
         client_api_key(Some(&seen[2])).as_deref(),
         Some("sk-provider")
     );
+    assert!(seen[3].get("x-goog-api-key").is_none());
+    assert_eq!(client_api_key(Some(&seen[3])), None);
+    assert!(seen[4].get("x-goog-api-key").is_none());
+    assert_eq!(client_api_key(Some(&seen[4])), None);
+    assert_eq!(seen[5]["x-goog-api-key"], "sk-provider");
 }
 
 /// An authenticated caller is the operator, so the daemon's own provider
@@ -5558,12 +5630,14 @@ async fn an_unenforced_policy_strips_its_keys_without_refusing_anyone() {
         .get(&url)
         .bearer_auth("daemon-key")
         .header("x-api-key", "sk-provider")
+        .header("x-goog-api-key", "daemon-key")
         .send()
         .await
         .unwrap();
     assert_eq!(keyed.status(), StatusCode::OK);
     let seen = seen.lock().await;
     assert!(seen[1].get("authorization").is_none());
+    assert!(seen[1].get("x-goog-api-key").is_none());
     assert_eq!(
         client_api_key(Some(&seen[1])).as_deref(),
         Some("sk-provider")

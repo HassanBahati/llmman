@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
+use base64::Engine as _;
 // `HttpBody` is axum's re-export of the `http_body::Body` trait, in
 // scope only for `size_hint` in `track_metrics`.
 use axum::body::{Body, Bytes, HttpBody as _};
@@ -34,6 +35,7 @@ mod anthropic;
 mod auth;
 mod backend;
 mod config;
+mod gemini;
 mod messages;
 mod ollama;
 mod openai;
@@ -46,29 +48,33 @@ mod types;
 mod webui;
 
 use backend::{
-    find_free_port, local_llama_server_bin, spawn_llama_server, spawn_mlx_server,
-    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
-    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args, wait_for_ready, OutputTail,
-    POLL_INTERVAL,
+    find_free_port, local_llama_server_bin, safetensors_engine_from_env,
+    sglang_serve_args_from_env, sglang_served_model_name, spawn_llama_server, spawn_mlx_server,
+    spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server, tail_child_output,
+    use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
+    vllm_serve_args_from_env, wait_for_ready, OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 pub use config::DEFAULT_CTX_SIZE;
 use config::{
-    backend_ctx_size, context_length_from_env, effective_num_parallel, embedding_model_ctx,
-    flash_attention_from_env, gguf_trained_ctx, initial_ctx_size, kv_cache_type_from_env,
-    looks_like_oom, max_loaded_models_from_env, max_queue_from_env, metrics_enabled_from_env,
-    next_ctx_size_after_oom, num_parallel_from_env, sched_spread_from_env, supports_context_shift,
-    threads_from_env_or_host, tls_from_env, MAX_CTX_SHRINK_ATTEMPTS,
+    backend_ctx_size, container_cpu_limit, context_length_from_env, effective_num_parallel,
+    embedding_model_ctx, flash_attention_from_env, gguf_trained_ctx, initial_ctx_size,
+    kv_cache_type_from_env, looks_like_oom, max_loaded_models_from_env, max_queue_from_env,
+    metrics_enabled_from_env, next_ctx_size_after_oom, num_parallel_from_env,
+    sched_spread_from_env, supports_context_shift, threads_from_env_or_host, tls_from_env,
+    MAX_CTX_SHRINK_ATTEMPTS,
 };
+use gemini::{gemini_method, handle_pinned_gemini};
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
     handle_embeddings, handle_ollama_chat, handle_ollama_generate, handle_ps, handle_pull,
     handle_push, handle_show, handle_tags, handle_version,
 };
 use openai::{
-    apply_default_repeat_penalty, forward_openai_request, handle_openai_chat,
-    handle_openai_completions, handle_openai_embeddings, handle_openai_models,
-    proxy_openai_generation, proxy_openai_passthrough, resolve_openai_request,
+    handle_openai_chat, handle_openai_completions, handle_openai_embeddings, handle_openai_images,
+    handle_openai_models, handle_openai_speech, handle_openai_transcriptions,
+    handle_openai_video_get, handle_openai_videos, proxy_openai_generation,
+    proxy_openai_passthrough, TRANSCRIPTION_BODY_LIMIT_BYTES,
 };
 pub use runtime::Runtime;
 use sched::{
@@ -95,7 +101,7 @@ Environment Variables:
       LLMMAN_TLS_CERT                PEM certificate chain to terminate TLS with (with LLMMAN_TLS_KEY)
       LLMMAN_TLS_KEY                 PEM private key for LLMMAN_TLS_CERT
       LLMMAN_TLS_CA                  PEM bundle of extra roots to trust when reaching peers (and, for the CLI, the daemon)
-      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (default 262144 for llama-server)
+      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM/SGLang when set (default 262144 for llama-server)
       LLMMAN_HYBRID_LOCAL_BYTES      Largest request a hybrid pair serves locally, in bytes (0 disables; default: from the context length)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
@@ -104,6 +110,10 @@ Environment Variables:
       LLMMAN_METRICS                 Serve a Prometheus scrape endpoint at /metrics (default: off)
       LLMMAN_MODELS                  The path to the models directory
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
+      LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on Apple Silicon (default: PyPI's current)
+      LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on Apple Silicon, installed at startup; else vllm)
+      LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
+      LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
       LLMMAN_ORIGINS                 A comma separated list of allowed CORS origins
@@ -132,13 +142,14 @@ pub struct ServeArgs {
 
     /// Where the inference engine comes from. `docker`/`podman` (Linux
     /// only) run the ghcr.io/ggml-org/llama.cpp server image for the
-    /// host's GPU, and a vLLM image for safetensors models. `bin`
+    /// host's GPU, and a vLLM image for safetensors models (an SGLang
+    /// one under LLMMAN_SAFETENSORS_ENGINE=sglang). `bin`
     /// downloads llama.cpp's prebuilt `llama-server` for this
     /// OS/arch/GPU. `path` uses the `llama-server` on PATH and never
     /// downloads anything. `auto` tries docker, podman, bin, path in
     /// turn (off Linux: bin, path). The choice is fetched before the
     /// listener binds. Safetensors models outside a container use the
-    /// `vllm`/`mlx_lm.server` on PATH.
+    /// `vllm`/`sglang`/`mlx_lm.server` on PATH.
     #[arg(long, value_enum, default_value = "auto", env = "LLMMAN_RUNTIME")]
     pub runtime: Runtime,
 
@@ -158,13 +169,21 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TAG")]
     pub vllm_version: Option<String>,
 
+    /// With a container runtime and LLMMAN_SAFETENSORS_ENGINE=sglang, pin
+    /// the lmsysorg/sglang image tag (e.g. `v0.5.19`; `-cu129` is added
+    /// for a CUDA 12 driver). For an AMD GPU the value is the whole tag
+    /// (e.g. `v0.5.19-rocm700-mi30x`) and required: upstream has no
+    /// floating one.
+    #[arg(long, value_name = "TAG")]
+    pub sglang_version: Option<String>,
+
     /// Fetch what `--runtime` needs (the container image or the
-    /// `llama-server` release), with its progress on this terminal, then
-    /// exit instead of serving. With a container runtime and an
-    /// already-pulled safetensors MODEL, the vLLM image is fetched too.
-    /// A plain `serve` does the same fetch at startup, but detached with
-    /// its output in a log file, where a slow first pull looks like a
-    /// hang; run this first and the daemon then starts instantly.
+    /// `llama-server` release, plus `uv` and `mlx-lm` on Apple Silicon),
+    /// with its progress on this terminal, then exit instead of serving.
+    /// With a container runtime and an already-pulled safetensors MODEL,
+    /// the vLLM (or SGLang) image is fetched too. A plain `serve` does the
+    /// same fetch at startup, detached with its output in a log file; run
+    /// this first and the daemon then starts instantly.
     #[arg(long)]
     pub pull_only: bool,
 
@@ -206,6 +225,9 @@ struct Inner {
     llama_cpp_version: Option<String>,
     // --vllm-version; only meaningful with a container runtime.
     vllm_version: Option<String>,
+    // --sglang-version; only meaningful with a container runtime and
+    // LLMMAN_SAFETENSORS_ENGINE=sglang.
+    sglang_version: Option<String>,
     // See context_length_from_env's doc comment — forwarded to
     // backends that expose a context-size flag.
     ctx_size: Option<u32>,
@@ -234,10 +256,12 @@ struct Inner {
     // See num_parallel_from_env's doc comment.
     num_parallel: Option<u32>,
     // See threads_from_env_or_host's doc comment. Resolved once at
-    // startup (this daemon's cgroup doesn't change per load) and passed
-    // to every *local* spawn_llama_server call from ensure_model's OOM
-    // retry loop.
+    // startup and passed to every llama-server spawn.
     threads: Option<u32>,
+    // See container_cpu_limit's doc comment: the backend container's
+    // `--cpus`. Snapshotted with `threads` so a later cgroup change
+    // cannot leave the two disagreeing.
+    cpu_limit: Option<f64>,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -304,13 +328,12 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
-    /// `Some(<absolute model directory path>)` only for `Engine::Mlx`,
-    /// `None` for every other engine — see `backend_wire_model`'s own
-    /// doc comment for what this is actually for (the `"model"` field a
-    /// request must carry to reach *this* model on an `mlx_lm.server`
-    /// backend, since it has no `--served-model-name`-equivalent way to
-    /// register a human-readable alias for it up front the way `vllm`
-    /// does).
+    /// The `"model"` field a request must carry to reach this model on
+    /// its backend when that differs from the canonical reference — see
+    /// `backend_wire_model`. `Some(<absolute model directory>)` for
+    /// `Engine::Mlx` (no `--served-model-name` equivalent),
+    /// `Some(sglang_served_model_name(..))` for `Engine::Sglang` (`:` is
+    /// its LoRA separator), `None` otherwise.
     backend_model_path: Option<String>,
 }
 
@@ -342,7 +365,7 @@ impl RunningModel {
     /// container form carries the runtime binary, which would put
     /// `docker` and `podman` in a label for the same engine. A container
     /// reports as whichever engine it runs (llama-server via
-    /// `container::spawn`, vllm via `container::spawn_vllm`).
+    /// `container::spawn`, vllm/sglang via `container::spawn_engine`).
     fn engine_label(&self) -> &'static str {
         match &self.process {
             ModelProcess::Local(engine, _, _) | ModelProcess::Container(_, engine, _) => {
@@ -360,8 +383,14 @@ enum Engine {
     Vllm,
     /// `vllm serve --omni` (the vLLM-Omni plugin) for a [`ModelPath::Omni`]
     /// model. Killed like [`Engine::Vllm`]; its media routes speak a
-    /// different dialect — see [`omni_images`] and [`omni_videos`].
+    /// different dialect — see `omni_images` and `omni_videos`.
     VllmOmni,
+    /// `sglang serve` (or the `lmsysorg/sglang` image) for a
+    /// [`ModelPath::SafeTensors`] directory under
+    /// `LLMMAN_SAFETENSORS_ENGINE=sglang` ([`SafetensorsEngine`]). Killed
+    /// like [`Engine::Vllm`]; addressed like [`Engine::Mlx`]
+    /// ([`RunningModel::backend_model_path`]).
+    Sglang,
     /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
     /// Metal-accelerated alternative to `vllm` for a
     /// [`ModelPath::SafeTensors`] directory, picked instead of it when
@@ -380,17 +409,19 @@ impl Engine {
             Engine::LlamaServer => "llama-server",
             Engine::Vllm => "vllm",
             Engine::VllmOmni => "vllm-omni",
+            Engine::Sglang => "sglang",
             Engine::Mlx => "mlx",
         }
     }
 }
 
 /// A running inference backend: either a local `llama-server`/`vllm`/
-/// `mlx_lm.server` process (killed via `Child::kill_on_drop`, except
-/// `Engine::Vllm` — see this Drop impl) or an attached `docker run`/
-/// `podman run` process running `Engine::LlamaServer` or `Engine::Vllm`,
-/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
-/// can't be forwarded to (and so doesn't stop) the container.
+/// `sglang`/`mlx_lm.server` process (killed via `Child::kill_on_drop`,
+/// except `Engine::Vllm`-like engines — see this Drop impl) or an
+/// attached `docker run`/`podman run` process running
+/// `Engine::LlamaServer`, `Engine::Vllm` or `Engine::Sglang`, gracefully
+/// stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL can't be
+/// forwarded to (and so doesn't stop) the container.
 enum ModelProcess {
     // `Option<u32>` is the pid captured right after spawn, not
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
@@ -421,26 +452,30 @@ impl Drop for ModelProcess {
                     crate::container::stop(pid);
                 }
             }
-            // vllm forks its own API-server/engine-core workers, which
-            // don't share a process tree `kill_on_drop`'s single-pid kill
-            // can reach — SIGKILLing just the top pid (e.g. on a
-            // cancelled load) orphans them, still holding GPU memory
-            // indefinitely. spawn_vllm_server puts this child in its own
-            // process group so the whole group can be killed here.
+            // vllm forks API-server/engine-core workers (sglang a
+            // scheduler and detokenizer) that `kill_on_drop`'s single-pid
+            // kill can't reach — SIGKILLing just the top pid orphans
+            // them, still holding GPU memory. `grouped_command` puts the
+            // child in its own process group so the whole group dies here.
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
+            ModelProcess::Local(
+                engine @ (Engine::Vllm | Engine::VllmOmni | Engine::Sglang),
+                _,
+                pid,
+            ) => {
                 if let Some(pid) = pid {
                     let result = unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                     if result != 0 {
                         let err = std::io::Error::last_os_error();
                         eprintln!(
-                            "[llmman] warning: SIGKILL to vllm process group {pid} failed: {err}"
+                            "[llmman] warning: SIGKILL to {} process group {pid} failed: {err}",
+                            engine.label()
                         );
                     }
                 }
             }
             #[cfg(not(unix))]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, _) => {}
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni | Engine::Sglang, _, _) => {}
             // `mlx_lm.server` runs entirely as one process — a single
             // background generation thread plus a `ThreadingHTTPServer`,
             // no forked worker tree of its own the way vllm has above —
@@ -498,7 +533,7 @@ impl ModelProcess {
                 }
             }
             #[cfg(unix)]
-            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni, _, pid) => {
+            ModelProcess::Local(Engine::Vllm | Engine::VllmOmni | Engine::Sglang, _, pid) => {
                 if let Some(pid) = pid {
                     unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
                 }
@@ -1493,7 +1528,7 @@ const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// Extracts the caller's own API key from a request, in either spelling
 /// the surfaces below accept: `Authorization: Bearer <key>` (OpenAI) or
-/// `x-api-key: <key>` (Anthropic).
+/// `x-api-key: <key>` (Anthropic), or `x-goog-api-key: <key>` (Gemini).
 ///
 /// This is what lets provider routing work against a daemon that is
 /// *already running* — the common case, since `daemon::ensure_server`
@@ -1511,12 +1546,19 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
     // Each candidate is filtered before the choice between them, not
     // after: a client that sends both a placeholder `Authorization` and a
     // real `x-api-key` still has a real key.
-    bearer.or_else(|| {
-        headers
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .and_then(usable)
-    })
+    bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
+        .or_else(|| {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(usable)
+        })
 }
 
 /// Whether a request was made by a browser on some other site's behalf.
@@ -1858,8 +1900,8 @@ async fn local_context_overflow(resp: Response) -> Result<Response, String> {
 /// per-request ctx change, the option only takes effect on a fresh
 /// load: the `check_running` short-circuits below reuse an
 /// already-running instance as-is, never reloading it for a different
-/// thread count. Under a container runtime it is ignored along with the derived
-/// value; see `container::LlamaOptions::threads` for why.
+/// thread count. A backend container gets the same `--threads`, plus
+/// the daemon's CPU limit as `--cpus`; see `container::run_args`.
 async fn ensure_model(
     state: &AppState,
     model_ref: &str,
@@ -2072,6 +2114,7 @@ async fn ensure_model(
             // See ensure_model's `request_threads` doc comment for the
             // full precedence chain this `.or` implements.
             threads: request_threads.or(state.0.threads),
+            cpus: state.0.cpu_limit,
         };
         // Every piped child gets an output tail for crash reasons; only
         // llama-server ones join the OOM retry loop below, whose
@@ -2079,9 +2122,9 @@ async fn ensure_model(
         let mut stderr_tail: Option<OutputTail> = None;
         let mut oom_retryable = false;
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+        // Per load, like use_mlx_for_safetensors, which it gates.
+        let safetensors_engine = safetensors_engine_from_env();
         process = match (&model_path, state.0.runtime.ociman()) {
-            // container::spawn ignores llama_opts.threads; see that
-            // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2111,6 +2154,7 @@ async fn ensure_model(
                     &state.0.cache_path,
                     state.0.llama_cpp_version.as_deref(),
                     port,
+                    state.0.cpu_limit,
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
                 oom_retryable = true;
@@ -2123,30 +2167,63 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
             // Container runtimes are Linux-only and mlx Metal-only, so
-            // this never competes with the mlx arm.
+            // this never competes with the mlx arm. vllm unless
+            // LLMMAN_SAFETENSORS_ENGINE=sglang.
             (ModelPath::SafeTensors(dir), Some(ociman)) => {
-                let mut child = crate::container::spawn_vllm(
+                let sglang = safetensors_engine == SafetensorsEngine::Sglang;
+                let (engine, container_engine, version) = if sglang {
+                    (
+                        Engine::Sglang,
+                        crate::container::ContainerEngine::Sglang,
+                        state.0.sglang_version.as_deref(),
+                    )
+                } else {
+                    (
+                        Engine::Vllm,
+                        crate::container::ContainerEngine::Vllm,
+                        state.0.vllm_version.as_deref(),
+                    )
+                };
+                let mut child = crate::container::spawn_engine(
                     ociman,
-                    crate::container::ContainerEngine::Vllm,
+                    container_engine,
                     dir,
-                    state.0.vllm_version.as_deref(),
+                    version,
                     port,
+                    state.0.cpu_limit,
                     |model_dir, host| {
-                        vllm_serve_args(model_dir, host, port, model_ref, max_model_len)
+                        if sglang {
+                            sglang_serve_args_from_env(
+                                model_dir,
+                                host,
+                                port,
+                                model_ref,
+                                max_model_len,
+                            )
+                        } else {
+                            vllm_serve_args_from_env(
+                                model_dir,
+                                host,
+                                port,
+                                model_ref,
+                                max_model_len,
+                            )
+                        }
                     },
                 )?;
                 stderr_tail = Some(tail_child_output(&mut child));
-                ModelProcess::Container(ociman, Engine::Vllm, child)
+                ModelProcess::Container(ociman, engine, child)
             }
             // Diffusers-layout models go to vLLM-Omni (`vllm serve --omni`),
             // never to plain vllm or mlx, which cannot load one.
             (ModelPath::Omni(dir), Some(ociman)) => {
-                let mut child = crate::container::spawn_vllm(
+                let mut child = crate::container::spawn_engine(
                     ociman,
                     crate::container::ContainerEngine::VllmOmni,
                     dir,
                     state.0.vllm_version.as_deref(),
                     port,
+                    state.0.cpu_limit,
                     |model_dir, host| {
                         vllm_omni_serve_args_from_env(model_dir, host, port, model_ref)
                     },
@@ -2159,6 +2236,17 @@ async fn ensure_model(
                 stderr_tail = Some(tail);
                 let pid = child.id();
                 ModelProcess::Local(Engine::VllmOmni, child, pid)
+            }
+            // An explicit engine choice also disables the mlx preference
+            // (see use_mlx_for_safetensors).
+            (ModelPath::SafeTensors(dir), None)
+                if safetensors_engine == SafetensorsEngine::Sglang =>
+            {
+                let (child, tail) =
+                    spawn_sglang_server(dir, port, model_ref, max_model_len).await?;
+                stderr_tail = Some(tail);
+                let pid = child.id();
+                ModelProcess::Local(Engine::Sglang, child, pid)
             }
             (ModelPath::SafeTensors(_dir), None) if use_mlx_for_safetensors() => {
                 let child = spawn_mlx_server(port).await?;
@@ -2245,14 +2333,11 @@ async fn ensure_model(
     }
     eprintln!("[llmman] {model_ref} ready on port {port}");
 
-    // See RunningModel::backend_model_path's own doc comment — only
-    // meaningful for Engine::Mlx, which is the only engine
-    // spawn_mlx_server deliberately doesn't preload via `--model` for
-    // (see its own doc comment), so every request must instead carry
-    // this exact directory as its own "model" field.
-    let backend_model_path = match &process {
-        ModelProcess::Local(Engine::Mlx, _, _) => model_path.path().to_str().map(|s| s.to_string()),
-        _ => None,
+    // See RunningModel::backend_model_path.
+    let backend_model_path = match process.engine() {
+        Engine::Mlx => model_path.path().to_str().map(|s| s.to_string()),
+        Engine::Sglang => Some(sglang_served_model_name(model_ref)),
+        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
     };
 
     let mut mgr = state.0.manager.lock().await;
@@ -2287,11 +2372,9 @@ async fn ensure_model(
 /// The `"model"` value to actually put in the JSON request body sent to
 /// `canonical_model`'s backend process — `canonical_model` itself
 /// (`ensure_model`'s return value, already the exact name every other
-/// engine needs — see its own doc comment) for everything except a
-/// running `Engine::Mlx` backend, for which it's that model's real
-/// on-disk directory path instead (`RunningModel::backend_model_path` —
-/// see `spawn_mlx_server`'s doc comment for why `mlx_lm.server` needs
-/// that rather than a human-readable name at all).
+/// engine needs — see its own doc comment) unless the running backend
+/// registered it differently (`RunningModel::backend_model_path`: an
+/// `Engine::Mlx` directory path, an `Engine::Sglang` colon-free name).
 ///
 /// Every caller must apply this only to the request forwarded to the
 /// backend — client-facing response bodies (an Ollama chunk's `model`
@@ -3340,472 +3423,6 @@ async fn configured_provider_models(
     }
 }
 
-// -- OpenAI media generation (/v1/images/generations, /v1/videos,
-//    /v1/audio/speech) --------------------------------------------------------
-//
-// Pass-throughs to a diffusion model's backend (crate::mediagen::server),
-// like handle_openai_embeddings — except for an `Engine::VllmOmni`
-// backend; see omni_images and omni_videos.
-
-async fn handle_openai_images(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    handle_openai_media(&state, &headers, body, "/v1/images/generations").await
-}
-
-async fn handle_openai_videos(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    handle_openai_media(&state, &headers, body, "/v1/videos").await
-}
-
-/// [`proxy_openai_passthrough`], but translated for a vLLM-Omni backend.
-async fn handle_openai_media(
-    state: &AppState,
-    headers: &HeaderMap,
-    body: Bytes,
-    route: &str,
-) -> Result<Response, AppError> {
-    let (req, target, activity, override_) = resolve_openai_request(state, headers, body).await?;
-    if local_engine(state, &target).await == Some(Engine::VllmOmni) {
-        return if route == "/v1/videos" {
-            omni_videos(state, &target, req, activity).await
-        } else {
-            omni_images(state, &target, req, activity).await
-        };
-    }
-    forward_openai_request(state, headers, req, target, activity, override_, route).await
-}
-
-/// The engine behind a [`Target::Local`]; `None` for anything else, or a
-/// backend unloaded since `ensure_model` (the request then fails on its own).
-async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
-    let Target::Local(port) = target else {
-        return None;
-    };
-    let mgr = state.0.manager.lock().await;
-    mgr.running
-        .values()
-        .find(|m| m.port == *port)
-        .map(|m| m.process.engine())
-}
-
-// -- vLLM-Omni media dialect --------------------------------------------------
-//
-// `llmman run` and crate::mediagen speak llama-server's image API
-// (`width`/`height`/`steps`/`cfg_scale`, streamed `image_generation.*`
-// events, a synchronous `/v1/videos` job with a `content_url`). vLLM-Omni
-// speaks OpenAI's (`size`, `num_inference_steps`, `guidance_scale`, no
-// image streaming, a multipart asynchronous `/v1/videos`). Fields a
-// client did not send are not invented — the model's defaults apply.
-
-/// llama-server image fields renamed to vLLM-Omni's; `stream` removed and
-/// returned (vLLM-Omni's text-to-image does not stream). `Err` names a
-/// request that cannot be expressed: one dimension without the other
-/// (llama-server fills in a default; vLLM-Omni's `size` needs both).
-fn omni_image_request(mut req: serde_json::Value) -> Result<(serde_json::Value, bool), String> {
-    let stream = req["stream"].as_bool().unwrap_or(false);
-    let Some(obj) = req.as_object_mut() else {
-        return Ok((req, stream));
-    };
-    obj.remove("stream");
-    let dim = |v: Option<serde_json::Value>| v.and_then(|v| v.as_u64()).filter(|n| *n > 0);
-    let (width, height) = (dim(obj.remove("width")), dim(obj.remove("height")));
-    match (width, height) {
-        (Some(w), Some(h)) if !obj.contains_key("size") => {
-            obj.insert("size".into(), serde_json::json!(format!("{w}x{h}")));
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("vLLM-Omni needs both width and height, or neither".into());
-        }
-        _ => {}
-    }
-    for (llama, omni) in [
-        ("steps", "num_inference_steps"),
-        ("cfg_scale", "guidance_scale"),
-    ] {
-        if let Some(v) = obj.remove(llama) {
-            if !obj.contains_key(omni) && v.as_f64().is_some_and(|n| n > 0.0) {
-                obj.insert(omni.into(), v);
-            }
-        }
-    }
-    if !obj.contains_key("response_format") {
-        obj.insert("response_format".into(), "b64_json".into());
-    }
-    Ok((req, stream))
-}
-
-/// `POST /v1/images/generations` on a vLLM-Omni backend. A streaming
-/// client gets one `image_generation.completed` event per image; a
-/// non-streaming one gets vLLM-Omni's response as is.
-async fn omni_images(
-    state: &AppState,
-    target: &Target,
-    req: serde_json::Value,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    let (req, stream) = match omni_image_request(req) {
-        Ok(ok) => ok,
-        Err(m) => {
-            drop(activity);
-            return Err(AppError::status(StatusCode::BAD_REQUEST, m));
-        }
-    };
-    let resp = state
-        .0
-        .client
-        .post(target.url("/v1/images/generations"))
-        .json(&req)
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    if !stream || !resp.status().is_success() {
-        return Ok(relay(resp, activity));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .context("decode vllm-omni image response")?;
-    let created = body["created"]
-        .as_i64()
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let mut events = String::new();
-    for image in body["data"].as_array().into_iter().flatten() {
-        let ev = serde_json::json!({
-            "type": "image_generation.completed",
-            "b64_json": image["b64_json"],
-            "revised_prompt": image["revised_prompt"],
-            "created_at": created,
-        });
-        events.push_str(&format!("data: {ev}\n\n"));
-    }
-    drop(activity);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from(events))
-        .context("build image event stream")?)
-}
-
-/// Form fields for vLLM-Omni's `/v1/videos` from a JSON body: llama-server
-/// names renamed (`steps`, `cfg_scale`, `frames`, `audio`), fractional
-/// `seconds` rounded to the whole seconds it takes, everything else by
-/// name (objects as JSON text, which is how it reads `extra_params`).
-fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
-    let Some(obj) = req.as_object() else {
-        return Vec::new();
-    };
-    let renamed = |name: &str| match name {
-        "steps" => Some("num_inference_steps"),
-        "cfg_scale" => Some("guidance_scale"),
-        "frames" => Some("num_frames"),
-        "audio" => Some("generate_sound"),
-        _ => None,
-    };
-    let text = |value: &serde_json::Value| match value {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    };
-    let mut fields: Vec<(String, String)> = Vec::new();
-    // Native names first, so an explicit one wins over its alias.
-    for (name, value) in obj {
-        if matches!(name.as_str(), "stream" | "response_format") || renamed(name).is_some() {
-            continue;
-        }
-        let value = if name == "seconds" {
-            match value.as_f64().or_else(|| value.as_str()?.parse().ok()) {
-                Some(s) if s > 0.0 => {
-                    serde_json::Value::String((s.round().max(1.0) as u64).to_string())
-                }
-                _ => continue,
-            }
-        } else {
-            value.clone()
-        };
-        if let Some(text) = text(&value) {
-            fields.push((name.clone(), text));
-        }
-    }
-    for (name, value) in obj {
-        let Some(native) = renamed(name) else {
-            continue;
-        };
-        if fields.iter().any(|(existing, _)| existing == native) {
-            continue;
-        }
-        if let Some(text) = text(value) {
-            fields.push((native.to_string(), text));
-        }
-    }
-    fields
-}
-
-/// A `multipart/form-data` body of text fields and its `content-type`.
-/// Both come from the caller: a name that is not a plain identifier is
-/// dropped (it would be written into a header), and the boundary is
-/// re-salted until no value contains it.
-fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
-    let fields: Vec<&(String, String)> = fields
-        .iter()
-        .filter(|(name, _)| {
-            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        })
-        .collect();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let boundary = (0u32..)
-        .map(|salt| format!("----llmman{}{stamp:x}{salt:x}", std::process::id()))
-        .find(|b| !fields.iter().any(|(_, v)| v.contains(b.as_str())))
-        .unwrap_or_default();
-    let mut body = Vec::new();
-    for (name, value) in fields {
-        body.extend_from_slice(
-            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (body, format!("multipart/form-data; boundary={boundary}"))
-}
-
-/// How often [`omni_videos`] polls the job, and how long before it gives up.
-const OMNI_VIDEO_POLL: Duration = Duration::from_secs(1);
-const OMNI_VIDEO_MAX_WAIT: Duration = Duration::from_secs(60 * 60);
-
-/// `POST /v1/videos` on a vLLM-Omni backend: submit the multipart job,
-/// poll `GET /v1/videos/{id}` until `completed`/`failed`, answer with the
-/// job plus the `content_url` [`handle_openai_video_get`] serves.
-async fn omni_videos(
-    state: &AppState,
-    target: &Target,
-    req: serde_json::Value,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    let (body, content_type) = multipart_form(&omni_video_fields(&req));
-    let resp = state
-        .0
-        .client
-        .post(target.url("/v1/videos"))
-        .header("content-type", content_type)
-        .body(body)
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    if !resp.status().is_success() {
-        return Ok(relay(resp, activity));
-    }
-    let mut job: serde_json::Value = resp.json().await.context("decode vllm-omni video job")?;
-    let id = job["id"]
-        .as_str()
-        .context("vllm-omni video job has no id")?
-        .to_string();
-    let poll_url = target.url(&format!("/v1/videos/{id}"));
-    let deadline = Instant::now() + OMNI_VIDEO_MAX_WAIT;
-    while !matches!(job["status"].as_str(), Some("completed" | "failed")) {
-        if Instant::now() >= deadline {
-            drop(activity);
-            return Err(AppError::status(
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("video job {id} did not finish within {OMNI_VIDEO_MAX_WAIT:?}"),
-            ));
-        }
-        sleep(OMNI_VIDEO_POLL).await;
-        let resp = state
-            .0
-            .client
-            .get(&poll_url)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .with_context(|| format!("poll video job {id} on {}", target.describe()))?;
-        // A failed job comes back as its own error status and JSON body.
-        if !resp.status().is_success() {
-            return Ok(relay(resp, activity));
-        }
-        job = resp.json().await.context("decode vllm-omni video job")?;
-    }
-    drop(activity);
-    if job["status"] == "failed" {
-        let message = job["error"]["message"]
-            .as_str()
-            .unwrap_or("video generation failed")
-            .to_string();
-        let body = serde_json::json!({
-            "error": { "message": message, "type": "server_error" }
-        });
-        return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response());
-    }
-    job["content_url"] = serde_json::json!(format!("/v1/videos/{id}/content"));
-    Ok(Json(job).into_response())
-}
-
-/// `GET /v1/videos/:id[/content]`: a completed video lives in the
-/// backend that generated it, and the job id names no model — so this
-/// asks every running local backend in turn and relays the first answer
-/// that is not a 404.
-async fn handle_openai_video_get(
-    State(state): State<AppState>,
-    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Result<Response, AppError> {
-    let ports: Vec<u16> = {
-        let mgr = state.0.manager.lock().await;
-        mgr.running.values().map(|m| m.port).collect()
-    };
-    let path = uri.path();
-    // all backends at once, so one stalled backend does not delay the rest
-    let probes = ports.into_iter().map(|port| {
-        state
-            .0
-            .client
-            .get(format!("http://127.0.0.1:{port}{path}"))
-            .timeout(Duration::from_secs(30))
-            .send()
-    });
-    let found = futures::future::join_all(probes)
-        .await
-        .into_iter()
-        .flatten()
-        .find(|r| r.status() != reqwest::StatusCode::NOT_FOUND);
-    if let Some(resp) = found {
-        let status = resp.status();
-        let mut builder = Response::builder().status(status);
-        for name in ["content-type", "content-disposition"] {
-            if let Some(v) = resp.headers().get(name) {
-                builder = builder.header(name, v);
-            }
-        }
-        let stream = resp
-            .bytes_stream()
-            .map(|item| item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
-        return Ok(builder
-            .body(Body::from_stream(stream))
-            .context("build video response")?);
-    }
-    let body = serde_json::json!({
-        "error": { "message": "video not found", "type": "not_found_error" }
-    });
-    Ok((StatusCode::NOT_FOUND, Json(body)).into_response())
-}
-
-async fn handle_openai_speech(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    proxy_openai_passthrough(&state, &headers, body, "/v1/audio/speech").await
-}
-
-// -- OpenAI Audio Transcriptions API (/v1/audio/transcriptions) -------------
-//
-// llama-server has its own native implementation (requires the model to
-// be loaded with mtmd audio support via a companion --mmproj — see
-// ModelPath::mmproj), so this is a plain pass-through like
-// handle_openai_responses. The request body is multipart/form-data, not
-// JSON, so resolve_openai_request's "parse as JSON to find model" doesn't apply —
-// multipart_text_field below extracts just the model field instead.
-
-/// Axum's own default `DefaultBodyLimit` (2 MiB) is well under a typical
-/// audio file's size — real recordings routinely run tens of MiB — so
-/// both transcription routes below opt out of it in favor of this
-/// higher cap instead of disabling it outright.
-const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
-
-/// Extracts a top-level form field's text value from a
-/// `multipart/form-data` body, or `None` if not multipart / no boundary /
-/// field not found.
-async fn multipart_text_field(
-    body: &Bytes,
-    headers: &HeaderMap,
-    field_name: &str,
-) -> Option<String> {
-    let content_type = headers.get("content-type")?.to_str().ok()?;
-    let boundary = multer::parse_boundary(content_type).ok()?;
-    // Single-chunk stream over a cheap Bytes clone — the body is already
-    // fully buffered, so there's nothing to actually stream.
-    let stream = futures::stream::once(async { Ok::<_, std::io::Error>(body.clone()) });
-    let mut multipart = multer::Multipart::new(stream, boundary);
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some(field_name) {
-            return field.text().await.ok();
-        }
-    }
-    None
-}
-
-async fn handle_openai_transcriptions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    let Some(model) = multipart_text_field(&body, &headers, "model")
-        .await
-        .filter(|m| !m.is_empty())
-    else {
-        // A malformed request, not a server-side failure — matches
-        // handle_pull's own "missing required field" convention instead
-        // of AppError's blanket 500.
-        let body = serde_json::json!({
-            "error": "transcription request is missing a required \"model\" form field"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
-    };
-    // A pair takes its local half whatever its size: audio bodies are
-    // past any byte budget, and the check below rules a provider out
-    // anyway. An explicit cloud pin still fails with that same message.
-    let model = match crate::hybrid::split_ref(&model) {
-        Some(pair) => {
-            let side = match request_pin(Some(&headers))? {
-                Some(crate::hybrid::Side::Cloud) => crate::hybrid::Side::Cloud,
-                _ => crate::hybrid::Side::Local,
-            };
-            eprintln!(
-                "[llmman] hybrid {:?} + {:?} -> {} (transcription)",
-                pair.local,
-                pair.remote_ref(),
-                side.as_str()
-            );
-            pair.side_ref(side)
-        }
-        None => model,
-    };
-    // Every other surface rewrites `model` to the provider's own id
-    // before forwarding, but this body is multipart, not JSON: the raw
-    // relay below would hand the provider a reference it has never heard
-    // of. Refuse in llmman's own words rather than let that surface as
-    // someone else's "unknown model".
-    if crate::providers::is_remote_ref(&model) {
-        let body = serde_json::json!({
-            "error": "llmman does not route /v1/audio/transcriptions to a provider — \
-                      use a locally served model with audio support"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
-    }
-    let (_, target, guard) = ensure_model(&state, &model, Some(&headers), None).await?;
-    // No `keep_alive` field on this API surface either — see
-    // resolve_openai_request's own comment on the same choice.
-    let activity = begin_activity(guard, None).await;
-    proxy(
-        &state.0.client,
-        &target,
-        "/v1/audio/transcriptions",
-        &headers,
-        body,
-        activity,
-    )
-    .await
-}
-
 // -- OpenAI Responses API (/v1/responses) ------------------------------------
 //
 // llama-server (llama.cpp) has its own native /v1/responses implementation
@@ -4160,126 +3777,6 @@ fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
     }
 }
 
-// -- Anthropic /v1/messages --------------------------------------------------
-
-/// The Anthropic Messages surface. The body is kept raw until the target
-/// is known: a [`Wire::Anthropic`] provider gets it relayed as sent (see
-/// [`relay_anthropic_messages`]); anything else gets it translated into
-/// a chat completion and the reply back (see [`messages`]).
-async fn handle_anthropic_messages(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    let raw: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        AppError(
-            anyhow!("parse Anthropic request: {e}"),
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
-    let model_ref = raw["model"].as_str().unwrap_or("").to_string();
-    // No `request_threads`: the Anthropic Messages API has no Ollama
-    // options blob, so there is no num_thread to forward.
-    send_with_hybrid_fallback(
-        &state,
-        &model_ref,
-        Some(&headers),
-        None,
-        |model, target, guard| anthropic_messages_to(&state, &headers, &raw, model, target, guard),
-    )
-    .await
-}
-
-/// [`handle_anthropic_messages`] against one resolved target. The
-/// response echoes the client's own `model` back, unchanged from before.
-async fn anthropic_messages_to(
-    state: &AppState,
-    headers: &HeaderMap,
-    raw: &serde_json::Value,
-    canonical_model: String,
-    target: Target,
-    guard: ActivityGuard,
-) -> Result<Response, AppError> {
-    // The Anthropic Messages API has no `keep_alive` field of its own —
-    // `None` leaves it untouched, same as the OpenAI-compatible surface
-    // (see resolve_openai_request's own comment on why).
-    let activity = begin_activity(guard, None).await;
-
-    // See backend_wire_model's own doc comment — usually just
-    // canonical_model itself, but a different value for an Engine::Mlx
-    // backend or a remote provider.
-    let wire_model = backend_wire_model(state, &target, &canonical_model).await;
-
-    if target.is_anthropic() {
-        return relay_anthropic_messages(
-            &state.0.client,
-            &target,
-            headers,
-            raw,
-            &wire_model,
-            activity,
-        )
-        .await;
-    }
-
-    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
-    let bad_request = |e| AppError(e, StatusCode::BAD_REQUEST);
-    let streaming = messages::streaming(raw).map_err(bad_request)?;
-    let (mut chat_req, tool_names) =
-        messages::from_messages_request(raw, &wire_model).map_err(bad_request)?;
-    if repeat_penalty_applies(&target) {
-        apply_default_repeat_penalty(&mut chat_req);
-    }
-    let upstream = send_chat_completion(&state.0.client, &target, &chat_req, &wire_model).await?;
-    let body = chat_body(&target, upstream).await?;
-
-    let converter = messages::StreamConverter::new(&client_model, tool_names);
-    Ok(convert_upstream(body, activity, converter, streaming).await)
-}
-
-/// Headers a `/v1/messages` caller sets for the provider: opt-in
-/// features and the API version it wrote against. Its credential is not
-/// among them (see `Target::authorize`).
-const ANTHROPIC_PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-beta", "anthropic-version"];
-
-/// `/v1/messages` to a provider that speaks it: relayed as sent, with
-/// only `model` rewritten out and back. Claude Code's cache breakpoints,
-/// thinking and betas, which the [`messages`] translation has no
-/// chat-completion form for, reach a provider intact.
-async fn relay_anthropic_messages(
-    client: &Client,
-    target: &Target,
-    headers: &HeaderMap,
-    raw: &serde_json::Value,
-    wire_model: &str,
-    activity: ActivityGuard,
-) -> Result<Response, AppError> {
-    let client_model = raw["model"].as_str().unwrap_or_default().to_string();
-    let streaming = raw["stream"].as_bool().unwrap_or(false);
-    let mut body = raw.clone();
-    body["model"] = serde_json::Value::String(wire_model.to_string());
-
-    // `headers()` replaces the `authorize` default; `header()` would
-    // append a second `anthropic-version`.
-    let mut passthrough = HeaderMap::new();
-    for name in ANTHROPIC_PASSTHROUGH_HEADERS {
-        if let Some(value) = headers.get(name) {
-            passthrough.insert(name, value.clone());
-        }
-    }
-    let resp = target
-        .authorize(client.post(target.url(anthropic::MESSAGES_ROUTE)))
-        .headers(passthrough)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("proxy request to {}", target.describe()))?;
-    if streaming {
-        return Ok(relay_stream_rewriting_model(resp, activity, client_model));
-    }
-    relay_rewriting_model(resp, activity, &client_model).await
-}
-
 // ---------------------------------------------------------------------------
 // Option extractors from Ollama options blob
 // ---------------------------------------------------------------------------
@@ -4468,6 +3965,8 @@ async fn track_metrics(req: Request, next: Next) -> Response {
 /// extractor the handlers use, so the size limit and its 413 are
 /// unchanged; the handler then reads it back from memory.
 async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    use axum::extract::FromRequestParts;
+
     let Some(log) = state.0.prompt_log.as_deref() else {
         return next.run(req).await;
     };
@@ -4485,7 +3984,27 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
     }) else {
         return next.run(req).await;
     };
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    let selected_model = if route == "/gemini/:model/*gemini_path" {
+        let model = UrlPath::<(String, String)>::from_request_parts(&mut parts, &())
+            .await
+            .ok()
+            .filter(|UrlPath((_, path))| {
+                gemini_method(path).is_some_and(|(_, method)| method.generates())
+            })
+            .and_then(|UrlPath((encoded_model, _))| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded_model)
+                    .ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let Some(model) = model else {
+            return next.run(Request::from_parts(parts, body)).await;
+        };
+        Some(model)
+    } else {
+        None
+    };
     let body = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
@@ -4494,7 +4013,10 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         .headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
-    if let Some(entry) = crate::promptlog::entry(&route, &body, client, now_rfc3339()) {
+    if let Some(mut entry) = crate::promptlog::entry(&route, &body, client, now_rfc3339()) {
+        if let Some(model) = selected_model {
+            entry.model = model;
+        }
         if let Err(e) = crate::promptlog::append(log, &entry) {
             eprintln!("[llmman] warning: prompt log {}: {e}", log.display());
         }
@@ -4773,8 +4295,12 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
+        // Native Gemini compatibility. The public route accepts a model in
+        // Gemini's normal API path; the AGY route pins AGY's auxiliary calls
+        // to the model chosen by `llmman launch agy`.
+        .route("/gemini/:model/*gemini_path", post(handle_pinned_gemini))
         // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages));
+        .route("/v1/messages", post(anthropic::handle_anthropic_messages));
 
     // Applied only when the operator asked for metrics. Nothing can read
     // the store while the endpoint is absent — enabling it needs a
@@ -4877,9 +4403,14 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
     let model_ref = crate::shortnames::resolve_ollama_api(model)?;
     let store_path = default_store()?;
     let format = crate::modelpack::stored_format(&store_path, &model_ref).with_context(|| {
-        format!("--pull-only: pull {model_ref} first to learn which image it needs")
+        format!("--pull-only: pull {model_ref} first to learn which backend it needs")
     })?;
     Ok(match format {
+        crate::modelpack::ModelFormat::SafeTensors
+            if safetensors_engine_from_env() == SafetensorsEngine::Sglang =>
+        {
+            crate::container::ContainerEngine::Sglang
+        }
         crate::modelpack::ModelFormat::SafeTensors => crate::container::ContainerEngine::Vllm,
         crate::modelpack::ModelFormat::Omni => crate::container::ContainerEngine::VllmOmni,
         crate::modelpack::ModelFormat::Gguf | crate::modelpack::ModelFormat::Diffusion => {
@@ -4890,7 +4421,10 @@ fn pull_only_engine(model: Option<&str>) -> anyhow::Result<crate::container::Con
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let requested = _args.runtime;
-    if requested == Runtime::Path && _args.pull_only {
+    // Startup installs mlx_lm.server under any local runtime on Apple
+    // Silicon (below), so `--pull-only` has work even under `path`.
+    let installs_mlx = use_mlx_for_safetensors();
+    if requested == Runtime::Path && _args.pull_only && !installs_mlx {
         anyhow::bail!("--pull-only: --runtime path runs the llama-server on PATH; nothing to pull");
     }
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
@@ -4905,13 +4439,41 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .await
             .context("resolve runtime task panicked")??
     };
+
+    // Likewise uv and mlx-lm, rather than inside the first safetensors
+    // request (minutes behind a client's first-token spinner). Cheap once
+    // installed. A failure is not fatal to a daemon that may only serve
+    // GGUF: the first MLX load retries and reports it. Under `--pull-only`
+    // it is the whole point.
+    if resolved.ociman().is_none() && installs_mlx {
+        let installed = tokio::task::spawn_blocking(crate::mlx_release::ensure_mlx_server)
+            .await
+            .context("ensure mlx_lm.server task panicked")?;
+        match installed {
+            Ok(_) => {}
+            Err(e) if _args.pull_only => return Err(e.context("install mlx-lm")),
+            Err(e) => eprintln!(
+                "[llmman] warning: could not install mlx-lm at startup ({e:#}); \
+                 the first safetensors model load will retry it"
+            ),
+        }
+    }
+
     if _args.pull_only {
         if let Some(ociman) = resolved.ociman() {
             // resolve() pulled the llama.cpp image; a safetensors MODEL
-            // needs vLLM's too.
+            // needs vLLM's (or SGLang's) too.
             let engine = pull_only_engine(_args.model.as_deref())?;
-            if engine != crate::container::ContainerEngine::LlamaServer {
-                crate::container::pull_image(ociman, engine, _args.vllm_version.as_deref())?;
+            let version = match engine {
+                crate::container::ContainerEngine::LlamaServer => None,
+                crate::container::ContainerEngine::Sglang => Some(_args.sglang_version.as_deref()),
+                crate::container::ContainerEngine::Vllm
+                | crate::container::ContainerEngine::VllmOmni => {
+                    Some(_args.vllm_version.as_deref())
+                }
+            };
+            if let Some(version) = version {
+                crate::container::pull_image(ociman, engine, version)?;
             }
         }
         return Ok(());
@@ -4973,18 +4535,30 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    // See threads_from_env_or_host's doc comment. Resolved once here
-    // rather than per load, and logged so a surprising thread count is
-    // explainable from the startup output. Only the local spawn path
-    // consumes the derived value, so don't log it under a container
-    // runtime (that arm deliberately ignores it).
+    // Resolved once and logged, so a surprising thread count or
+    // container limit is explainable from the startup output.
+    let cpu_limit = container_cpu_limit();
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        if runtime.ociman().is_none() {
-            eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
-        }
+        eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
+    }
+    if let (Some(n), Some(_)) = (cpu_limit, runtime.ociman()) {
+        eprintln!("[llmman] backend container gets --cpus {n} (this daemon's own CPU limit)");
+    }
+
+    // Logged at startup so a typo is reported before the first request.
+    let chosen = match safetensors_engine_from_env() {
+        SafetensorsEngine::Auto => None,
+        SafetensorsEngine::Vllm => Some("vllm"),
+        SafetensorsEngine::Sglang => Some("sglang"),
+    };
+    if let Some(engine) = chosen {
+        eprintln!(
+            "[llmman] safetensors models go to {engine} ({})",
+            backend::SAFETENSORS_ENGINE_VAR
+        );
     }
 
     // Before anything binds, so a misconfiguration fails at exec.
@@ -5021,10 +4595,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // deleted, exactly the situation /api/version exists to expose.
         exe: std::env::current_exe()
             .ok()
-            .map(|p| p.canonicalize().unwrap_or(p)),
+            .map(|p| dunce::canonicalize(&p).unwrap_or(p)),
         runtime,
         llama_cpp_version,
         vllm_version: _args.vllm_version.clone(),
+        sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
         hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
@@ -5033,6 +4608,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         split_mode: sched_spread_from_env(),
         num_parallel: num_parallel_from_env(),
         threads,
+        cpu_limit,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         peers,
