@@ -139,10 +139,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 // local model just pulled.
                 Some((provider, hosted)) => {
                     check_provider_supported(name)?;
-                    // A pair routes by request size (`hybrid::route`) and
-                    // an image usually clears the local budget, landing on
-                    // the hosted half, whose modality llmman never checked.
-                    vision = false;
                     let per_request =
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
                     let (remote, api_key) =
