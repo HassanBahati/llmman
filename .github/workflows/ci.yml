@@ -1,6 +1,6 @@
 name: CI
 
-# No `tags:` trigger: every commit on main is a release, and the `release`
+# No `tags:` trigger: every commit on main is a release, and the `tag`
 # job creates the v<version> tag itself (see packaging/version.sh).
 on:
   push:
@@ -12,11 +12,9 @@ on:
   # still requires a push to main.
   workflow_dispatch:
 
-# Workflow-wide default: read-only. Every job here only needs to check
-# out and build/test the repo except `release`, which needs to create a
-# GitHub Release — that one job overrides this with its own
-# `permissions: contents: write` (see the release job below) rather than
-# every job inheriting broad default repo permissions for no reason.
+# Workflow-wide default: read-only. Only `tag`, `release` and `untag`
+# write to the repo (the release tag and the GitHub Release); they set
+# their own `permissions: contents: write`.
 permissions:
   contents: read
 
@@ -345,7 +343,7 @@ jobs:
 
       # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
-        run: shellcheck packaging/version.sh packaging/render.sh
+        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -1582,6 +1580,43 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
+  # Tag: v<version> on this commit, as soon as the run starts. GITHUB_TOKEN
+  # can only create a ref whose .github/workflows/ matches main's tip (see
+  # packaging/release-tag.sh), so when `release` did this an hour after
+  # the push, any merge touching ci.yml in between failed it with a 403
+  # (v0.1.389, .396, .409-.411). Now the commit is the tip, bar a merge
+  # landing before this job gets a runner. `untag` removes the tag if the
+  # release never happens.
+  # --------------------------------------------------------------------------
+  tag:
+    name: Tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    outputs:
+      tag_name: ${{ steps.version.outputs.tag_name }}
+
+    steps:
+      # fetch-depth: 0 for the commit count.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine version and tag
+        id: version
+        run: echo "tag_name=v$(packaging/version.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
+
+  # --------------------------------------------------------------------------
   # Release: a GitHub Release per commit on main, tagged v<version> where
   # version = packaging/version.sh's MAJOR.MINOR.<commit count>. The build
   # job compiled with that version in Cargo.toml, so the binaries report
@@ -1594,7 +1629,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [build, lint-packaging, e2e]
+    needs: [tag, build, lint-packaging, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -1622,6 +1657,16 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag_name=v$version" >> "$GITHUB_OUTPUT"
           echo "Releasing llmman $version as tag v$version"
+
+      # The tag job made this; check it is still here and at this commit
+      # before the Releases API would try to create it itself. Recreating
+      # it (after `untag` ran and the failed jobs were re-run) works only
+      # while ci.yml is unchanged on main.
+      - name: Verify release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: packaging/release-tag.sh ensure "$TAG" "$GITHUB_SHA"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -1722,6 +1767,7 @@ jobs:
               ' > release-notes.md
           cat release-notes.md
 
+      # The tag exists, so this creates no ref (the call that used to 403).
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -1733,6 +1779,33 @@ jobs:
           files: |
             dist/llmman-*
             dist/checksums.txt
+
+  # --------------------------------------------------------------------------
+  # No release, no tag: a failed or cancelled run must not leave
+  # v<version> on an unreleased commit. Leaves a tag that has a release
+  # (an upload failure is fixed by re-running). Deleting a ref is not
+  # subject to the workflows restriction.
+  # --------------------------------------------------------------------------
+  untag:
+    name: Remove unreleased tag
+    needs: [tag, release]
+    # always(): also after a cancellation. Skipped unless `tag` made one.
+    if: always() && needs.tag.result == 'success' && needs.release.result != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag_name }}
+        run: packaging/release-tag.sh remove "$TAG" "$GITHUB_SHA"
 
   # --------------------------------------------------------------------------
   # docker.io/ai/llmman: each ghcr.io/ggml-org/llama.cpp server image
