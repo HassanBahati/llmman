@@ -178,6 +178,7 @@ installed:
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
+| `goose` | Block goose | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
