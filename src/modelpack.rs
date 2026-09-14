@@ -279,7 +279,7 @@ fn named_blob_path(
         return Ok(blob);
     };
     // absolute: LLMMAN_MODELS may be relative
-    let blob = blob.canonicalize()?;
+    let blob = dunce::canonicalize(&blob)?;
     let dir = cache_path.join(digest_hex(&layer.digest)?);
     std::fs::create_dir_all(&dir)?;
     let link = dir.join(name);
@@ -513,7 +513,7 @@ fn no_servable_layer(model_ref: &str, manifest: &crate::storage::oci::Manifest) 
     } else {
         anyhow!(
             "no servable model layer in {model_ref} — found {exts:?} files; \
-             llmman serve supports GGUF (llama-server) and safetensors (vllm/vllm-omni/mlx)"
+             llmman serve supports GGUF (llama-server) and safetensors (vllm/vllm-omni/sglang/mlx)"
         )
     }
 }

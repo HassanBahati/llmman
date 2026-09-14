@@ -68,8 +68,7 @@ base_url = "http://gpubox:8000/v1"
 
 ```console
 $ llmman config set providers.gpubox.base_url http://gpubox:8000/v1
-$ llmman providers gpubox
-PROVIDER    NAME      API KEY    KEY            MODELS
+$ llmman providers | grep gpubox
 gpubox      gpubox    -          none needed    -
 $ llmman list --provider gpubox                # asks the box's own /models
 $ llmman launch opencode --provider gpubox --model qwen3-coder
@@ -180,6 +179,7 @@ installed:
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
+| `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
 | `cline` | Cline | no: it picks its own model rather than taking llmman's |
 | `kimi` | Kimi Code CLI | no: it picks its own model rather than taking llmman's |
