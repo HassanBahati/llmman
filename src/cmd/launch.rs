@@ -84,8 +84,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     );
 
     // The local model's thinking controls (see `opencode_variants`) and
-    // whether it takes images (see `write_dsh_settings`, `opencode_config`);
-    // a provider's model has neither a template nor a manifest to read.
+    // whether it takes images (see `write_dsh_settings`); a provider's
+    // model has neither a template nor a manifest to read.
     let mut thinking = None;
     let mut vision = false;
     let (model, api_key) = match provider {
@@ -772,8 +772,8 @@ fn opencode_config(
         output: &'static [&'static str],
     }
 
-    // opencode assumes a model it doesn't know is text-only; claiming
-    // images for one that is would send what the daemon rejects.
+    // Declare image input for a vision model so opencode will attach
+    // images; a text-only model gets neither key.
     let modalities = vision.then_some(Modalities {
         input: &["text", "image"],
         output: &["text"],
