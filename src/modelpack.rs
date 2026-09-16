@@ -374,15 +374,18 @@ pub fn chat_template(
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
 ) -> Option<String> {
-    if let Some((primary, _)) = gguf_layers(manifest) {
-        let path = raw_blob_path(store_path, primary)
-            .ok()
-            .filter(|p| blob_is_gguf(p))
-            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
-        return crate::gguf::read_info(&path)
-            .ok()?
-            .str("tokenizer.chat_template")
-            .map(str::to_string);
+    let gguf = gguf_info(store_path, cache_path, manifest);
+    chat_template_with(store, gguf.as_ref(), manifest)
+}
+
+/// [`chat_template`] with the GGUF header already read by [`gguf_info`].
+pub fn chat_template_with(
+    store: &OciStore,
+    gguf: Option<&crate::gguf::Info>,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<String> {
+    if gguf_layers(manifest).is_some() {
+        return gguf?.str("tokenizer.chat_template").map(str::to_string);
     }
     let file = |name: &str| {
         manifest
@@ -416,28 +419,28 @@ pub fn chat_template(
     }
 }
 
-/// `general.architecture` and `<arch>.context_length` from the primary
-/// GGUF's header, keyed as Ollama's `model_info` keys them; empty for a
-/// model that isn't GGUF or a header without them.
-pub fn model_info(
+/// The primary GGUF's header, from the blob as stored or a tar layer
+/// already extracted; `None` for a non-GGUF model or an unreadable header.
+pub fn gguf_info(
     store_path: &Path,
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    let Some((primary, _)) = gguf_layers(manifest) else {
-        return map;
-    };
-    let info = raw_blob_path(store_path, primary)
+) -> Option<crate::gguf::Info> {
+    let (primary, _) = gguf_layers(manifest)?;
+    let path = raw_blob_path(store_path, primary)
         .ok()
         .filter(|p| blob_is_gguf(p))
-        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))
-        .and_then(|path| crate::gguf::read_info(&path).ok());
-    if let Some(info) = &info {
-        if let (Some(arch), Some(context_length)) = (info.architecture(), info.context_length()) {
-            map.insert("general.architecture".into(), arch.into());
-            map.insert(format!("{arch}.context_length"), context_length.into());
-        }
+        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
+/// `general.architecture` and `<arch>.context_length`, keyed as Ollama's
+/// `model_info` keys them; empty for a header without them.
+pub fn model_info(info: &crate::gguf::Info) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    if let (Some(arch), Some(context_length)) = (info.architecture(), info.context_length()) {
+        map.insert("general.architecture".into(), arch.into());
+        map.insert(format!("{arch}.context_length"), context_length.into());
     }
     map
 }
@@ -934,13 +937,14 @@ mod tests {
             .push(store.write_blob(HF_GGUF_MEDIA_TYPE, &bytes).unwrap());
         let no_cache = store.root().join("no-cache");
 
+        let info = gguf_info(store.root(), &no_cache, &m).expect("a readable header");
         assert_eq!(
-            serde_json::Value::from(model_info(store.root(), &no_cache, &m)),
+            serde_json::Value::from(model_info(&info)),
             serde_json::json!({ "general.architecture": "llama", "llama.context_length": 4096 })
         );
 
         let (other, safetensors) = manifest_with(vec![descriptor("sha256:a", "model.safetensors")]);
-        assert!(model_info(other.root(), &no_cache, &safetensors).is_empty());
+        assert!(gguf_info(other.root(), &no_cache, &safetensors).is_none());
     }
 
     #[test]

@@ -230,14 +230,16 @@ pub(super) async fn handle_show(
     })?;
     let manifest = store.read_manifest(&desc.digest)?;
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
-    let template = crate::modelpack::chat_template(
-        &store,
-        &state.0.store_path,
-        &state.0.cache_path,
-        &manifest,
-    );
+    let gguf = crate::modelpack::gguf_info(&state.0.store_path, &state.0.cache_path, &manifest);
+    let template = crate::modelpack::chat_template_with(&store, gguf.as_ref(), &manifest);
+    let mut model_info = gguf
+        .as_ref()
+        .map(crate::modelpack::model_info)
+        .unwrap_or_default();
+    model_info.insert("digest".into(), desc.digest.clone().into());
+    model_info.insert("size".into(), desc.size.into());
     Ok(Json(OllamaShowResponse {
-        model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
+        model_info: model_info.into(),
         details: OllamaModelDetails {
             format: "gguf".into(),
             family: String::new(),
