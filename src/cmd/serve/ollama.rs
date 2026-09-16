@@ -230,32 +230,19 @@ pub(super) async fn handle_show(
     })?;
     let manifest = store.read_manifest(&desc.digest)?;
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
-    let gguf = crate::modelpack::gguf_info(&state.0.store_path, &state.0.cache_path, &manifest);
-    let template = crate::modelpack::chat_template_with(&store, gguf.as_ref(), &manifest);
-    let mut model_info = gguf
-        .as_ref()
-        .map(crate::modelpack::model_info)
-        .unwrap_or_default();
-    model_info.insert("digest".into(), desc.digest.clone().into());
-    model_info.insert("size".into(), desc.size.into());
+    let template = crate::modelpack::chat_template(
+        &store,
+        &state.0.store_path,
+        &state.0.cache_path,
+        &manifest,
+    );
     Ok(Json(OllamaShowResponse {
-        model_info: model_info.into(),
+        model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
         details: OllamaModelDetails {
             format: "gguf".into(),
-            family: gguf
-                .as_ref()
-                .and_then(|i| i.architecture())
-                .unwrap_or_default()
-                .to_string(),
-            parameter_size: gguf
-                .as_ref()
-                .filter(|i| i.parameter_count > 0)
-                .map(|i| crate::fmt::human_count(i.parameter_count))
-                .unwrap_or_default(),
-            quantization_level: gguf
-                .as_ref()
-                .and_then(|i| i.quantization.clone())
-                .unwrap_or_default(),
+            family: String::new(),
+            parameter_size: String::new(),
+            quantization_level: String::new(),
         },
         capabilities,
         template,

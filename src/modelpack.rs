@@ -374,18 +374,15 @@ pub fn chat_template(
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
 ) -> Option<String> {
-    let gguf = gguf_info(store_path, cache_path, manifest);
-    chat_template_with(store, gguf.as_ref(), manifest)
-}
-
-/// [`chat_template`] with the GGUF header already read by [`gguf_info`].
-pub fn chat_template_with(
-    store: &OciStore,
-    gguf: Option<&crate::gguf::Info>,
-    manifest: &crate::storage::oci::Manifest,
-) -> Option<String> {
-    if gguf_layers(manifest).is_some() {
-        return gguf?.str("tokenizer.chat_template").map(str::to_string);
+    if let Some((primary, _)) = gguf_layers(manifest) {
+        let path = raw_blob_path(store_path, primary)
+            .ok()
+            .filter(|p| blob_is_gguf(p))
+            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+        return crate::gguf::read_info(&path)
+            .ok()?
+            .str("tokenizer.chat_template")
+            .map(str::to_string);
     }
     let file = |name: &str| {
         manifest
@@ -419,50 +416,28 @@ pub fn chat_template_with(
     }
 }
 
-/// The primary GGUF's header, from the stored blob or an already-extracted
-/// tar layer; `None` for a non-GGUF model or an unreadable header.
-pub fn gguf_info(
+/// `general.architecture` and `<arch>.context_length` from the primary
+/// GGUF's header, keyed as Ollama's `model_info` keys them; empty for a
+/// model that isn't GGUF or a header without them.
+pub fn model_info(
     store_path: &Path,
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
-) -> Option<crate::gguf::Info> {
-    let (primary, _) = gguf_layers(manifest)?;
-    let path = raw_blob_path(store_path, primary)
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let Some((primary, _)) = gguf_layers(manifest) else {
+        return map;
+    };
+    let info = raw_blob_path(store_path, primary)
         .ok()
         .filter(|p| blob_is_gguf(p))
-        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
-    crate::gguf::read_info(&path).ok()
-}
-
-/// Ollama's `model_info`: a GGUF header's scalar metadata plus
-/// `general.parameter_count`, without arrays or the chat template.
-pub fn model_info(info: &crate::gguf::Info) -> serde_json::Map<String, serde_json::Value> {
-    use crate::gguf::Value as G;
-    let mut map: serde_json::Map<String, serde_json::Value> = info
-        .metadata
-        .iter()
-        .filter(|(key, _)| key.as_str() != "tokenizer.chat_template")
-        .filter_map(|(key, value)| {
-            let json = match value {
-                G::String(s) => s.clone().into(),
-                G::Bool(b) => (*b).into(),
-                G::I8(n) => i64::from(*n).into(),
-                G::I16(n) => i64::from(*n).into(),
-                G::I32(n) => i64::from(*n).into(),
-                G::I64(n) => (*n).into(),
-                G::F32(f) => serde_json::Number::from_f64(f64::from(*f))?.into(),
-                G::F64(f) => serde_json::Number::from_f64(*f)?.into(),
-                G::Array(_) => return None,
-                unsigned => unsigned.as_u64()?.into(),
-            };
-            Some((key.clone(), json))
-        })
-        .collect();
-    if info.parameter_count > 0 {
-        map.insert(
-            "general.parameter_count".into(),
-            info.parameter_count.into(),
-        );
+        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))
+        .and_then(|path| crate::gguf::read_info(&path).ok());
+    if let Some(info) = &info {
+        if let (Some(arch), Some(context_length)) = (info.architecture(), info.context_length()) {
+            map.insert("general.architecture".into(), arch.into());
+            map.insert(format!("{arch}.context_length"), context_length.into());
+        }
     }
     map
 }
@@ -950,54 +925,22 @@ mod tests {
     }
 
     #[test]
-    fn gguf_info_reads_the_header_of_a_stored_gguf_blob() {
+    fn model_info_is_the_context_length_of_a_stored_gguf() {
         let (store, mut m) = manifest_with(vec![]);
         let file = crate::gguf::write_test_gguf_with(&[]);
         let bytes = std::fs::read(&file).unwrap();
         std::fs::remove_file(&file).ok();
         m.layers
             .push(store.write_blob(HF_GGUF_MEDIA_TYPE, &bytes).unwrap());
-
         let no_cache = store.root().join("no-cache");
-        let info = gguf_info(store.root(), &no_cache, &m).expect("a readable header");
-        assert_eq!(info.context_length(), Some(4096));
+
+        assert_eq!(
+            serde_json::Value::from(model_info(store.root(), &no_cache, &m)),
+            serde_json::json!({ "general.architecture": "llama", "llama.context_length": 4096 })
+        );
 
         let (other, safetensors) = manifest_with(vec![descriptor("sha256:a", "model.safetensors")]);
-        assert!(gguf_info(other.root(), &no_cache, &safetensors).is_none());
-    }
-
-    #[test]
-    fn model_info_is_the_scalar_metadata_and_the_parameter_count() {
-        use crate::gguf::Value as G;
-        let mut info = crate::gguf::Info::default();
-        for (key, value) in [
-            ("general.architecture", G::String("llama".into())),
-            ("llama.context_length", G::U32(4096)),
-            ("llama.rope.freq_base", G::F32(10000.0)),
-            ("llama.attention.sliding_window", G::I32(-1)),
-            ("tokenizer.ggml.add_bos_token", G::Bool(true)),
-            (
-                "tokenizer.ggml.tokens",
-                G::Array(vec![G::String("a".into())]),
-            ),
-            (
-                "tokenizer.chat_template",
-                G::String("{{ messages }}".into()),
-            ),
-        ] {
-            info.metadata.insert(key.into(), value);
-        }
-        info.parameter_count = 8_030_261_248;
-
-        let map = model_info(&info);
-        assert_eq!(map["general.architecture"], "llama");
-        assert_eq!(map["llama.context_length"], 4096);
-        assert_eq!(map["llama.rope.freq_base"], 10000.0);
-        assert_eq!(map["llama.attention.sliding_window"], -1);
-        assert_eq!(map["tokenizer.ggml.add_bos_token"], true);
-        assert_eq!(map["general.parameter_count"], 8_030_261_248u64);
-        assert!(!map.contains_key("tokenizer.ggml.tokens"));
-        assert!(!map.contains_key("tokenizer.chat_template"));
+        assert!(model_info(other.root(), &no_cache, &safetensors).is_empty());
     }
 
     #[test]
