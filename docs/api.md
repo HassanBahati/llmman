@@ -64,7 +64,10 @@ works too.
 `think` is `true`/`false` or a level (`minimal`, `low`, `medium`,
 `high`, `xhigh`, `max`), forwarded as llama-server's
 `chat_template_kwargs`. `/api/show` returns `capabilities` and, for a
-local model with one, `template`.
+local model with one, `template`. For a GGUF model, `model_info` has the
+header's metadata, including `<arch>.context_length` (the trained context;
+`LLMMAN_CONTEXT_LENGTH` may serve less), and `details` its family,
+parameter size and quantization.
 
 `/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such

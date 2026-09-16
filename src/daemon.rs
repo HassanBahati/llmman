@@ -1116,9 +1116,20 @@ pub struct ShowResponse {
     /// The model's chat template, if any (see `crate::modelpack::chat_template`).
     #[serde(default)]
     pub template: Option<String>,
+    /// The GGUF header's metadata (see `crate::modelpack::model_info`).
+    #[serde(default)]
+    pub model_info: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ShowResponse {
+    /// The trained `<arch>.context_length`; the daemon may serve less.
+    pub fn context_length(&self) -> Option<u64> {
+        let arch = self.model_info.get("general.architecture")?.as_str()?;
+        self.model_info
+            .get(&format!("{arch}.context_length"))?
+            .as_u64()
+    }
+
     /// The template's thinking controls; `None` without a template.
     pub fn thinking_controls(&self) -> Option<crate::chat_template::ThinkingControls> {
         self.template
@@ -1449,6 +1460,23 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_response_context_length_reads_the_architectures_key() {
+        let show = |body: serde_json::Value| -> ShowResponse {
+            serde_json::from_value(body).expect("valid show response")
+        };
+        let gguf = show(serde_json::json!({ "model_info": {
+            "general.architecture": "qwen3",
+            "qwen3.context_length": 40960,
+            "llama.context_length": 4096,
+        }}));
+        assert_eq!(gguf.context_length(), Some(40960));
+        // No architecture, or an older daemon without model_info.
+        let no_arch = show(serde_json::json!({ "model_info": { "qwen3.context_length": 40960 } }));
+        assert_eq!(no_arch.context_length(), None);
+        assert_eq!(show(serde_json::json!({})).context_length(), None);
+    }
 
     /// The two locality questions differ on exactly one host, and it is
     /// the one that matters: a wildcard bind is reached over loopback
