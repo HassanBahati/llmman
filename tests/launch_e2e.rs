@@ -5,8 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `qwen`, `hermes`, `openclaw`,
-//! `dsh`, `goose`) — not mocks.
+//! (`claude`, `agy`, `opencode`, `codex`, `grok`, `qwen`, `hermes`,
+//! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -613,6 +613,7 @@ fn run_launch(
         // send the settings `launch qwen` writes past this `HOME`, and on
         // Windows `dirs::home_dir` reads neither `HOME` nor `USERPROFILE`.
         .env("QWEN_HOME", home.join(".qwen"))
+        .env("GROK_HOME", home.join(".grok"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
         // auto-approving an agent's writes is the user's call.
@@ -666,7 +667,26 @@ const MAX_ATTEMPTS: u32 = 3;
 /// sampling variance, not an llmman regression, so it must not turn CI
 /// red on its own.
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    launch_and_assert_with(integration, extra_args, |_stderr| false, |_stdout| false);
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        |_stderr| false,
+        |_stdout| false,
+        false,
+    );
+}
+
+/// [`launch_and_assert`], but exhausting the attempts without a `pong`
+/// is a test failure. Used where the integration is expected to be
+/// deterministic enough that a zero exit without inference is not success.
+fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        |_stderr| false,
+        |_stdout| false,
+        true,
+    );
 }
 
 /// [`launch_and_assert`], for a CLI that reports failure without a
@@ -677,7 +697,13 @@ fn launch_and_assert_rejecting(
     extra_args: &[&str],
     reject_stdout: impl Fn(&str) -> bool,
 ) {
-    launch_and_assert_with(integration, extra_args, |_stderr| false, reject_stdout);
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        |_stderr| false,
+        reject_stdout,
+        false,
+    );
 }
 
 /// [`launch_and_assert`], generalized with an extra tolerated failure
@@ -694,16 +720,24 @@ fn launch_and_assert_tolerating(
     extra_args: &[&str],
     tolerate_stderr: impl Fn(&str) -> bool,
 ) {
-    launch_and_assert_with(integration, extra_args, tolerate_stderr, |_stdout| false);
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        tolerate_stderr,
+        |_stdout| false,
+        false,
+    );
 }
 
 /// The shared body: `tolerate_stderr` widens what a nonzero exit may be,
-/// `reject_stdout` narrows what a zero exit may be.
+/// `reject_stdout` narrows what a zero exit may be, and `strict` makes
+/// exhausting the sampling attempts a test failure.
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
     tolerate_stderr: impl Fn(&str) -> bool,
     reject_stdout: impl Fn(&str) -> bool,
+    strict: bool,
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -780,6 +814,11 @@ fn launch_and_assert_with(
     } else {
         "a missing \"pong\" (or a known non-llmman-caused failure)"
     };
+    assert!(
+        !strict,
+        "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` gave up via {why}\n\
+         {last_failure}"
+    );
     eprintln!(
         "[test] {integration}: WARNING — gave up via {why} only (sampling variance, not an \
          llmman regression — see launch_and_assert's doc comment); does not fail this test. \
@@ -889,6 +928,27 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_grok_with_model() {
+    eprintln!("[test] launch_grok_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_grok_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("grok") {
+        eprintln!("skipping: grok not on PATH — https://x.ai/cli");
+        return;
+    }
+
+    // `-p <prompt>` is Grok Build's headless, single-turn mode. This
+    // exercises its real model-catalog fetch and Chat Completions request
+    // against llmman's `/v1` endpoint, using the model table llmman writes
+    // into Grok's config.
+    launch_and_assert_strict("grok", &["-p", PROMPT]);
 }
 
 #[test]
