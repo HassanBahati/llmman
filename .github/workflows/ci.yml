@@ -46,6 +46,10 @@ env:
   # (Linux) and MLX runtime (macOS) come from the repo's own
   # pyproject_cpu.toml / pyproject_other.toml.
   SGLANG_VERSION: "0.5.19"
+  # Official Grok Build CLI used by launch_e2e's real `launch grok` test.
+  # Pinned because its command-line and custom-model contracts are what
+  # the test verifies; bump deliberately and rerun the launch suite.
+  GROK_CLI_VERSION: "1.0.34"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -550,7 +554,7 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|codex|qwen|hermes|openclaw|dsh|goose> --model
+  # <claude|agy|opencode|codex|grok|qwen|hermes|openclaw|dsh|goose> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -581,7 +585,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/codex/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/codex/grok/qwen/hermes/openclaw/dsh/goose, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -917,6 +921,41 @@ jobs:
             fi
           done
           echo "::error::goose never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
+
+      # Grok Build's official installer supports every E2E target and puts
+      # the binary in GROK_BIN_DIR. No login is needed: launch_grok supplies
+      # the local endpoint and placeholder/API key for each test process.
+      - name: Install Grok Build (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          bin_dir="$HOME/.grok/bin"
+          bin="$bin_dir/grok"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            if ! curl -fsSL https://x.ai/cli/install.sh \
+              | GROK_BIN_DIR="$bin_dir" bash -s "$GROK_CLI_VERSION"; then
+              echo "::warning::grok install failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif version_output=$("$bin" --version 2>&1); then
+              if command -v cygpath >/dev/null 2>&1; then
+                cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+              else
+                echo "$bin_dir" >> "$GITHUB_PATH"
+              fi
+              exit 0
+            else
+              echo "::warning::grok installed but \"grok --version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::grok never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
 
       # Pinned official AGY release; verify each runner's archive before installing.
