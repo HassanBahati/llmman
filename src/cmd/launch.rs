@@ -592,8 +592,8 @@ fn launch(
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, extra_args),
-        "codex" => launch_codex(model, api_key, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
+        "codex" => launch_codex(model, api_key, vision, extra_args),
         "cline" => launch_simple("cline", model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -639,11 +639,13 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants.
+/// /v1 endpoint, with the model's thinking variants and, for a vision
+/// model, image input.
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
+    vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
@@ -654,6 +656,7 @@ fn launch_opencode(
         effective_model,
         api_key,
         &opencode_variants(thinking),
+        vision,
     );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
@@ -711,6 +714,7 @@ fn opencode_config(
     model: &str,
     api_key: &str,
     variants: &[(&'static str, serde_json::Value)],
+    vision: bool,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -757,7 +761,23 @@ fn opencode_config(
         name: &'a str,
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
         variants: &'a [(&'static str, serde_json::Value)],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modalities: Option<Modalities>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attachment: Option<bool>,
     }
+    #[derive(serde::Serialize)]
+    struct Modalities {
+        input: &'static [&'static str],
+        output: &'static [&'static str],
+    }
+
+    // Declare image input for a vision model so opencode will attach
+    // images; a text-only model gets neither key.
+    let modalities = vision.then_some(Modalities {
+        input: &["text", "image"],
+        output: &["text"],
+    });
 
     let config = Config {
         schema: "https://opencode.ai/config.json",
@@ -774,6 +794,8 @@ fn opencode_config(
                     Model {
                         name: model,
                         variants,
+                        modalities,
+                        attachment: vision.then_some(true),
                     },
                 )],
             },
@@ -785,9 +807,14 @@ fn opencode_config(
 
 /// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
 /// ollama provider pointing at our /v1 endpoint.
-fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_codex(
+    model: &str,
+    api_key: &str,
+    vision: bool,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config()?;
+    write_codex_config(model, vision)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -826,7 +853,7 @@ fn launch_codex(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
 /// leftover copy of that table is stripped from `config.toml` first, then
 /// the real settings are (re)written to the profile overlay file codex
 /// actually reads.
-fn write_codex_config() -> anyhow::Result<()> {
+fn write_codex_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let config_dir = home.join(".codex");
     std::fs::create_dir_all(&config_dir)?;
@@ -838,24 +865,88 @@ fn write_codex_config() -> anyhow::Result<()> {
         }
     }
 
+    // Without a model there is nothing to describe; codex keeps its defaults.
+    let catalog_path = config_dir.join("llmman-model.json");
+    let catalog = (!model.is_empty()).then(|| {
+        write_codex_file(&catalog_path, &codex_model_catalog(model, vision))
+            .map(|()| catalog_path.clone())
+    });
+    let catalog = catalog.transpose()?;
+
     let profile_path = config_dir.join("llmman.config.toml");
-    let contents = codex_profile(&daemon::server());
-    // Avoid rewriting (and bumping the mtime of) a file that's already
-    // correct.
-    if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
-        std::fs::write(&profile_path, contents)?;
+    write_codex_file(
+        &profile_path,
+        &codex_profile(&daemon::server(), catalog.as_deref()),
+    )
+}
+
+/// Writes `contents` to `path` unless it already holds exactly that.
+fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
     }
-    Ok(())
+    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
+/// The catalog's `context_window` without `LLMMAN_CONTEXT_LENGTH`; ollama's
+/// fallback too.
+const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
+
+fn codex_context_window() -> u64 {
+    std::env::var("LLMMAN_CONTEXT_LENGTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+}
+
+/// The `model_catalog_json` for `model`, declaring its image input in
+/// `input_modalities`. The other fields are ones codex requires, valued
+/// as ollama's `buildCodexModelEntry` does.
+fn codex_model_catalog(model: &str, vision: bool) -> String {
+    let input: &[&str] = if vision {
+        &["text", "image"]
+    } else {
+        &["text"]
+    };
+    let entry = serde_json::json!({
+        "slug": model,
+        "display_name": model,
+        "context_window": codex_context_window(),
+        "shell_type": "default",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "truncation_policy": { "mode": "bytes", "limit": 10000 },
+        "input_modalities": input,
+        "base_instructions": "",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "supports_parallel_tool_calls": false,
+        "supports_reasoning_summaries": false,
+        "supported_reasoning_levels": [],
+        "experimental_supported_tools": [],
+    });
+    let catalog = serde_json::json!({ "models": [entry] });
+    serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
 }
 
 /// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
 /// own rather than `openai_base_url` on codex's built-in one, which codex
 /// treats as WebSocket-capable and so opened every session with five
 /// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
-fn codex_profile(server: &str) -> String {
+fn codex_profile(server: &str, catalog: Option<&Path>) -> String {
+    // A JSON string is also a valid TOML string.
+    let catalog = catalog
+        .map(|p| {
+            let quoted = serde_json::Value::from(p.display().to_string());
+            format!("model_catalog_json = {quoted}\n")
+        })
+        .unwrap_or_default();
     format!(
         "# Written by `llmman launch codex`; edits are overwritten.\n\
          model_provider = \"llmman\"\n\
+         {catalog}\
          \n\
          [model_providers.llmman]\n\
          name = \"llmman\"\n\
@@ -2429,7 +2520,13 @@ model = \"gpt-5\"
     #[test]
     fn opencode_config_lists_the_variants_in_order() {
         let variants = opencode_variants(None);
-        let text = opencode_config("http://127.0.0.1:17434", "qwen3.5:0.8b", "k", &variants);
+        let text = opencode_config(
+            "http://127.0.0.1:17434",
+            "qwen3.5:0.8b",
+            "k",
+            &variants,
+            false,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
         assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
@@ -2453,15 +2550,31 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[]);
+        let bare = opencode_config("http://h", "m", "k", &[], false);
         assert!(!bare.contains("variants"), "{bare}");
+    }
+
+    #[test]
+    fn opencode_config_declares_image_input_only_for_a_vision_model() {
+        let text = opencode_config("http://h", "m", "k", &[], true);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let model = &config["provider"]["ollama"]["models"]["m"];
+        assert_eq!(
+            model["modalities"],
+            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
+        );
+        assert_eq!(model["attachment"], true);
+
+        let text_only = opencode_config("http://h", "m", "k", &[], false);
+        assert!(!text_only.contains("modalities"), "{text_only}");
+        assert!(!text_only.contains("attachment"), "{text_only}");
     }
 
     #[test]
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
         let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[]))
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false))
                 .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
@@ -2506,7 +2619,7 @@ model = \"gpt-5\"
 
     #[test]
     fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
-        let profile: toml::Value = codex_profile("http://127.0.0.1:17434")
+        let profile: toml::Value = codex_profile("http://127.0.0.1:17434", None)
             .parse()
             .expect("valid TOML");
         assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
@@ -2521,6 +2634,56 @@ model = \"gpt-5\"
         assert!(
             profile.get("openai_base_url").is_none(),
             "the built-in openai provider is not the one in use"
+        );
+        assert!(
+            profile.get("model_catalog_json").is_none(),
+            "no model, no catalog to point at"
+        );
+    }
+
+    #[test]
+    fn codex_profile_names_the_catalog_it_was_given() {
+        let path = PathBuf::from("/home/we\"ird/.codex/llmman-model.json");
+        let profile: toml::Value = codex_profile("http://h", Some(&path))
+            .parse()
+            .expect("valid TOML");
+        assert_eq!(
+            profile["model_catalog_json"].as_str(),
+            Some(path.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog("m", true)).expect("valid JSON");
+        let entry = &catalog["models"][0];
+        assert_eq!(
+            entry["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(entry["slug"], "m");
+        assert_eq!(entry["display_name"], "m");
+        // Fields codex requires of an entry.
+        for key in [
+            "context_window",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "truncation_policy",
+            "support_verbosity",
+            "supported_reasoning_levels",
+            "experimental_supported_tools",
+        ] {
+            assert!(entry.get(key).is_some(), "missing {key}");
+        }
+
+        let text_only: serde_json::Value =
+            serde_json::from_str(&codex_model_catalog("m", false)).expect("valid JSON");
+        assert_eq!(
+            text_only["models"][0]["input_modalities"],
+            serde_json::json!(["text"])
         );
     }
 
