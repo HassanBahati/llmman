@@ -82,6 +82,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
     );
+    // Offer to install a missing integration before starting the daemon
+    // and pulling the model.
+    ensure_installed(name)?;
 
     // The local model's thinking controls (see `opencode_variants`) and
     // whether it takes images (see `write_dsh_settings`); a provider's
@@ -523,8 +526,8 @@ const INTEGRATIONS: &[Integration] = &[
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        // An integration with an npm package resolves to npx when it
-        // isn't installed, and that launch downloads it first.
+        // dsh resolves to npx when it isn't installed (see `find_dsh`),
+        // and that launch downloads the package before running it.
         let how = match find_integration_binary(i) {
             Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
             Some(_) => "",
@@ -571,21 +574,217 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 }
 
 /// The binary `launch` will run for `i`, so the listing does not report
-/// as missing what the launcher would find: an install, else the `npx`
-/// that stands in for an npm-published one.
+/// as missing what the launcher would find: `PATH`, then what the
+/// launcher knows.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
-    find_integration_command(i.name, i.binary).map(|(bin, _)| bin)
-}
-
-/// An install: `PATH`, then the locations the launcher itself knows.
-fn find_installed(name: &str, binary: &str) -> Option<PathBuf> {
-    match name {
+    match i.name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
+        "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
         "grok" => find_grok(),
-        _ => find_on_path(binary),
+        _ => find_on_path(i.binary),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Install on demand
+// ---------------------------------------------------------------------------
+
+/// Installs a missing integration with its official installer. Ported
+/// from ollama's `cmd/launch/opencode.go` and `cmd/launch/qwen.go`.
+struct Installer {
+    /// Name shown in the prompt.
+    display: &'static str,
+    /// Finds the integration's binary. Checked before and after installing.
+    find: fn() -> Option<PathBuf>,
+    /// Binaries the installer needs, each with where to get it.
+    deps: &'static [(&'static str, &'static str)],
+    /// The command that runs the installer.
+    program: &'static str,
+    args: &'static [&'static str],
+    /// Install command printed when there is no terminal to prompt on.
+    manual: &'static str,
+    /// Whether to put a no-op binary first on the installer's `PATH`; see
+    /// [`write_install_shim`].
+    shim: bool,
+}
+
+const CURL: (&str, &str) = ("curl", "curl: https://curl.se/");
+const BASH: (&str, &str) = ("bash", "bash: https://www.gnu.org/software/bash/");
+const NPM: (&str, &str) = ("npm", "npm (Node.js): https://nodejs.org/");
+const POWERSHELL: (&str, &str) = (
+    "powershell",
+    "PowerShell: https://learn.microsoft.com/powershell/",
+);
+
+/// Qwen Code's installers start qwen when they finish (`exec qwen` in the
+/// `.sh`, `call qwen` in the `.bat`). These commands remove that step
+/// before running them, since llmman launches qwen itself afterwards.
+const QWEN_INSTALL_SH: &str = "set -o pipefail; curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | sed '/log_info \"Starting Qwen Code...\"/,/exec qwen/d' | bash";
+const QWEN_INSTALL_BAT: &str = r#"$installer = Join-Path $env:TEMP 'install-qwen.bat'; Invoke-WebRequest -UseBasicParsing -Uri 'https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat' -OutFile $installer; $content = Get-Content -Raw -Path $installer; $content = $content -replace '(?m)^\s*call qwen\s*$', 'REM call qwen'; Set-Content -Path $installer -Value $content -Encoding ASCII; & $installer"#;
+
+/// The installer for `name`, or `None` if llmman doesn't install it (dsh
+/// runs under `npx` instead; see `find_dsh`).
+fn installer_for(name: &str, windows: bool) -> Option<Installer> {
+    Some(match (name, windows) {
+        ("opencode", false) => Installer {
+            display: "OpenCode",
+            find: find_opencode,
+            deps: &[CURL, BASH],
+            program: "bash",
+            args: &["-c", "set -o pipefail; curl -fsSL https://opencode.ai/install | bash"],
+            manual: "curl -fsSL https://opencode.ai/install | bash",
+            shim: false,
+        },
+        ("opencode", true) => Installer {
+            display: "OpenCode",
+            find: find_opencode,
+            deps: &[NPM],
+            program: "npm",
+            args: &["install", "-g", "opencode-ai@latest"],
+            manual: "npm install -g opencode-ai@latest",
+            shim: false,
+        },
+        ("qwen", false) => Installer {
+            display: "Qwen Code",
+            find: find_qwen,
+            deps: &[CURL, BASH],
+            program: "bash",
+            args: &["-c", QWEN_INSTALL_SH],
+            manual: "curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | bash",
+            shim: true,
+        },
+        ("qwen", true) => Installer {
+            display: "Qwen Code",
+            find: find_qwen,
+            deps: &[POWERSHELL],
+            program: "powershell",
+            args: &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", QWEN_INSTALL_BAT],
+            manual: "download and run https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat",
+            shim: true,
+        },
+        _ => return None,
+    })
+}
+
+/// If `name` has an [`Installer`] and isn't installed, asks to install it
+/// and runs the installer. Does nothing for other integrations.
+fn ensure_installed(name: &str) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let name = name.to_lowercase();
+    let Some(installer) = installer_for(&name, cfg!(windows)) else {
+        return Ok(());
+    };
+    if (installer.find)().is_some() {
+        return Ok(());
+    }
+
+    let missing = missing_deps(installer.deps, |bin| find_on_path(bin).is_some());
+    anyhow::ensure!(
+        missing.is_empty(),
+        "{name} is not installed and required dependencies are missing\n\n\
+         Install the following first:\n  {}\n\nThen re-run:\n  llmman launch {name}",
+        missing.join("\n  ")
+    );
+
+    // No terminal to prompt on: print the install command instead.
+    anyhow::ensure!(
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        "{name} is not installed\n\nInstall it with:\n  {}\n\nThen re-run:\n  llmman launch {name}",
+        installer.manual
+    );
+    eprint!(
+        "{} is not installed. Install now? [y/N] ",
+        installer.display
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    anyhow::ensure!(accepts(&answer), "{name} installation cancelled");
+
+    eprintln!("\nInstalling {}...", installer.display);
+    let program = find_on_path(installer.program)
+        .with_context(|| format!("{} is not on PATH", installer.program))?;
+    let mut cmd = Command::new(&program);
+    cmd.args(installer.args);
+    let shim_dir = if installer.shim {
+        let dir = write_install_shim(&name)?;
+        if let Some(path) =
+            path_with_dir_prepended(Some(&dir), &std::env::var_os("PATH").unwrap_or_default())
+        {
+            cmd.env("PATH", path);
+        }
+        Some(dir)
+    } else {
+        None
+    };
+    let status = cmd.status();
+    if let Some(dir) = shim_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let status = status.with_context(|| format!("failed to run {}", program.display()))?;
+    anyhow::ensure!(status.success(), "failed to install {name}: {status}");
+
+    anyhow::ensure!(
+        (installer.find)().is_some(),
+        "{name} was installed but the binary was not found on PATH\n\n\
+         You may need to restart your shell"
+    );
+    eprintln!("{} installed successfully\n", installer.display);
+    Ok(())
+}
+
+/// The install hint for each dependency that `found` reports missing.
+fn missing_deps(
+    deps: &[(&'static str, &'static str)],
+    found: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    deps.iter()
+        .filter(|(bin, _)| !found(bin))
+        .map(|(_, hint)| *hint)
+        .collect()
+}
+
+/// True for `y` or `yes` (any case); anything else, including an empty
+/// line, is no.
+fn accepts(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Creates a temp directory holding a `name` that does nothing. Put first
+/// on the installer's `PATH`, it stops the installer from starting the
+/// real `name` if a script change defeats [`QWEN_INSTALL_SH`]'s line
+/// removal. ollama does the same.
+fn write_install_shim(name: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-{name}-install-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    if cfg!(windows) {
+        for ext in ["cmd", "bat"] {
+            let shim = dir.join(format!("{name}.{ext}"));
+            std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n")
+                .with_context(|| format!("write {}", shim.display()))?;
+        }
+    } else {
+        let shim = dir.join(name);
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n")
+            .with_context(|| format!("write {}", shim.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod {}", shim.display()))?;
+        }
+    }
+    Ok(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +869,7 @@ fn launch_opencode(
     vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let (bin, prefix) = integration_command("opencode", "opencode")?;
+    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(
@@ -681,9 +880,7 @@ fn launch_opencode(
         vision,
     );
 
-    let mut args = prefix;
-    args.extend_from_slice(extra_args);
-    exec_with_env(&bin, &args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
 /// The choices offered when the model's template could not be read (a
@@ -720,14 +917,39 @@ fn opencode_variants(
         .collect()
 }
 
-/// `PATH`, then opencode's own installer target, `~/.opencode/bin`.
+/// Finds opencode on `PATH`, then where its installers put it. The second
+/// check finds a fresh install that this process's `PATH` doesn't include
+/// yet.
 fn find_opencode() -> Option<PathBuf> {
-    find_on_path("opencode").or_else(|| {
-        dirs::home_dir().and_then(|h| {
-            let p = h.join(".opencode").join("bin").join("opencode");
-            p.exists().then_some(p)
-        })
-    })
+    find_on_path("opencode").or_else(|| opencode_fallback_paths().into_iter().find(|p| p.is_file()))
+}
+
+/// Where opencode's installers put it: `~/.opencode/bin` (install script)
+/// and, on Windows, `%APPDATA%\npm` (`npm install -g`).
+fn opencode_fallback_paths() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    if cfg!(windows) {
+        let mut paths: Vec<PathBuf> = home
+            .iter()
+            .map(|h| h.join(".opencode").join("bin").join("opencode.exe"))
+            .collect();
+        // Treat an empty APPDATA as unset.
+        let roaming = std::env::var_os("APPDATA")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Roaming")));
+        if let Some(npm) = roaming.map(|d| d.join("npm")) {
+            paths.extend(
+                WINDOWS_PATH_EXTS
+                    .iter()
+                    .map(|ext| npm.join(format!("opencode.{ext}"))),
+            );
+        }
+        return paths;
+    }
+    home.iter()
+        .map(|h| h.join(".opencode").join("bin").join("opencode"))
+        .collect()
 }
 
 /// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
@@ -1293,7 +1515,7 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// `--model` after `--` is the one Qwen Code uses, so the settings and
 /// `OPENAI_MODEL` follow it.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let (bin, prefix) = integration_command("qwen", "qwen")?;
+    let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
     let model = forwarded_model(extra_args).unwrap_or(model);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
@@ -1308,20 +1530,12 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
     ];
     // A shim the fallback found is a `#!/usr/bin/env node` script whose
     // `node` sits beside it, so its directory goes on the child's `PATH`.
-    // npx brings its own node.
-    let path = prefix
-        .is_empty()
-        .then(|| {
-            path_with_dir_prepended(bin.parent(), &std::env::var_os("PATH").unwrap_or_default())
-        })
-        .flatten()
+    let path = path_with_dir_prepended(bin.parent(), &std::env::var_os("PATH").unwrap_or_default())
         .map(|p| p.to_string_lossy().into_owned());
     if let Some(path) = &path {
         env.push(("PATH", path.as_str()));
     }
-    let mut args = prefix;
-    args.extend(qwen_args(model, extra_args));
-    exec_with_env(&bin, &args, &env)
+    exec_with_env(&bin, &qwen_args(model, extra_args), &env)
 }
 
 /// `path_var` with `dir` in front, or `None` when it is there already or
@@ -1856,7 +2070,9 @@ fn launch_dsh(
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let (bin, prefix) = integration_command("dsh", "dsh")?;
+    let (bin, prefix) = find_dsh().ok_or_else(|| {
+        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
+    })?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
@@ -1865,65 +2081,35 @@ fn launch_dsh(
     write_dsh_patch(&patch_path, &settings_path)?;
 
     let mut args = prefix;
+    if !args.is_empty() {
+        // Said before it happens: this launch downloads a package.
+        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
+    }
     args.extend(dsh_args(&patch_path, extra_args));
     exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
 }
 
-/// The npm package `npx` fetches for an integration that isn't installed.
-/// Unpinned, so a one-off run gets what a global install would have.
-const NPM_PACKAGES: &[(&str, &str)] = &[
-    ("dsh", "@deepseek-ai/dsh@latest"),
-    ("opencode", "opencode-ai@latest"),
-    ("qwen", "@qwen-code/qwen-code@latest"),
-];
+/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
+/// a one-off run gets what a global install would have.
+const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
 
-fn npm_package(name: &str) -> Option<&'static str> {
-    NPM_PACKAGES
-        .iter()
-        .find(|(integration, _)| *integration == name)
-        .map(|(_, package)| *package)
+/// dsh, and the arguments that must lead whatever it is handed: none for
+/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
+/// there is none. `find_integration_binary` resolves it the same way, so
+/// the listing agrees with what a launch would run.
+fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
+    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
 }
 
-/// The binary a launch of `name` runs and the arguments that must lead
-/// its own, saying so first when that means downloading a package.
-fn integration_command(name: &str, binary: &str) -> anyhow::Result<(PathBuf, Vec<String>)> {
-    let package = npm_package(name);
-    let (bin, prefix) = find_integration_command(name, binary).ok_or_else(|| match package {
-        Some(package) => anyhow::anyhow!(
-            "{name} is not installed, and there is no npx on PATH to run {package} with"
-        ),
-        None => anyhow::anyhow!("{name} is not installed"),
-    })?;
-    if let (false, Some(package)) = (prefix.is_empty(), package) {
-        eprintln!("[llmman] {name} is not installed; running {package} with npx");
-    }
-    Ok((bin, prefix))
-}
-
-/// An install, else the `npx` that stands in for an npm-published
-/// integration — which takes `--yes <package>` before the arguments the
-/// launcher passes.
-fn find_integration_command(name: &str, binary: &str) -> Option<(PathBuf, Vec<String>)> {
-    npx_command(
-        find_installed(name, binary),
-        || find_on_path("npx"),
-        npm_package(name),
-    )
-}
-
-/// Split from [`find_integration_command`] so which binary wins can be
-/// asserted without depending on what the test machine has installed.
-fn npx_command(
-    installed: Option<PathBuf>,
+/// Split from [`find_dsh`] so which binary wins can be asserted without
+/// depending on what the test machine has installed.
+fn dsh_command(
+    dsh: Option<PathBuf>,
     npx: impl FnOnce() -> Option<PathBuf>,
-    package: Option<&str>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    match installed {
+    match dsh {
         Some(bin) => Some((bin, Vec::new())),
-        None => {
-            let package = package?;
-            Some((npx()?, vec!["--yes".into(), package.to_string()]))
-        }
+        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
     }
 }
 
@@ -3056,51 +3242,117 @@ model = \"gpt-5\"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The fallback that makes a launch work without a global install —
-    /// and stays out of the way of one that exists.
+    /// The fallback that makes `llmman launch dsh` work without a global
+    /// install — and stays out of the way of one that exists.
     #[test]
-    fn an_npm_integration_falls_back_to_its_package_under_npx() {
-        let installed = PathBuf::from("/usr/local/bin/dsh");
+    fn dsh_falls_back_to_the_published_package_under_npx() {
+        let dsh = PathBuf::from("/usr/local/bin/dsh");
         let npx = PathBuf::from("/usr/local/bin/npx");
-        let package = Some("@deepseek-ai/dsh@latest");
 
         // An install wins, and npx is never even looked for.
         assert_eq!(
-            npx_command(
-                Some(installed.clone()),
-                || panic!("npx looked up anyway"),
-                package
-            ),
-            Some((installed, Vec::new()))
+            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
+            Some((dsh, Vec::new()))
         );
         // Without one, npx runs the package: `--yes` so a first run
-        // isn't blocked on a prompt, ahead of the launcher's arguments.
+        // isn't blocked on a prompt, ahead of dsh's own arguments.
         assert_eq!(
-            npx_command(None, || Some(npx.clone()), package),
-            Some((
-                npx.clone(),
-                vec!["--yes".to_string(), "@deepseek-ai/dsh@latest".to_string()]
-            ))
+            dsh_command(None, || Some(npx.clone())),
+            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
         );
-        // Neither: "not installed", not an npm error.
-        assert_eq!(npx_command(None, || None, package), None);
-        // No package: only an install counts.
-        assert_eq!(npx_command(None, || Some(npx), None), None);
+        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
+        // Neither: "dsh is not installed", not an npm error.
+        assert_eq!(dsh_command(None, || None), None);
+    }
+
+    /// Only opencode and qwen have installers, on both platforms.
+    #[test]
+    fn opencode_and_qwen_have_installers_for_each_platform() {
+        for windows in [false, true] {
+            for name in ["opencode", "qwen"] {
+                let i = installer_for(name, windows).unwrap_or_else(|| panic!("{name}"));
+                // The installer program must be one of the checked dependencies.
+                assert!(
+                    i.deps.iter().any(|(bin, _)| *bin == i.program),
+                    "{name}: {} is not checked",
+                    i.program
+                );
+                assert!(!i.manual.is_empty());
+            }
+            for name in ["dsh", "claude", "codex", "gemini", "aider", "goose", "grok"] {
+                assert!(installer_for(name, windows).is_none(), "{name}");
+            }
+        }
+
+        let opencode = installer_for("opencode", false).unwrap();
+        assert_eq!(opencode.program, "bash");
+        assert_eq!(
+            opencode.args,
+            [
+                "-c",
+                "set -o pipefail; curl -fsSL https://opencode.ai/install | bash"
+            ]
+        );
+        assert!(!opencode.shim);
+        let opencode = installer_for("opencode", true).unwrap();
+        assert_eq!(opencode.program, "npm");
+        assert_eq!(opencode.args, ["install", "-g", "opencode-ai@latest"]);
+    }
+
+    /// Both qwen installers remove the step that starts qwen, and use the
+    /// shim.
+    #[test]
+    fn qwen_installers_do_not_start_qwen() {
+        let unix = installer_for("qwen", false).unwrap();
+        assert_eq!(unix.args[0], "-c");
+        let script = unix.args[1];
+        assert!(script.starts_with("set -o pipefail; curl -fsSL https://"));
+        assert!(script.contains("/installation/install-qwen.sh"));
+        assert!(script.contains("sed '/log_info \"Starting Qwen Code...\"/,/exec qwen/d'"));
+        assert!(script.ends_with("| bash"));
+        assert!(unix.shim);
+
+        let windows = installer_for("qwen", true).unwrap();
+        let command = windows.args.last().unwrap();
+        assert!(command.contains("/installation/install-qwen.bat"));
+        assert!(command.contains(r"-replace '(?m)^\s*call qwen\s*$', 'REM call qwen'"));
+        assert!(windows.shim);
     }
 
     #[test]
-    fn npm_packages_name_integrations_and_track_latest() {
-        for (name, package) in NPM_PACKAGES {
-            assert!(INTEGRATIONS.iter().any(|i| i.name == *name), "{name}");
-            assert!(package.ends_with("@latest"), "{package}");
+    fn missing_deps_are_reported_in_order_with_where_to_get_them() {
+        let deps = [CURL, BASH];
+        assert!(missing_deps(&deps, |_| true).is_empty());
+        assert_eq!(
+            missing_deps(&deps, |_| false),
+            [
+                "curl: https://curl.se/",
+                "bash: https://www.gnu.org/software/bash/"
+            ]
+        );
+        assert_eq!(
+            missing_deps(&deps, |bin| bin == "curl"),
+            ["bash: https://www.gnu.org/software/bash/"]
+        );
+    }
+
+    #[test]
+    fn only_a_yes_accepts_the_install() {
+        for yes in ["y", "Y", "yes", "YES", " y\n", "yes\r\n"] {
+            assert!(accepts(yes), "{yes:?}");
         }
-        assert_eq!(npm_package("dsh"), Some("@deepseek-ai/dsh@latest"));
-        assert_eq!(npm_package("qwen"), Some("@qwen-code/qwen-code@latest"));
-        assert_eq!(npm_package("opencode"), Some("opencode-ai@latest"));
-        // Every other integration is launched from an install alone.
-        for name in ["claude", "codex", "gemini", "aider", "goose", "grok"] {
-            assert_eq!(npm_package(name), None, "{name}");
+        for no in ["", "\n", "n", "no", "N", "yep", "sure"] {
+            assert!(!accepts(no), "{no:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_shim_is_a_qwen_that_does_nothing() {
+        let dir = write_install_shim("qwen").unwrap();
+        let status = Command::new(dir.join("qwen")).status().unwrap();
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
