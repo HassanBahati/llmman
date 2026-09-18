@@ -523,8 +523,8 @@ const INTEGRATIONS: &[Integration] = &[
 fn print_integrations() {
     println!("Available integrations:\n");
     for i in INTEGRATIONS {
-        // dsh resolves to npx when it isn't installed (see `find_dsh`),
-        // and that launch downloads the package before running it.
+        // An integration with an npm package resolves to npx when it
+        // isn't installed, and that launch downloads it first.
         let how = match find_integration_binary(i) {
             Some(bin) if bin.file_stem().is_some_and(|s| s == "npx") => " (via npx)",
             Some(_) => "",
@@ -571,16 +571,20 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
 }
 
 /// The binary `launch` will run for `i`, so the listing does not report
-/// as missing what the launcher would find: `PATH`, then what the
-/// launcher knows.
+/// as missing what the launcher would find: an install, else the `npx`
+/// that stands in for an npm-published one.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
-    match i.name {
+    find_integration_command(i.name, i.binary).map(|(bin, _)| bin)
+}
+
+/// An install: `PATH`, then the locations the launcher itself knows.
+fn find_installed(name: &str, binary: &str) -> Option<PathBuf> {
+    match name {
         "opencode" => find_opencode(),
         "qwen" => find_qwen(),
-        "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
         "grok" => find_grok(),
-        _ => find_on_path(i.binary),
+        _ => find_on_path(binary),
     }
 }
 
@@ -666,7 +670,7 @@ fn launch_opencode(
     vision: bool,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
+    let (bin, prefix) = integration_command("opencode", "opencode")?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(
@@ -677,7 +681,9 @@ fn launch_opencode(
         vision,
     );
 
-    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+    let mut args = prefix;
+    args.extend_from_slice(extra_args);
+    exec_with_env(&bin, &args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
 /// The choices offered when the model's template could not be read (a
@@ -1287,7 +1293,7 @@ fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 /// `--model` after `--` is the one Qwen Code uses, so the settings and
 /// `OPENAI_MODEL` follow it.
 fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
+    let (bin, prefix) = integration_command("qwen", "qwen")?;
     let model = forwarded_model(extra_args).unwrap_or(model);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
@@ -1302,12 +1308,20 @@ fn launch_qwen(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
     ];
     // A shim the fallback found is a `#!/usr/bin/env node` script whose
     // `node` sits beside it, so its directory goes on the child's `PATH`.
-    let path = path_with_dir_prepended(bin.parent(), &std::env::var_os("PATH").unwrap_or_default())
+    // npx brings its own node.
+    let path = prefix
+        .is_empty()
+        .then(|| {
+            path_with_dir_prepended(bin.parent(), &std::env::var_os("PATH").unwrap_or_default())
+        })
+        .flatten()
         .map(|p| p.to_string_lossy().into_owned());
     if let Some(path) = &path {
         env.push(("PATH", path.as_str()));
     }
-    exec_with_env(&bin, &qwen_args(model, extra_args), &env)
+    let mut args = prefix;
+    args.extend(qwen_args(model, extra_args));
+    exec_with_env(&bin, &args, &env)
 }
 
 /// `path_var` with `dir` in front, or `None` when it is there already or
@@ -1842,9 +1856,7 @@ fn launch_dsh(
             if command == "web" { "web" } else { "<name>" }
         );
     }
-    let (bin, prefix) = find_dsh().ok_or_else(|| {
-        anyhow::anyhow!("dsh is not installed, and there is no npx on PATH to run it with")
-    })?;
+    let (bin, prefix) = integration_command("dsh", "dsh")?;
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
@@ -1853,35 +1865,65 @@ fn launch_dsh(
     write_dsh_patch(&patch_path, &settings_path)?;
 
     let mut args = prefix;
-    if !args.is_empty() {
-        // Said before it happens: this launch downloads a package.
-        eprintln!("[llmman] dsh is not installed; running {DSH_NPM_PACKAGE} with npx");
-    }
     args.extend(dsh_args(&patch_path, extra_args));
     exec_with_env(&bin, &args, &[(DSH_API_KEY_ENV, api_key)])
 }
 
-/// The npm package `npx` fetches when dsh isn't installed. Unpinned, so
-/// a one-off run gets what a global install would have.
-const DSH_NPM_PACKAGE: &str = "@deepseek-ai/dsh@latest";
+/// The npm package `npx` fetches for an integration that isn't installed.
+/// Unpinned, so a one-off run gets what a global install would have.
+const NPM_PACKAGES: &[(&str, &str)] = &[
+    ("dsh", "@deepseek-ai/dsh@latest"),
+    ("opencode", "opencode-ai@latest"),
+    ("qwen", "@qwen-code/qwen-code@latest"),
+];
 
-/// dsh, and the arguments that must lead whatever it is handed: none for
-/// an installed `dsh`, `--yes <package>` for the `npx` that stands in when
-/// there is none. `find_integration_binary` resolves it the same way, so
-/// the listing agrees with what a launch would run.
-fn find_dsh() -> Option<(PathBuf, Vec<String>)> {
-    dsh_command(find_on_path("dsh"), || find_on_path("npx"))
+fn npm_package(name: &str) -> Option<&'static str> {
+    NPM_PACKAGES
+        .iter()
+        .find(|(integration, _)| *integration == name)
+        .map(|(_, package)| *package)
 }
 
-/// Split from [`find_dsh`] so which binary wins can be asserted without
-/// depending on what the test machine has installed.
-fn dsh_command(
-    dsh: Option<PathBuf>,
+/// The binary a launch of `name` runs and the arguments that must lead
+/// its own, saying so first when that means downloading a package.
+fn integration_command(name: &str, binary: &str) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let package = npm_package(name);
+    let (bin, prefix) = find_integration_command(name, binary).ok_or_else(|| match package {
+        Some(package) => anyhow::anyhow!(
+            "{name} is not installed, and there is no npx on PATH to run {package} with"
+        ),
+        None => anyhow::anyhow!("{name} is not installed"),
+    })?;
+    if let (false, Some(package)) = (prefix.is_empty(), package) {
+        eprintln!("[llmman] {name} is not installed; running {package} with npx");
+    }
+    Ok((bin, prefix))
+}
+
+/// An install, else the `npx` that stands in for an npm-published
+/// integration — which takes `--yes <package>` before the arguments the
+/// launcher passes.
+fn find_integration_command(name: &str, binary: &str) -> Option<(PathBuf, Vec<String>)> {
+    npx_command(
+        find_installed(name, binary),
+        || find_on_path("npx"),
+        npm_package(name),
+    )
+}
+
+/// Split from [`find_integration_command`] so which binary wins can be
+/// asserted without depending on what the test machine has installed.
+fn npx_command(
+    installed: Option<PathBuf>,
     npx: impl FnOnce() -> Option<PathBuf>,
+    package: Option<&str>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    match dsh {
+    match installed {
         Some(bin) => Some((bin, Vec::new())),
-        None => Some((npx()?, vec!["--yes".into(), DSH_NPM_PACKAGE.into()])),
+        None => {
+            let package = package?;
+            Some((npx()?, vec!["--yes".into(), package.to_string()]))
+        }
     }
 }
 
@@ -3014,27 +3056,51 @@ model = \"gpt-5\"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The fallback that makes `llmman launch dsh` work without a global
-    /// install — and stays out of the way of one that exists.
+    /// The fallback that makes a launch work without a global install —
+    /// and stays out of the way of one that exists.
     #[test]
-    fn dsh_falls_back_to_the_published_package_under_npx() {
-        let dsh = PathBuf::from("/usr/local/bin/dsh");
+    fn an_npm_integration_falls_back_to_its_package_under_npx() {
+        let installed = PathBuf::from("/usr/local/bin/dsh");
         let npx = PathBuf::from("/usr/local/bin/npx");
+        let package = Some("@deepseek-ai/dsh@latest");
 
         // An install wins, and npx is never even looked for.
         assert_eq!(
-            dsh_command(Some(dsh.clone()), || panic!("npx looked up anyway")),
-            Some((dsh, Vec::new()))
+            npx_command(
+                Some(installed.clone()),
+                || panic!("npx looked up anyway"),
+                package
+            ),
+            Some((installed, Vec::new()))
         );
         // Without one, npx runs the package: `--yes` so a first run
-        // isn't blocked on a prompt, ahead of dsh's own arguments.
+        // isn't blocked on a prompt, ahead of the launcher's arguments.
         assert_eq!(
-            dsh_command(None, || Some(npx.clone())),
-            Some((npx, vec!["--yes".to_string(), DSH_NPM_PACKAGE.to_string()]))
+            npx_command(None, || Some(npx.clone()), package),
+            Some((
+                npx.clone(),
+                vec!["--yes".to_string(), "@deepseek-ai/dsh@latest".to_string()]
+            ))
         );
-        assert!(DSH_NPM_PACKAGE.starts_with("@deepseek-ai/dsh@"));
-        // Neither: "dsh is not installed", not an npm error.
-        assert_eq!(dsh_command(None, || None), None);
+        // Neither: "not installed", not an npm error.
+        assert_eq!(npx_command(None, || None, package), None);
+        // No package: only an install counts.
+        assert_eq!(npx_command(None, || Some(npx), None), None);
+    }
+
+    #[test]
+    fn npm_packages_name_integrations_and_track_latest() {
+        for (name, package) in NPM_PACKAGES {
+            assert!(INTEGRATIONS.iter().any(|i| i.name == *name), "{name}");
+            assert!(package.ends_with("@latest"), "{package}");
+        }
+        assert_eq!(npm_package("dsh"), Some("@deepseek-ai/dsh@latest"));
+        assert_eq!(npm_package("qwen"), Some("@qwen-code/qwen-code@latest"));
+        assert_eq!(npm_package("opencode"), Some("opencode-ai@latest"));
+        // Every other integration is launched from an install alone.
+        for name in ["claude", "codex", "gemini", "aider", "goose", "grok"] {
+            assert_eq!(npm_package(name), None, "{name}");
+        }
     }
 
     #[test]
