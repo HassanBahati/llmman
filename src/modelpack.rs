@@ -362,6 +362,43 @@ pub fn capabilities(store: &OciStore, manifest: &crate::storage::oci::Manifest) 
     caps
 }
 
+/// How many primary GGUF layers the manifest holds. More than one is a
+/// `gguf-split` set, whose tensors are spread across the shards, so no
+/// single header's tensor list describes the whole model.
+pub fn gguf_shard_count(manifest: &crate::storage::oci::Manifest) -> usize {
+    let layers: Vec<_> = manifest
+        .layers
+        .iter()
+        .filter(|l| is_gguf_layer(l) && layer_role(l).is_none())
+        .collect();
+    let weights = layers.iter().filter(|l| !is_mmproj_layer(l)).count();
+    if weights > 0 {
+        return weights;
+    }
+    // [`gguf_layers`] falls back to the first layer when every one looks
+    // like mmproj, so a lone one is the model and its header describes
+    // it. Several, and which is the model is a guess — stay plural, so
+    // the caller reports nothing rather than one of them.
+    layers.len()
+}
+
+/// The model's parsed GGUF header: the blob as stored, or a tar layer
+/// already extracted. Like [`chat_template`] it extracts nothing itself,
+/// so a read-only caller never copies a checkout into the cache. `None`
+/// for a checkout-layout model, or a header that will not parse.
+pub fn gguf_info(
+    store_path: &Path,
+    cache_path: &Path,
+    manifest: &crate::storage::oci::Manifest,
+) -> Option<crate::gguf::Info> {
+    let (primary, _) = gguf_layers(manifest)?;
+    let path = raw_blob_path(store_path, primary)
+        .ok()
+        .filter(|p| blob_is_gguf(p))
+        .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
+    crate::gguf::read_info(&path).ok()
+}
+
 /// Ollama's `api.ShowResponse.Template`: the model's chat template, read
 /// without extracting anything (a read-only `/api/show` must not copy a
 /// checkout into the cache). A GGUF's `tokenizer.chat_template`, from
@@ -374,13 +411,8 @@ pub fn chat_template(
     cache_path: &Path,
     manifest: &crate::storage::oci::Manifest,
 ) -> Option<String> {
-    if let Some((primary, _)) = gguf_layers(manifest) {
-        let path = raw_blob_path(store_path, primary)
-            .ok()
-            .filter(|p| blob_is_gguf(p))
-            .or_else(|| cached_gguf(cache_path, digest_hex(&primary.digest).ok()?))?;
-        return crate::gguf::read_info(&path)
-            .ok()?
+    if gguf_layers(manifest).is_some() {
+        return gguf_info(store_path, cache_path, manifest)?
             .str("tokenizer.chat_template")
             .map(str::to_string);
     }
@@ -484,9 +516,21 @@ pub enum ModelFormat {
     Omni,
 }
 
+impl ModelFormat {
+    /// The same vocabulary [`ModelPath::format`] reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFormat::Gguf => "gguf",
+            ModelFormat::SafeTensors => "safetensors",
+            ModelFormat::Diffusion => "diffusion",
+            ModelFormat::Omni => "omni",
+        }
+    }
+}
+
 /// [`resolve_model`]'s classification: diffusion > GGUF > Diffusers
 /// (omni) > safetensors, `None` for "no servable model layer".
-fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
+pub fn manifest_format(manifest: &crate::storage::oci::Manifest) -> Option<ModelFormat> {
     if manifest.layers.iter().any(|l| layer_role(l).is_some()) {
         Some(ModelFormat::Diffusion)
     } else if gguf_layers(manifest).is_some() {
@@ -886,6 +930,30 @@ mod tests {
     }
 
     #[test]
+    fn gguf_info_reads_the_header_of_the_stored_primary_layer() {
+        let path = crate::gguf::write_test_gguf_with(&[]);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (store, mut m) = manifest_with(vec![]);
+        let mut d = store.write_blob(HF_GGUF_MEDIA_TYPE, &bytes).unwrap();
+        d.annotations.get_or_insert_with(Default::default).insert(
+            "org.cncf.model.filepath".to_string(),
+            "model.gguf".to_string(),
+        );
+        m.layers = vec![d];
+        let info = gguf_info(store.root(), Path::new("/nonexistent"), &m).expect("header");
+        assert_eq!(info.architecture(), Some("llama"));
+        assert_eq!(info.context_length(), Some(4096));
+    }
+
+    /// A checkout-layout model has no GGUF layer to read.
+    #[test]
+    fn gguf_info_is_none_without_a_gguf_layer() {
+        let (store, m) = manifest_with(vec![descriptor("sha256:a", "model.safetensors")]);
+        assert!(gguf_info(store.root(), Path::new("/nonexistent"), &m).is_none());
+    }
+
+    #[test]
     fn capabilities_honours_cncf_config_input_types_image() {
         // The exact shape hf::oci::build_cncf_manifest writes.
         let (store, mut m) = manifest_with(vec![descriptor("sha256:a", "model.gguf")]);
@@ -960,6 +1028,40 @@ mod tests {
         assert_eq!(manifest_format(&m), Some(ModelFormat::Diffusion));
         let (_, m) = manifest_with(vec![descriptor("sha256:a", "README.md")]);
         assert_eq!(manifest_format(&m), None);
+    }
+
+    #[test]
+    fn gguf_shard_count_counts_only_the_primary_weights() {
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model-00001-of-00003.gguf"),
+            descriptor("sha256:b", "model-00002-of-00003.gguf"),
+            descriptor("sha256:c", "model-00003-of-00003.gguf"),
+            descriptor("sha256:d", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 3);
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "model.Q4_K_M.gguf"),
+            descriptor("sha256:b", "mmproj-F16.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 1);
+        // A lone mmproj-named GGUF is the model here (see gguf_layers).
+        let (_, m) = manifest_with(vec![descriptor("sha256:a", "mmproj-F16.gguf")]);
+        assert_eq!(gguf_shard_count(&m), 1);
+        // Several, and which one is the model is a guess.
+        let (_, m) = manifest_with(vec![
+            descriptor("sha256:a", "mmproj-F16.gguf"),
+            descriptor("sha256:b", "mmproj-Q8.gguf"),
+        ]);
+        assert_eq!(gguf_shard_count(&m), 2);
+    }
+
+    /// `/api/show` reports these strings, so they are the wire contract.
+    #[test]
+    fn model_format_as_str_matches_model_paths_vocabulary() {
+        assert_eq!(ModelFormat::Gguf.as_str(), "gguf");
+        assert_eq!(ModelFormat::SafeTensors.as_str(), "safetensors");
+        assert_eq!(ModelFormat::Diffusion.as_str(), "diffusion");
+        assert_eq!(ModelFormat::Omni.as_str(), "omni");
     }
 
     /// The layers `llmman pull nvidia/Cosmos3-Edge` records (the

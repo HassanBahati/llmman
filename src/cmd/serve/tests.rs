@@ -1,9 +1,9 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::ollama::{
-    embed_inputs, empty_chat_chunk, evict_if_retagged, normalize_in_place, opt_f64, opt_num_thread,
-    opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file, OllamaPullRequest,
-    OllamaPushRequest, PushOutcome, StreamedOutcome,
+    embed_inputs, empty_chat_chunk, evict_if_retagged, model_info_json, normalize_in_place,
+    opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
+    OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
     apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
@@ -4434,6 +4434,180 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     };
     let resp = handle_delete(State(state), Json(req)).await.into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// ollama sends every GGUF metadata key verbatim, drops two of them, and
+/// carries an array whole unless it is longer than its own ceiling.
+#[test]
+fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
+    use crate::gguf::Value;
+    let mut info = crate::gguf::Info::default();
+    for (k, v) in [
+        ("general.architecture", Value::String("llama".into())),
+        ("llama.context_length", Value::U32(4096)),
+        ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
+        (
+            "tokenizer.ggml.token_type",
+            Value::Array(vec![Value::I32(1), Value::I32(3)]),
+        ),
+        (
+            "tokenizer.ggml.precompiled_charsmap",
+            Value::Array(vec![Value::U8(1), Value::U8(2), Value::U8(3)]),
+        ),
+        ("llama.vision.indexes", Value::Array(Vec::new())),
+        ("general.name", Value::String("Qwen3.5 0.8B".into())),
+        (
+            "tokenizer.chat_template",
+            Value::String("{{ bulk }}".into()),
+        ),
+    ] {
+        info.metadata.insert(k.to_string(), v);
+    }
+    let json = model_info_json(&info);
+    assert_eq!(json["general.architecture"], serde_json::json!("llama"));
+    assert_eq!(json["llama.context_length"], serde_json::json!(4096));
+    assert_eq!(
+        json["tokenizer.ggml.add_eos_token"],
+        serde_json::json!(false)
+    );
+    // A UINT8 array is Go's []byte, which encoding/json writes as a
+    // base64 string — "AQID" is [1, 2, 3].
+    assert_eq!(
+        json["tokenizer.ggml.precompiled_charsmap"],
+        serde_json::json!("AQID")
+    );
+    // A short array is the value itself, not a placeholder for one.
+    assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
+    assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
+    // Both keys ollama's GetModelInfo deletes. The template has its own
+    // field on this response.
+    assert_eq!(json.get("general.name"), None);
+    assert_eq!(json.get("tokenizer.chat_template"), None);
+}
+
+/// The ceiling is ollama's: an array of exactly 1024 elements is still
+/// sent, and a longer one is elided as `[]` rather than `null`, which a
+/// client would read as "this key has no value" instead of "not carried".
+#[test]
+fn model_info_json_elides_only_arrays_past_the_ceiling() {
+    use crate::gguf::Value;
+    let array = |n: usize| Value::Array(vec![Value::U32(7); n]);
+    let mut info = crate::gguf::Info::default();
+    info.metadata.insert("at.ceiling".into(), array(1024));
+    info.metadata.insert("past.ceiling".into(), array(1025));
+    let json = model_info_json(&info);
+    assert_eq!(json["at.ceiling"].as_array().map(Vec::len), Some(1024));
+    assert_eq!(json["past.ceiling"], serde_json::json!([]));
+}
+
+/// The `/api/show` body for a store holding one model whose single
+/// layer is `(media_type, filepath, blob)`. The two cases below differ
+/// only in that layer, and in what they then assert.
+async fn show_one_model(
+    name: &str,
+    media_type: &str,
+    filepath: &str,
+    blob: &[u8],
+) -> serde_json::Value {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-show-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let state = test_state_at(dir.clone());
+    let store = OciStore::open(&dir).unwrap();
+
+    let mut layer = store.write_blob(media_type, blob).unwrap();
+    layer.annotations = Some(HashMap::from([(
+        "org.cncf.model.filepath".to_string(),
+        filepath.to_string(),
+    )]));
+    let config = store
+        .write_blob("application/vnd.cncf.model.config.v1+json", b"{}")
+        .unwrap();
+    let manifest = crate::storage::oci::Manifest {
+        schema_version: 2,
+        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+        artifact_type: None,
+        config,
+        layers: vec![layer],
+        annotations: None,
+    };
+    let mdesc = store
+        .write_blob(
+            "application/vnd.oci.image.manifest.v1+json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    store
+        .tag(mdesc, &format!("docker.io/ai/{name}:latest"))
+        .unwrap();
+
+    let req = OllamaShowRequest {
+        model: format!("docker.io/ai/{name}"),
+        name: None,
+    };
+    let resp = handle_show(State(state), Json(req)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The whole `/api/show` wiring over a stored GGUF: the fields below are
+/// public API, and a handler that read the architecture into the wrong
+/// one would still pass the unit tests for the pieces.
+#[tokio::test]
+async fn handle_show_reports_the_stored_ggufs_own_metadata() {
+    // file_type 15 is Q4_K_M while the fixture's lone tensor is Q4_K, so
+    // the assertion below says which of the two sources won.
+    let path = crate::gguf::write_test_gguf_with(&[("general.file_type", 15)]);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v = show_one_model(
+        "showmeta",
+        "application/vnd.docker.ai.gguf.v3",
+        "model.gguf",
+        &bytes,
+    )
+    .await;
+
+    // write_test_gguf_with's header: llama, 4096, one 2-D Q4_K tensor.
+    assert_eq!(v["details"]["format"], "gguf");
+    assert_eq!(v["details"]["family"], "llama");
+    assert_eq!(v["details"]["families"], serde_json::json!(["llama"]));
+    assert_eq!(v["details"]["quantization_level"], "Q4_K_M");
+    assert_eq!(v["model_info"]["general.architecture"], "llama");
+    assert_eq!(v["model_info"]["llama.context_length"], 4096);
+    // The old stub keys are gone.
+    assert_eq!(v["model_info"].get("digest"), None);
+    assert_eq!(v["model_info"].get("size"), None);
+}
+
+/// The other half: a checkout-layout model has no GGUF header, so the
+/// format must be its own rather than the `"gguf"` this handler used to
+/// hardcode, and the metadata fields stay empty rather than guessing.
+#[tokio::test]
+async fn handle_show_reports_a_safetensors_model_as_safetensors() {
+    let v = show_one_model(
+        "showst",
+        "application/vnd.cncf.model.weight.v1.tar",
+        "model.safetensors",
+        b"weights",
+    )
+    .await;
+
+    assert_eq!(v["details"]["format"], "safetensors");
+    assert_eq!(v["details"]["family"], "");
+    assert_eq!(v["details"]["families"], serde_json::json!([]));
+    assert_eq!(v["model_info"], serde_json::json!({}));
+    assert_eq!(v["template"], serde_json::Value::Null);
 }
 
 /// /api/show resolves (and so validates) the client ref before it ever

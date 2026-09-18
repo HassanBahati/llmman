@@ -62,8 +62,10 @@ pub(super) async fn handle_tags(
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(now_rfc3339),
             details: OllamaModelDetails {
+                parent_model: String::new(),
                 format: "gguf".into(),
                 family: String::new(),
+                families: Vec::new(),
                 parameter_size: String::new(),
                 quantization_level: String::new(),
             },
@@ -193,13 +195,15 @@ pub(super) async fn handle_show(
     if crate::providers::is_remote_ref(model_ref) {
         eprintln!("[llmman] /api/show model={model_ref:?} (provider-routed)");
         return Ok(Json(OllamaShowResponse {
-            model_info: serde_json::json!({ "digest": "", "size": 0 }),
+            model_info: serde_json::json!({}),
             details: OllamaModelDetails {
+                parent_model: String::new(),
                 // Not "gguf": there are no local weights here at all, and
                 // claiming a format llmman never inspected would be a
                 // guess about someone else's serving stack.
                 format: String::new(),
                 family: String::new(),
+                families: Vec::new(),
                 parameter_size: String::new(),
                 quantization_level: String::new(),
             },
@@ -230,23 +234,139 @@ pub(super) async fn handle_show(
     })?;
     let manifest = store.read_manifest(&desc.digest)?;
     let capabilities = crate::modelpack::capabilities(&store, &manifest);
-    let template = crate::modelpack::chat_template(
-        &store,
-        &state.0.store_path,
-        &state.0.cache_path,
-        &manifest,
-    );
+    // Off the worker: parsing a GGUF header is 30-50ms of blocking reads
+    // on this host's models, and every /api/show pays it.
+    let gguf = {
+        let (store_path, cache_path, manifest) = (
+            state.0.store_path.clone(),
+            state.0.cache_path.clone(),
+            manifest.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::modelpack::gguf_info(&store_path, &cache_path, &manifest)
+        })
+        .await
+        .map_err(|e| AppError::from(anyhow::anyhow!("reading GGUF metadata: {e}")))?
+    };
+    // Read from the header already in hand rather than reading it twice;
+    // a checkout-layout model has no header and takes the longer route.
+    let template = match &gguf {
+        Some(info) => info.str("tokenizer.chat_template").map(str::to_string),
+        None => crate::modelpack::chat_template(
+            &store,
+            &state.0.store_path,
+            &state.0.cache_path,
+            &manifest,
+        ),
+    };
+    let arch = gguf.as_ref().and_then(|i| i.architecture());
     Ok(Json(OllamaShowResponse {
-        model_info: serde_json::json!({ "digest": desc.digest, "size": desc.size }),
+        model_info: gguf
+            .as_ref()
+            .map_or_else(|| serde_json::json!({}), model_info_json),
         details: OllamaModelDetails {
-            format: "gguf".into(),
-            family: String::new(),
-            parameter_size: String::new(),
-            quantization_level: String::new(),
+            parent_model: String::new(),
+            // What resolve_model would serve this as, read off the
+            // manifest. Empty rather than a guess when no layer is
+            // servable at all.
+            format: crate::modelpack::manifest_format(&manifest)
+                .map(crate::modelpack::ModelFormat::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            family: arch.unwrap_or_default().to_string(),
+            families: arch.map(|a| vec![a.to_string()]).unwrap_or_default(),
+            // The header's own figure when it declares one. Otherwise
+            // the sum of this file's tensors, which describes the whole
+            // model only when it is not a split set — shard 1 of six
+            // would understate it, and nothing beats no answer there.
+            parameter_size: gguf
+                .as_ref()
+                .and_then(|i| {
+                    i.u64("general.parameter_count").or_else(|| {
+                        (crate::modelpack::gguf_shard_count(&manifest) == 1)
+                            .then_some(i.parameter_count)
+                    })
+                })
+                .filter(|n| *n > 0)
+                .map(crate::fmt::human_count)
+                .unwrap_or_default(),
+            // The declared file type, which keeps the mixed-quant
+            // variant; the modal tensor type reads Q4_K for both
+            // Q4_K_M and Q4_K_S, so it is only the fallback.
+            quantization_level: gguf
+                .as_ref()
+                .and_then(|i| {
+                    i.u64("general.file_type")
+                        .and_then(crate::gguf::file_type_name)
+                        .map(str::to_string)
+                        .or_else(|| i.quantization.clone())
+                })
+                .unwrap_or_default(),
         },
         capabilities,
         template,
     }))
+}
+
+/// Elements past this many are not carried. A non-verbose `/api/show`
+/// reads the header with the same ceiling and discards any longer array
+/// outright rather than reading it (`fs/gguf/metadata.go`,
+/// `fs/gguf/gguf.go`), which reaches the response as `[]`, not `null`.
+/// `tokenizer.ggml.tokens` and `merges` alone run to megabytes.
+const MODEL_INFO_MAX_ARRAY: usize = 1024;
+
+/// Keys ollama's own `GetModelInfo` deletes before answering
+/// (`server/routes.go`). The chat template already has its own field on
+/// this response; carrying it here too made it 82% of the body on a
+/// Qwen3.5 header.
+const MODEL_INFO_OMITTED: [&str; 2] = ["general.name", "tokenizer.chat_template"];
+
+/// The GGUF header as ollama's `/api/show` reports it: every metadata key
+/// verbatim, minus [`MODEL_INFO_OMITTED`] and the bulk
+/// [`MODEL_INFO_MAX_ARRAY`] cuts.
+pub(super) fn model_info_json(info: &crate::gguf::Info) -> serde_json::Value {
+    info.metadata
+        .iter()
+        .filter(|(k, _)| !MODEL_INFO_OMITTED.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), metadata_cell(v)))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into()
+}
+
+/// One metadata value as JSON — see [`model_info_json`].
+fn metadata_cell(v: &crate::gguf::Value) -> serde_json::Value {
+    use crate::gguf::Value;
+    match v {
+        Value::U8(n) => serde_json::Value::from(*n),
+        Value::I8(n) => serde_json::Value::from(*n),
+        Value::U16(n) => serde_json::Value::from(*n),
+        Value::I16(n) => serde_json::Value::from(*n),
+        Value::U32(n) => serde_json::Value::from(*n),
+        Value::I32(n) => serde_json::Value::from(*n),
+        Value::U64(n) => serde_json::Value::from(*n),
+        Value::I64(n) => serde_json::Value::from(*n),
+        Value::F32(f) => serde_json::Value::from(*f),
+        Value::F64(f) => serde_json::Value::from(*f),
+        Value::Bool(b) => serde_json::Value::from(*b),
+        Value::String(s) => serde_json::Value::from(s.as_str()),
+        Value::Array(a) if a.len() > MODEL_INFO_MAX_ARRAY => serde_json::Value::Array(Vec::new()),
+        // ollama holds a UINT8 array as Go's `[]byte`, which
+        // `encoding/json` writes as a base64 string rather than a number
+        // array, so that is the wire value for this element type. An
+        // empty array carries no element type to go on and stays `[]`.
+        Value::Array(a) if !a.is_empty() && a.iter().all(|v| matches!(v, Value::U8(_))) => {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = a
+                .iter()
+                .filter_map(|v| match v {
+                    Value::U8(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(metadata_cell).collect()),
+    }
 }
 
 // -- Ollama /api/pull ---------------------------------------------------------
