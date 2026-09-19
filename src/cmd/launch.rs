@@ -920,10 +920,8 @@ fn write_codex_config(
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        let context_window = codex_context_window(
-            std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref(),
-            context_length,
-        );
+        let context_window =
+            codex_context_window(super::serve::context_length_from_env(), context_length);
         write_codex_file(
             &catalog_path,
             &codex_model_catalog(model, vision, context_window),
@@ -947,19 +945,17 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
-/// The catalog's `context_window` with neither a trained context nor
-/// `LLMMAN_CONTEXT_LENGTH`; ollama's fallback too.
+/// The catalog's `context_window` with neither `LLMMAN_CONTEXT_LENGTH` nor
+/// a trained context; ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-/// The model's `trained` context, else a positive `LLMMAN_CONTEXT_LENGTH`
-/// (`env`), else [`CODEX_FALLBACK_CONTEXT_WINDOW`]. An `env` below the
-/// trained context is what the daemon serves, so codex is told more.
-fn codex_context_window(env: Option<&str>, trained: Option<u64>) -> u64 {
-    trained
-        .or_else(|| {
-            env.and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|n| *n > 0)
-        })
+/// What codex compacts against: a positive `LLMMAN_CONTEXT_LENGTH`
+/// (`env`), the `--ctx-size` the daemon serves, else the model's
+/// `trained` context, else [`CODEX_FALLBACK_CONTEXT_WINDOW`].
+fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
+    env.filter(|n| *n > 0)
+        .map(u64::from)
+        .or(trained)
         .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
@@ -3103,18 +3099,17 @@ model = \"gpt-5\"
     }
 
     #[test]
-    fn codex_context_window_prefers_the_model_s_trained_context() {
+    fn codex_context_window_is_what_the_daemon_serves() {
         let cases = [
-            // The trained context wins over LLMMAN_CONTEXT_LENGTH.
+            // A positive LLMMAN_CONTEXT_LENGTH is the served --ctx-size.
+            (Some(16384), Some(32768), 16384),
+            (Some(65536), Some(32768), 65536),
+            (Some(16384), None, 16384),
+            // Unset or 0: the trained context.
             (None, Some(32768), 32768),
-            (Some("16384"), Some(32768), 32768),
-            (Some("65536"), Some(32768), 32768),
+            (Some(0), Some(32768), 32768),
             (None, Some(1 << 20), 1 << 20),
-            // No trained context: LLMMAN_CONTEXT_LENGTH, if positive.
-            (Some("16384"), None, 16384),
-            (Some(" 16384 "), None, 16384),
-            (Some("0"), None, CODEX_FALLBACK_CONTEXT_WINDOW),
-            (Some("lots"), None, CODEX_FALLBACK_CONTEXT_WINDOW),
+            (Some(0), None, CODEX_FALLBACK_CONTEXT_WINDOW),
             (None, None, CODEX_FALLBACK_CONTEXT_WINDOW),
         ];
         for (env, trained, want) in cases {
