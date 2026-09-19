@@ -274,8 +274,10 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, Aider, Qwen Code, Gemini CLI, Grok Build,
 AGY, DeepSeek Harness, ...) and whether each is installed. `dsh` runs under
-`npx` when
-it isn't installed globally. Any extra arguments after `--` are forwarded to
+`npx` when it isn't installed globally. When OpenCode or Qwen Code is
+missing, llmman offers to install it with the official installer
+(`curl`+`bash` on Linux/macOS; `npm` or PowerShell on Windows). Any extra
+arguments after `--` are forwarded to
 the integration's own CLI. Short names work wherever a model reference is
 accepted.
 
