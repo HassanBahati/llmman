@@ -1189,8 +1189,9 @@ fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
 }
 
 /// The `model:`/`providers:` blocks [`write_hermes_config`] owns. A
-/// vision model gets `model.supports_vision`, the override hermes's image
-/// routing reads; without it hermes describes images through a text tool.
+/// vision model gets `model.supports_vision`, the override hermes's
+/// image routing reads before its own catalog, which lists no local
+/// model and so routes every image through a describe-it tool instead.
 fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     // Double-quoted (not bare) so a model name that happens to be a YAML
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
@@ -1328,10 +1329,7 @@ fn launch_qwen(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_qwen().ok_or_else(|| anyhow::anyhow!("qwen is not installed"))?;
-    // `vision` describes `model`, not a different one forwarded after `--`.
-    let forwarded = forwarded_model(extra_args).filter(|f| *f != model);
-    let vision = vision && forwarded.is_none();
-    let model = forwarded.unwrap_or(model);
+    let (model, vision) = qwen_model_and_vision(model, vision, extra_args);
     // After the lookup, so nothing is written for an integration that is
     // not there; `check_model_flag` has made sure there is a model.
     write_qwen_settings(model, vision)?;
@@ -1351,6 +1349,23 @@ fn launch_qwen(
         env.push(("PATH", path.as_str()));
     }
     exec_with_env(&bin, &qwen_args(model, extra_args), &env)
+}
+
+/// The model Qwen Code will use — a `--model` after `--` wins — and
+/// whether to declare its image input, which `vision` answers for
+/// `model` alone. `model` arrives resolved and the forwarded name as
+/// typed, so they are compared resolved: `gemma4:12b` is the
+/// `docker.io/ai/gemma4:12b` it names.
+fn qwen_model_and_vision<'a>(
+    model: &'a str,
+    vision: bool,
+    extra_args: &'a [String],
+) -> (&'a str, bool) {
+    let forwarded = forwarded_model(extra_args);
+    let same = forwarded.is_none_or(|f| {
+        crate::shortnames::resolve_ollama_api(f).is_ok_and(|resolved| resolved == model)
+    });
+    (forwarded.unwrap_or(model), vision && same)
 }
 
 /// `path_var` with `dir` in front, or `None` when it is there already or
@@ -2673,6 +2688,31 @@ mod tests {
         let text = once.to_string();
         assert!(!text.contains("apiKey") && !text.contains("\"env\""));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"qwen"));
+    }
+
+    /// The spelling the two sides arrive in differs: `llmman launch qwen
+    /// --model gemma4:12b -- --model gemma4:12b` names one model, as
+    /// `docker.io/ai/gemma4:12b` and as typed.
+    #[test]
+    fn qwen_keeps_image_input_only_for_the_model_it_was_read_from() {
+        let resolved = crate::shortnames::resolve_ollama_api("gemma4:12b").unwrap();
+        let forwarded = |m: &str| vec![String::from("--model"), String::from(m)];
+        let cases = [
+            // Nothing forwarded, then the same model spelled either way.
+            (Vec::new(), resolved.as_str(), true),
+            (forwarded("gemma4:12b"), "gemma4:12b", true),
+            (forwarded(&resolved), resolved.as_str(), true),
+            // Another model, and one that is not a reference at all.
+            (forwarded("qwen3.5:0.8b"), "qwen3.5:0.8b", false),
+            (forwarded("not a reference"), "not a reference", false),
+        ];
+        for (extra_args, model, vision) in cases {
+            assert_eq!(
+                qwen_model_and_vision(&resolved, true, &extra_args),
+                (model, vision),
+                "{extra_args:?}"
+            );
+        }
     }
 
     /// Relaunching with a text model drops the declaration, since
