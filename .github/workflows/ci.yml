@@ -55,6 +55,14 @@ env:
   # integration contract under test. The macOS GitHub runner kills 3.0.62;
   # that failure is runner-specific, not a general macOS release failure.
   CLINE_CLI_VERSION: "2.18.0"
+  # Docker Agent release used by launch_e2e's real `launch docker-agent`
+  # test. Pinned because the agent-file contract launch_docker_agent
+  # writes — the `models:` map with `provider`/`base_url`/`token_key`, and
+  # `run`'s first positional being the agent file — is what that test
+  # verifies; bump deliberately and rerun the launch suite. v1.50.0, the
+  # build Docker Desktop ships, answers this same test with a 600s
+  # timeout, so the pin is also what keeps it honest.
+  DOCKER_AGENT_VERSION: "1.142.0"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -715,7 +723,7 @@ jobs:
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 11 launch tests above
+    # small-model sampling variance), so unlike the 12 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
@@ -1066,6 +1074,65 @@ jobs:
             fi
           done
           echo "::error::grok never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
+
+      # Docker Agent ships one static binary per platform, covering every
+      # E2E target. Installed onto PATH rather than into
+      # `~/.docker/cli-plugins`: `launch_docker_agent` looks in the plugin
+      # directory too, but `run_launch` replaces HOME with a fresh temp
+      # directory, so under that harness only PATH can resolve it.
+      #
+      # No login and no `docker agent setup`: the agent file
+      # `launch_docker_agent` generates carries the endpoint, and the key
+      # reaches it through LLMMAN_API_KEY.
+      - name: Install Docker Agent (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          case "${{ runner.os }}" in
+            Linux)   os=linux ;;
+            macOS)   os=darwin ;;
+            Windows) os=windows ;;
+          esac
+          case "${{ runner.arch }}" in
+            X64)   arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *)     echo "::warning::no Docker Agent build for ${{ runner.arch }}; launch_docker_agent_with_model will skip"; exit 0 ;;
+          esac
+          asset="docker-agent-$os-$arch"
+          bin_dir="$HOME/.docker-agent/bin"
+          bin="$bin_dir/docker-agent"
+          if [ "$os" = "windows" ]; then
+            asset="$asset.exe"
+            bin="$bin.exe"
+          fi
+          mkdir -p "$bin_dir"
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            if ! curl -fsSL -o "$bin" \
+              "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
+              echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            else
+              chmod +x "$bin"
+              # `version`, not `--version`: docker-agent rejects the flag.
+              if version_output=$("$bin" version 2>&1); then
+                if command -v cygpath >/dev/null 2>&1; then
+                  cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+                else
+                  echo "$bin_dir" >> "$GITHUB_PATH"
+                fi
+                exit 0
+              fi
+              echo "::warning::docker-agent installed but \"docker-agent version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::docker-agent never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
 
       # Pinned official AGY release; verify each runner's archive before installing.

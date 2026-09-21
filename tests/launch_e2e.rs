@@ -1200,6 +1200,39 @@ fn launch_grok_with_model() {
 }
 
 #[test]
+fn launch_docker_agent_with_model() {
+    eprintln!("[test] launch_docker_agent_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_docker_agent_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // `on_path` alone, deliberately: `launch_docker_agent`'s other
+    // resolution path is `~/.docker/cli-plugins`, and `run_launch`
+    // replaces `HOME` with a fresh temp directory, so under this harness
+    // that fallback can never fire. CI installs the binary onto `PATH`
+    // for exactly that reason.
+    if !on_path("docker-agent") {
+        eprintln!(
+            "skipping: docker-agent not on PATH — https://github.com/docker/docker-agent/releases"
+        );
+        return;
+    }
+
+    // `--exec <prompt>`: docker-agent's own non-interactive mode, no TUI.
+    // `run` and the generated agent file are llmman's to supply (that
+    // file is `run`'s first positional), so they are absent here.
+    //
+    // No `--yolo`: the generated agent declares no toolsets, so there is
+    // nothing for docker-agent to ask approval for — see
+    // `docker_agent_document`, which keeps the request to a single
+    // `system` message because this very model's chat template rejects a
+    // second one.
+    launch_and_assert("docker-agent", &["--exec", PROMPT]);
+}
+
+#[test]
 fn launch_hermes_with_model() {
     eprintln!("[test] launch_hermes_with_model: acquiring SERIAL");
     let _guard = lock_serial();

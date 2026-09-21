@@ -181,6 +181,7 @@ installed:
 | `dsh` | DeepSeek Harness | yes |
 | `goose` | Block goose | yes |
 | `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
+| `docker-agent` | Docker Agent (requires `--model`) | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
