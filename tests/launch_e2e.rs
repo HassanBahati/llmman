@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `codex`, `grok`, `qwen`, `hermes`,
+//! (`claude`, `agy`, `opencode`, `codex`, `cline`, `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
@@ -666,13 +666,21 @@ const MAX_ATTEMPTS: u32 = 3;
 /// `assert!`) is logged loudly but does not panic: it's the model's own
 /// sampling variance, not an llmman regression, so it must not turn CI
 /// red on its own.
+enum NonzeroDisposition {
+    Reject,
+    Retry,
+    Accept,
+}
+
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
         extra_args,
-        |_stderr| false,
+        |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
+        reply_contains_pong,
         false,
+        |_home| {},
     );
 }
 
@@ -683,9 +691,38 @@ fn launch_and_assert_strict(integration: &str, extra_args: &[&str]) {
     launch_and_assert_with(
         integration,
         extra_args,
-        |_stderr| false,
+        |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
+        reply_contains_pong,
         true,
+        |_home| {},
+    );
+}
+
+/// Strict inference plus assertions over the fresh HOME after the real CLI
+/// exits. This catches launchers that infer correctly but leak credentials or
+/// mutate user-owned state while doing it.
+fn launch_and_assert_strict_inspecting(
+    integration: &str,
+    extra_args: &[&str],
+    accept_nonzero: impl Fn(&str, &str) -> bool,
+    accept_stdout: impl Fn(&str) -> bool,
+    inspect_home: impl Fn(&Path),
+) {
+    launch_and_assert_with(
+        integration,
+        extra_args,
+        |stdout, stderr| {
+            if accept_nonzero(stdout, stderr) {
+                NonzeroDisposition::Accept
+            } else {
+                NonzeroDisposition::Reject
+            }
+        },
+        |_stdout| false,
+        accept_stdout,
+        true,
+        inspect_home,
     );
 }
 
@@ -700,9 +737,11 @@ fn launch_and_assert_rejecting(
     launch_and_assert_with(
         integration,
         extra_args,
-        |_stderr| false,
+        |_stdout, _stderr| NonzeroDisposition::Reject,
         reject_stdout,
+        reply_contains_pong,
         false,
+        |_home| {},
     );
 }
 
@@ -723,21 +762,36 @@ fn launch_and_assert_tolerating(
     launch_and_assert_with(
         integration,
         extra_args,
-        tolerate_stderr,
+        |_stdout, stderr| {
+            if tolerate_stderr(stderr) {
+                NonzeroDisposition::Retry
+            } else {
+                NonzeroDisposition::Reject
+            }
+        },
         |_stdout| false,
+        reply_contains_pong,
         false,
+        |_home| {},
     );
 }
 
-/// The shared body: `tolerate_stderr` widens what a nonzero exit may be,
-/// `reject_stdout` narrows what a zero exit may be, and `strict` makes
+fn reply_contains_pong(stdout: &str) -> bool {
+    stdout.to_lowercase().contains("pong")
+}
+
+/// The shared body: `nonzero_disposition` rejects, retries, or conditionally
+/// accepts a nonzero exit, `reject_stdout` narrows what a zero exit may be,
+/// `accept_stdout` defines a successful model reply, and `strict` makes
 /// exhausting the sampling attempts a test failure.
 fn launch_and_assert_with(
     integration: &str,
     extra_args: &[&str],
-    tolerate_stderr: impl Fn(&str) -> bool,
+    nonzero_disposition: impl Fn(&str, &str) -> NonzeroDisposition,
     reject_stdout: impl Fn(&str) -> bool,
+    accept_stdout: impl Fn(&str) -> bool,
     strict: bool,
+    inspect_home: impl Fn(&Path),
 ) {
     let mut last_failure = None;
     // Set when the loop gives up on a timeout (not retried) rather than
@@ -762,12 +816,18 @@ fn launch_and_assert_with(
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
-            assert!(
-                tolerate_stderr(&stderr),
-                "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
-                 (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                output.status
-            );
+            match nonzero_disposition(&stdout, &stderr) {
+                NonzeroDisposition::Accept if accept_stdout(&stdout) => {
+                    inspect_home(&home);
+                    return;
+                }
+                NonzeroDisposition::Accept | NonzeroDisposition::Retry => {}
+                NonzeroDisposition::Reject => panic!(
+                    "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
+                     (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                    output.status
+                ),
+            }
             eprintln!(
                 "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} failed via its own \
                  known non-llmman-caused failure shape; {}",
@@ -791,12 +851,13 @@ fn launch_and_assert_with(
             "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
              reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
-        if stdout.to_lowercase().contains("pong") {
+        if accept_stdout(&stdout) {
+            inspect_home(&home);
             return;
         }
         eprintln!(
             "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
-             didn't contain \"pong\"; {}",
+             didn't satisfy the output assertion; {}",
             if attempt < MAX_ATTEMPTS {
                 "retrying with a fresh HOME"
             } else {
@@ -804,7 +865,7 @@ fn launch_and_assert_with(
             }
         );
         last_failure = Some(format!(
-            "expected {integration}'s reply to contain \"pong\"\n\
+            "expected {integration}'s reply to satisfy its output assertion\n\
              --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
         ));
     }
@@ -812,7 +873,7 @@ fn launch_and_assert_with(
     let why = if gave_up_after_timeout.is_some() {
         "a timeout"
     } else {
-        "a missing \"pong\" (or a known non-llmman-caused failure)"
+        "an unexpected model reply (or a known non-llmman-caused failure)"
     };
     assert!(
         !strict,
@@ -928,6 +989,112 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_cline_with_model() {
+    eprintln!("[test] launch_cline_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_cline_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("cline") {
+        eprintln!("skipping: cline not on PATH — npm install -g cline");
+        return;
+    }
+
+    // `--json` selects NDJSON output and `--yolo` prevents interactive tool
+    // approval. Parse only the final assistant text so an echoed prompt or a
+    // question containing "pong" cannot satisfy the assertion. qwen3.5:0.8b
+    // may answer correctly without wrapping it in Cline's completion tool;
+    // accept that one known nonzero shape only after this exact reply check.
+    launch_and_assert_strict_inspecting(
+        "cline",
+        &["--json", "--yolo", PROMPT],
+        cline_nonzero_is_only_missing_completion_tool,
+        cline_json_reply_is_exact_pong,
+        |home| {
+            let path = home.join(".cline/data/settings/providers.json");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let settings: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            let provider = &settings["providers"]["ollama"]["settings"];
+            assert_eq!(settings["lastUsedProvider"], "ollama");
+            assert_eq!(provider["provider"], "ollama");
+            assert_eq!(provider["model"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(
+                provider["baseUrl"],
+                format!("{}/v1", llmman::daemon::server())
+            );
+            assert!(
+                provider.get("apiKey").is_none(),
+                "Cline persisted the launch credential in {}: {text}",
+                path.display()
+            );
+
+            let global_path = home.join(".cline/data/globalState.json");
+            let global_text = std::fs::read_to_string(&global_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", global_path.display()));
+            let global: serde_json::Value = serde_json::from_str(&global_text)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", global_path.display()));
+            assert_eq!(global["actModeApiProvider"], "ollama");
+            assert_eq!(global["planModeApiProvider"], "ollama");
+            assert_eq!(global["actModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(global["planModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
+            assert_eq!(global["welcomeViewCompleted"], true);
+        },
+    );
+}
+
+fn cline_json_reply_is_exact_pong(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "say" && event["say"] == "text")
+        .filter_map(|event| event["text"].as_str().map(str::to_owned))
+        .next_back()
+        .is_some_and(|text| text.trim() == "pong")
+}
+
+fn cline_nonzero_is_only_missing_completion_tool(stdout: &str, stderr: &str) -> bool {
+    stderr.trim().is_empty()
+        && stdout.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|event| {
+                    event["type"] == "error"
+                        && event["message"].as_str().is_some_and(|message| {
+                            message.contains("Too many consecutive mistakes")
+                        })
+                })
+        })
+}
+
+#[test]
+fn cline_json_reply_requires_the_final_result_to_be_exactly_pong() {
+    assert!(cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"  pong\\n\"}\n"
+    ));
+    assert!(!cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"task\",\"text\":\"Reply with exactly the single word: pong\"}\n\
+         {\"type\":\"ask\",\"ask\":\"followup\",\"text\":\"Which teammate should I play in the pong game?\"}\n"
+    ));
+    assert!(!cline_json_reply_is_exact_pong(
+        "{\"type\":\"say\",\"say\":\"text\",\"text\":\"pong\"}\n\
+         {\"type\":\"say\",\"say\":\"text\",\"text\":\"not pong\"}\n"
+    ));
+    assert!(cline_nonzero_is_only_missing_completion_tool(
+        "{\"type\":\"error\",\"message\":\"[YOLO MODE] Task failed: Too many consecutive mistakes (3).\"}\n",
+        ""
+    ));
+    assert!(!cline_nonzero_is_only_missing_completion_tool(
+        "{\"type\":\"error\",\"message\":\"connection refused\"}\n",
+        ""
+    ));
 }
 
 #[test]
