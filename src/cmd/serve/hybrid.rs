@@ -82,7 +82,7 @@ pub(super) fn request_pin(
 /// The hosted half a hybrid pair falls back to when its local half
 /// refuses a request as too large: `None` for anything but a pair, and
 /// for a pair pinned local, whose pin is never overridden.
-pub(super) fn hybrid_fallback(
+fn hybrid_fallback(
     model_ref: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<String>, AppError> {
@@ -157,13 +157,13 @@ where
 
 /// Largest 400 body [`local_context_overflow`] reads to classify it.
 /// llama-server's is one short JSON object.
-pub(super) const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
+const OVERFLOW_BODY_LIMIT: usize = 64 * 1024;
 
 /// Splits a relayed response into the backend's context refusal (`Err`,
 /// with its message) or anything else (`Ok`, the response intact). Only
 /// a 400 is read, up to [`OVERFLOW_BODY_LIMIT`]; whatever was read is
 /// put back in front of the rest when it is some other error.
-pub(super) async fn local_context_overflow(resp: Response) -> Result<Response, String> {
+async fn local_context_overflow(resp: Response) -> Result<Response, String> {
     if resp.status() != StatusCode::BAD_REQUEST {
         return Ok(resp);
     }
@@ -189,4 +189,78 @@ pub(super) async fn local_context_overflow(resp: Response) -> Result<Response, S
         parts,
         Body::from_stream(head.chain(rest)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{headers_with, HOSTED, PAIR};
+    use super::*;
+
+    /// Only a pair falls back, and never one the caller pinned local:
+    /// that pin is the promise the data stays on this machine.
+    #[test]
+    fn only_an_unpinned_pair_has_a_hosted_half_to_fall_back_to() {
+        assert_eq!(
+            hybrid_fallback(PAIR, Some(&headers_with(&[]))).unwrap(),
+            Some(HOSTED.to_string())
+        );
+        assert_eq!(
+            hybrid_fallback(PAIR, None).unwrap(),
+            Some(HOSTED.to_string())
+        );
+        assert_eq!(
+            hybrid_fallback(PAIR, Some(&headers_with(&[("x-llmman-route", "local")]))).unwrap(),
+            None
+        );
+        assert_eq!(hybrid_fallback("gemma4", None).unwrap(), None);
+        assert_eq!(hybrid_fallback(HOSTED, None).unwrap(), None);
+    }
+
+    /// A relayed 400 is inspected and either taken as the refusal or
+    /// handed back intact; nothing else is touched.
+    #[tokio::test]
+    async fn a_relayed_response_is_only_intercepted_when_it_is_the_refusal() {
+        let llama = r#"{"error":{"code":400,"message":"request (9 tokens) exceeds the available context size (8 tokens), try increasing it","type":"exceed_context_size_error"}}"#;
+        // No Content-Length: proxy_rewriting_model strips it.
+        let resp = |status: StatusCode, body: &'static str| {
+            Response::builder()
+                .status(status)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let refusal = local_context_overflow(resp(StatusCode::BAD_REQUEST, llama))
+            .await
+            .expect_err("the refusal must be intercepted");
+        assert!(
+            refusal.contains("exceeds the available context size"),
+            "{refusal}"
+        );
+
+        let other = r#"{"error":{"code":400,"message":"invalid grammar"}}"#;
+        let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, other))
+            .await
+            .expect("another 400 passes through");
+        assert_eq!(passed.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, other.as_bytes(), "body reattached intact");
+
+        let ok = local_context_overflow(resp(StatusCode::OK, "data: {}"))
+            .await
+            .expect("a success is never read");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Past the read limit: not classified, and nothing lost.
+        let big: &'static str = String::from_utf8(vec![b'x'; OVERFLOW_BODY_LIMIT + 10])
+            .unwrap()
+            .leak();
+        let passed = local_context_overflow(resp(StatusCode::BAD_REQUEST, big))
+            .await
+            .expect("an oversized 400 passes through");
+        let body = axum::body::to_bytes(passed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), big.len());
+    }
 }
