@@ -107,6 +107,9 @@ hf-xet = "=1.6.0"
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
+
 [features]
 default = ["docker"]
 docker = []
