@@ -1225,17 +1225,17 @@ fn launch_docker_agent_with_model() {
     // pointless, since the generated agent declares no toolsets to
     // approve.
     //
-    // Not strict: a thinking model can spend a whole run reasoning and
-    // stop without answering. That is sampling variance rather than a
-    // launcher fault, so exhausting the attempts warns instead of
-    // failing, as `launch_and_assert` does for claude and codex.
+    // Strict: `inspect_home` runs only after the reply assertion
+    // passes, so a tolerated miss would skip the config checks below
+    // and leave the test asserting nothing. A timeout is still
+    // forgiven when the daemon is shown to be alive.
     launch_and_assert_with(
         "docker-agent",
         &["--exec", PROMPT],
         |_stdout, _stderr| NonzeroDisposition::Reject,
         |_stdout| false,
         docker_agent_reply_is_pong,
-        false,
+        true,
         docker_agent_left_the_users_own_config_alone,
     );
 }
