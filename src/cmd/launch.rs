@@ -579,9 +579,7 @@ fn print_integrations() {
             Some(_) => "",
             None => " (not installed)",
         };
-        // 14, not 12: "docker-agent" fills a 12-wide column exactly,
-        // leaving no gap before its description.
-        println!("  {:<14} {}{}", i.name, i.description, how);
+        println!("  {:<12} {}{}", i.name, i.description, how);
     }
     println!("\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>]");
     println!("       llmman providers   (the providers --provider accepts)");
@@ -4532,14 +4530,16 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"docker-agent"));
     }
 
-    /// The listing pads names into a fixed column, so a name as wide as
-    /// it would touch its own description.
+    /// `print_integrations` pads each name into a 12-wide column and
+    /// prints a space after it, so every description starts at the same
+    /// place — including "docker-agent", which fills the column exactly.
+    /// A longer name would push its own description right instead.
     #[test]
     fn every_integration_name_fits_the_listings_column() {
         let longest = INTEGRATIONS.iter().map(|i| i.name.len()).max().unwrap();
         assert!(
-            longest < 14,
-            "{longest}-character name does not fit the `{{:<14}}` column in print_integrations"
+            longest <= 12,
+            "{longest}-character name overflows the `{{:<12}}` column in print_integrations"
         );
     }
 
