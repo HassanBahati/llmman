@@ -57,11 +57,9 @@ env:
   CLINE_CLI_VERSION: "2.18.0"
   # Docker Agent release used by launch_e2e's real `launch docker-agent`
   # test. Pinned because the agent-file contract launch_docker_agent
-  # writes — the `models:` map with `provider`/`base_url`/`token_key`, and
-  # `run`'s first positional being the agent file — is what that test
-  # verifies; bump deliberately and rerun the launch suite. v1.50.0, the
-  # build Docker Desktop ships, answers this same test with a 600s
-  # timeout, so the pin is also what keeps it honest.
+  # writes is what that test verifies; bump deliberately and rerun the
+  # launch suite. Not the v1.50.0 Docker Desktop ships: that build answers
+  # this test with a 600s timeout.
   DOCKER_AGENT_VERSION: "1.142.0"
 
 jobs:
@@ -1076,15 +1074,10 @@ jobs:
           echo "::error::grok never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
 
-      # Docker Agent ships one static binary per platform, covering every
-      # E2E target. Installed onto PATH rather than into
-      # `~/.docker/cli-plugins`: `launch_docker_agent` looks in the plugin
-      # directory too, but `run_launch` replaces HOME with a fresh temp
-      # directory, so under that harness only PATH can resolve it.
-      #
-      # No login and no `docker agent setup`: the agent file
-      # `launch_docker_agent` generates carries the endpoint, and the key
-      # reaches it through LLMMAN_API_KEY.
+      # One static binary per platform, covering every E2E target. Onto
+      # PATH rather than ~/.docker/cli-plugins, which run_launch's fresh
+      # HOME puts out of reach. No login needed: the generated agent file
+      # carries the endpoint, and the key arrives in LLMMAN_API_KEY.
       - name: Install Docker Agent (e2e)
         shell: bash
         run: |

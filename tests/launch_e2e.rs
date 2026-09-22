@@ -1208,11 +1208,10 @@ fn launch_docker_agent_with_model() {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
     }
-    // `on_path` alone, deliberately: `launch_docker_agent`'s other
-    // resolution path is `~/.docker/cli-plugins`, and `run_launch`
-    // replaces `HOME` with a fresh temp directory, so under this harness
-    // that fallback can never fire. CI installs the binary onto `PATH`
-    // for exactly that reason.
+    // `on_path` alone, though `find_docker_agent` also looks in
+    // `~/.docker/cli-plugins`: `run_launch` replaces `HOME` with a fresh
+    // temp directory, so that fallback can never fire under this
+    // harness. CI installs the binary onto `PATH` for that reason.
     if !on_path("docker-agent") {
         eprintln!(
             "skipping: docker-agent not on PATH — https://github.com/docker/docker-agent/releases"
@@ -1220,16 +1219,88 @@ fn launch_docker_agent_with_model() {
         return;
     }
 
-    // `--exec <prompt>`: docker-agent's own non-interactive mode, no TUI.
-    // `run` and the generated agent file are llmman's to supply (that
-    // file is `run`'s first positional), so they are absent here.
+    // These arguments land after the `run <agent file>` that
+    // `docker_agent_args` prepends, which is why neither appears here.
+    // `--exec` is docker-agent's non-interactive mode; `--yolo` would be
+    // pointless, since the generated agent declares no toolsets to
+    // approve.
     //
-    // No `--yolo`: the generated agent declares no toolsets, so there is
-    // nothing for docker-agent to ask approval for — see
-    // `docker_agent_document`, which keeps the request to a single
-    // `system` message because this very model's chat template rejects a
-    // second one.
-    launch_and_assert("docker-agent", &["--exec", PROMPT]);
+    // Not strict: this model has been seen to spend a whole run
+    // reasoning and stop without answering, which docker-agent reports
+    // as "produced only reasoning and no reply". That is sampling
+    // variance rather than a launcher fault, so exhausting the attempts
+    // warns instead of failing — the same call `launch_and_assert` makes
+    // for claude and codex.
+    launch_and_assert_with(
+        "docker-agent",
+        &["--exec", PROMPT],
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        |_stdout| false,
+        docker_agent_reply_is_pong,
+        false,
+        docker_agent_left_the_users_own_config_alone,
+    );
+}
+
+/// Whether the model's *reply* was "pong", ignoring the reasoning
+/// docker-agent prints before it.
+///
+/// This model reasons about the prompt itself: one run said `Wait, I
+/// need to check if I need to output the word "pong" or "Pong".` and
+/// then never answered — which `stdout.contains("pong")` would have
+/// called a pass. The reply is the last non-empty line, so that is what
+/// this reads.
+fn docker_agent_reply_is_pong(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .is_some_and(|reply| {
+            reply
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("pong")
+        })
+}
+
+/// Checks what `launch_docker_agent` promises: it writes its own agent
+/// file under `~/.config/llmman`, and puts nothing in docker-agent's own
+/// `~/.config/cagent`. The second is asserted as "no llmman settings in
+/// that file" rather than "that directory is absent", because
+/// docker-agent creates it itself on first run.
+fn docker_agent_left_the_users_own_config_alone(home: &Path) {
+    let generated = home.join(".config/llmman/launch/docker-agent/agent.yaml");
+    let text = std::fs::read_to_string(&generated)
+        .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));
+    assert!(
+        text.contains(&format!("base_url: \"{}/v1\"", llmman::daemon::server())),
+        "generated agent does not route at the daemon: {text}"
+    );
+    assert!(
+        // MODEL as `launch` resolves it before the launcher sees it,
+        // spelled out the way `launch_cline_with_model` does.
+        text.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
+        "generated agent does not name the resolved model: {text}"
+    );
+    // The key is named, not written, so a `--provider` launch cannot
+    // leave a real credential in this file.
+    assert!(
+        text.contains("token_key: LLMMAN_API_KEY"),
+        "generated agent does not read its key from the environment: {text}"
+    );
+    assert!(
+        !text.contains("api_key"),
+        "generated agent persisted a credential: {text}"
+    );
+
+    let theirs = home.join(".config/cagent/config.yaml");
+    if let Ok(text) = std::fs::read_to_string(&theirs) {
+        assert!(
+            !text.contains("llmman"),
+            "llmman wrote into docker-agent's own config at {}: {text}",
+            theirs.display()
+        );
+    }
 }
 
 #[test]
