@@ -296,12 +296,15 @@ and `globalState.json`, honouring `CLINE_DIR` like Cline does.
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own
 agent file under `~/.config/llmman/launch/docker-agent/` and passes it to
-`docker-agent run`; `~/.config/cagent` stays untouched. That agent is
-deliberately chat-only: Docker Agent sends each toolset's instructions as a
-*separate* `system` message, and many chat templates — including
-`qwen3.5`'s — reject a system message that isn't first. To run a tool-using
-agent against the same daemon, write your own agent file and run
-`docker-agent` directly:
+`docker-agent run`; `~/.config/cagent` stays untouched. With more than one
+Docker Agent installed, the one on `PATH` wins.
+
+That agent is deliberately chat-only: Docker Agent sends each toolset's
+instructions as a *separate* `system` message, and some chat templates
+reject a system message that isn't first. llmman cannot tell in advance
+which model will, so it generates what they all accept. To run a
+tool-using agent against the same daemon, write your own agent file and
+run `docker-agent` directly:
 
 ```yaml
 models:
