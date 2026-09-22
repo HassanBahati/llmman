@@ -2692,17 +2692,24 @@ fn check_docker_agent_args(extra_args: &[String]) -> anyhow::Result<()> {
         );
     }
     if let Some(file) = docker_agent_config_argument(extra_args) {
-        anyhow::bail!(
-            "llmman launch docker-agent passes its own agent file, so {file:?} would be read as a \
-             message rather than an agent.\n\
-             To run your own agent against this daemon, point its model at llmman and run \
-             docker-agent directly:\n  \
-             models:\n    llmman:\n      provider: openai\n      model: <model>\n      \
-             base_url: {}/v1\n      token_key: {DOCKER_AGENT_API_KEY_ENV}",
-            daemon::server()
-        );
+        anyhow::bail!(docker_agent_own_agent_file_error(file));
     }
     Ok(())
+}
+
+/// Split from `check_docker_agent_args` so a test can render a
+/// Windows-shaped path on any platform. `{file}`, never `{file:?}`:
+/// Debug doubles the `\` separators of a Windows path.
+fn docker_agent_own_agent_file_error(file: &str) -> String {
+    format!(
+        "llmman launch docker-agent passes its own agent file, so `{file}` would be read as a \
+         message rather than an agent.\n\
+         To run your own agent against this daemon, point its model at llmman and run \
+         docker-agent directly:\n  \
+         models:\n    llmman:\n      provider: openai\n      model: <model>\n      \
+         base_url: {}/v1\n      token_key: {DOCKER_AGENT_API_KEY_ENV}",
+        daemon::server()
+    )
 }
 
 /// `~/.config/llmman/launch/docker-agent`, derived from `llmman.conf`'s
@@ -4767,5 +4774,16 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(error.contains(&named), "{error}");
         assert!(error.contains("provider: openai"), "{error}");
         assert!(error.contains(DOCKER_AGENT_API_KEY_ENV), "{error}");
+    }
+
+    /// `{file:?}` echoed `C:\Users\...` back as `C:\\Users\\...`, twice
+    /// the backslashes the caller typed. Only the Windows CI legs had
+    /// separators to double, so only they caught it.
+    #[test]
+    fn docker_agent_agent_file_error_does_not_escape_a_windows_path() {
+        let windows = r"C:\Users\me\AppData\Local\Temp\team.yaml";
+        let error = docker_agent_own_agent_file_error(windows);
+        assert!(error.contains(windows), "{error}");
+        assert!(!error.contains(r"\\"), "separators were doubled: {error}");
     }
 }
