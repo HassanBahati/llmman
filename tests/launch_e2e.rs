@@ -1225,12 +1225,10 @@ fn launch_docker_agent_with_model() {
     // pointless, since the generated agent declares no toolsets to
     // approve.
     //
-    // Not strict: this model has been seen to spend a whole run
-    // reasoning and stop without answering, which docker-agent reports
-    // as "produced only reasoning and no reply". That is sampling
-    // variance rather than a launcher fault, so exhausting the attempts
-    // warns instead of failing — the same call `launch_and_assert` makes
-    // for claude and codex.
+    // Not strict: a thinking model can spend a whole run reasoning and
+    // stop without answering. That is sampling variance rather than a
+    // launcher fault, so exhausting the attempts warns instead of
+    // failing, as `launch_and_assert` does for claude and codex.
     launch_and_assert_with(
         "docker-agent",
         &["--exec", PROMPT],
@@ -1243,13 +1241,12 @@ fn launch_docker_agent_with_model() {
 }
 
 /// Whether the model's *reply* was "pong", ignoring the reasoning
-/// docker-agent prints before it.
+/// docker-agent prints above it.
 ///
-/// This model reasons about the prompt itself: one run said `Wait, I
-/// need to check if I need to output the word "pong" or "Pong".` and
-/// then never answered — which `stdout.contains("pong")` would have
-/// called a pass. The reply is the last non-empty line, so that is what
-/// this reads.
+/// A thinking model reasons about the prompt, so the word appears in its
+/// reasoning whether or not it ever answers — `stdout.contains("pong")`
+/// passes on a run that produced no reply. The reply is the last
+/// non-empty line.
 fn docker_agent_reply_is_pong(stdout: &str) -> bool {
     stdout
         .lines()

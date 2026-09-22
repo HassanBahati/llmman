@@ -2637,20 +2637,16 @@ fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// (same role as `QWEN_ENV_KEY` and `DSH_API_KEY_ENV`).
 const DOCKER_AGENT_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
-/// The name `docker_agent_document` gives its model entry, and the value
-/// the `root` agent it writes selects that entry by.
+/// The generated model entry's name, which its `root` agent selects it by.
 const DOCKER_AGENT_MODEL_NAME: &str = "llmman";
 
 /// docker-agent: write an agent file whose single `openai`-provider model
 /// points at this daemon, then hand that file to `docker-agent run`.
 ///
 /// An agent file, not docker-agent's own `~/.config/cagent/config.yaml`:
-/// a `providers:` or `models:` map there is ignored by v1.50.0 and
-/// v1.142.0 alike (`docker-agent models` still lists only the Docker
-/// Model Runner defaults, and selecting the entry fails with "agent
-/// 'root' references non-existent model"). Only the `models:` map in an
-/// agent file is read, so llmman writes one it owns and leaves
-/// `~/.config/cagent` alone.
+/// a `models:` map there is ignored, and the entry cannot then be
+/// selected. Writing one llmman owns also leaves `~/.config/cagent`
+/// alone.
 fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     // `run` has already rejected these arguments before starting the
     // daemon; repeated so a direct call to `launch` rejects them too.
@@ -2676,11 +2672,9 @@ fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> any
 /// daemon to decide, so `run` calls this before `ensure_server` and the
 /// refusal costs no daemon start and no model pull.
 fn check_docker_agent_args(extra_args: &[String]) -> anyhow::Result<()> {
-    // Refused, not warned about: docker-agent's `--model` replaces the
-    // model entry `docker_agent_document` wrote, `base_url` included, so
-    // the request goes to api.openai.com — carrying the real key under
-    // `--provider`. v1.50.0 and v1.142.0 both answer a forwarded
-    // `--model openai/<m>` by demanding an OpenAI key.
+    // Refused, not warned about: `--model` replaces the generated entry
+    // including its `base_url`, so the request goes to api.openai.com —
+    // carrying the real key under `--provider`.
     //
     // No `-m`: `run` has no such shorthand (`-a`, `-s`, `-w`, `-d`,
     // `-o`, `-h`), so matching it would refuse an unrelated argument.
@@ -2731,22 +2725,15 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
         .with_context(|| format!("write {}", path.display()))
 }
 
-/// The agent-file shape v1.50.0 and v1.142.0 read: a `models:` map, and
-/// an `agents.root` selecting one entry by name. `provider: openai`
-/// picks the API client; `base_url` is what aims it here.
+/// The agent file docker-agent reads: a `models:` map, and an
+/// `agents.root` naming one entry. `provider: openai` picks the API
+/// client, not the destination — `base_url` is what aims it here.
 ///
-/// `root` carries an `instruction` and nothing else. Each toolset and
-/// each `add_*` field arrives as its *own* `system` message (docker-agent's
-/// debug log: `add_date` alone sends `system_messages=2`, `shell` +
-/// `filesystem` send 3), and strict chat templates reject a system
-/// message that isn't first — `qwen3.5:0.8b` answers the second with
-/// HTTP 500 `Jinja Exception: System message must be at the beginning`,
-/// though `smollm2:135M-Q4_K_M` accepts all three. Tools would therefore
-/// work on only part of the catalog; a caller who wants them writes
-/// their own agent file (see `docker_agent_config_argument`).
-///
-/// Split from `write_docker_agent_file` to be assertable without a
-/// filesystem.
+/// `root` gets an `instruction` and nothing else: docker-agent sends
+/// each toolset and each `add_*` field as its own `system` message, and
+/// some chat templates reject a system message that isn't first. llmman
+/// cannot tell which model will, so it generates what they all accept;
+/// a caller who wants tools writes their own agent file.
 fn docker_agent_document(model: &str, base_url: &str) -> String {
     let quoted_model = yaml_quote(model);
     let quoted_base_url = yaml_quote(base_url);
@@ -2772,13 +2759,11 @@ fn docker_agent_args(path: &Path, extra_args: &[String]) -> Vec<String> {
 
 /// The caller's own agent file, if the first argument names one.
 ///
-/// Narrow on purpose — refusing a launch someone meant is worse than the
-/// confusion this prevents. Only the first argument (a later `.yaml` is a
-/// message or a flag's value, like `--prompt-file notes.yaml`), not a
-/// flag (`--exec "summarize the config.yaml"` is a message), and it must
-/// exist ("explain agent.yaml" names nothing on disk). The cost is a
-/// missed `--exec team.yaml`, which just reaches docker-agent as a
-/// message, as it would with no check at all.
+/// Narrow on purpose: refusing a launch someone meant is worse than the
+/// confusion this prevents. It must be the first argument, not a flag,
+/// and a file that exists — so a message ending in `.yaml`, or a path
+/// that is some flag's value, is left alone. A file behind a boolean
+/// flag is missed, and reaches docker-agent as a message.
 fn docker_agent_config_argument(extra_args: &[String]) -> Option<&String> {
     docker_agent_config_argument_with(extra_args, |path| Path::new(path).is_file())
 }
@@ -4608,9 +4593,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(!document.contains("sk-"), "{document}");
     }
 
-    /// Each toolset and `add_*` field arrives as its own `system`
-    /// message, and strict templates (`qwen3.5:0.8b`'s) answer a second
-    /// with HTTP 500. See `docker_agent_document`.
+    /// Each toolset and `add_*` field adds a `system` message, which
+    /// some chat templates reject. See `docker_agent_document`.
     #[test]
     fn docker_agent_document_sends_a_single_system_message() {
         let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
