@@ -7,8 +7,9 @@ use super::ollama::{
     OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
-    apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
-    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
+    apply_default_repeat_penalty, apply_reasoning_effort, consolidate_chat_system_messages,
+    mlx_embeddings_unsupported_response, multipart_form, multipart_text_field, omni_image_request,
+    omni_video_fields,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{rewrite_json_response_model, rewrite_sse_line_model, set_response_model};
@@ -3893,6 +3894,126 @@ fn consolidate_responses_instructions_is_a_no_op_without_developer_or_system_ite
     let before = req.clone();
     consolidate_responses_instructions(&mut req);
     assert_eq!(req, before);
+}
+
+/// An agent runner sends one `system` message per toolset, which a
+/// strict template refuses past the first.
+#[test]
+fn consolidate_chat_system_messages_merges_them_into_one_leading_message() {
+    let mut req = serde_json::json!({
+        "model": "docker.io/ai/qwen3.5:0.8b",
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "## Shell Tools"},
+            {"role": "developer", "content": [{"type": "text", "text": "## Filesystem Tools"}]}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content":
+                "you are a helpful assistant\n\n## Shell Tools\n\n## Filesystem Tools"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// The common shape, and the one every ordinary request pays for:
+/// already-leading system message, returned byte for byte.
+#[test]
+fn consolidate_chat_system_messages_leaves_a_single_leading_one_alone() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// Rebuilding a conforming request would flatten its content to text
+/// and drop every block that isn't.
+#[test]
+fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// A late system turn is the shape templates reject, so it moves — and
+/// reorders relative to the user turn before it, as `/v1/messages` does.
+#[test]
+fn consolidate_chat_system_messages_moves_a_late_lone_system_turn_to_the_front() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "a mid-conversation reminder"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "a mid-conversation reminder"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// A request with no system message must not gain one.
+#[test]
+fn consolidate_chat_system_messages_is_a_no_op_without_any() {
+    let mut req = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+
+    // An embeddings-shaped body has no `messages` at all.
+    let mut input_only = serde_json::json!({"input": "hi"});
+    let before = input_only.clone();
+    consolidate_chat_system_messages(&mut input_only);
+    assert_eq!(input_only, before);
+}
+
+/// An empty system message must not join a blank line into the merge.
+#[test]
+fn consolidate_chat_system_messages_drops_empty_ones() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "the only real instruction"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "the only real instruction"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
 }
 
 // -- Tests ported from ollama ---------------------------------------------

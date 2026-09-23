@@ -14,6 +14,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
+use super::messages::content_text;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_rewriting_model, relay, relay_chat_upstream, stream_rewriting_model,
@@ -83,6 +84,57 @@ pub(super) fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
     if req.get("repeat_penalty").is_none() {
         req["repeat_penalty"] = serde_json::json!(DEFAULT_REPEAT_PENALTY);
     }
+}
+
+/// Merges every `system` and `developer` message into one leading
+/// `system` message, joined by a blank line.
+///
+/// Strict chat templates refuse a system message anywhere but index 0,
+/// and a client may legitimately send several — an agent runner sends
+/// one per toolset. `/v1/messages` and `/v1/responses` already merge
+/// (`messages::from_messages_request`,
+/// `consolidate_responses_instructions`); this is the same for the third
+/// surface. Callers pass local targets only, so a provider still gets
+/// the array as written.
+pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
+    fn role(message: &serde_json::Value) -> &str {
+        message.get("role").and_then(|v| v.as_str()).unwrap_or("")
+    }
+    fn leads(message: &serde_json::Value) -> bool {
+        matches!(role(message), "system" | "developer")
+    }
+
+    let Some(messages) = req.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    // Already one leading system message: return it untouched rather
+    // than rebuild it, which would flatten block content to text.
+    let conforming = messages
+        .iter()
+        .enumerate()
+        .all(|(i, m)| !leads(m) || i == 0)
+        && messages.first().map(role) != Some("developer");
+    if conforming {
+        return;
+    }
+    let mut system = Vec::new();
+    messages.retain(|message| {
+        if !leads(message) {
+            return true;
+        }
+        let text = content_text(message.get("content").unwrap_or(&serde_json::Value::Null));
+        if !text.is_empty() {
+            system.push(text);
+        }
+        false
+    });
+    if system.is_empty() {
+        return;
+    }
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": system.join("\n\n") }),
+    );
 }
 
 /// Mirrors a local chat completion's `reasoning_effort` into the
@@ -266,6 +318,7 @@ async fn proxy_openai_generation_to(
             apply_default_repeat_penalty(&mut req);
             if llama_path == CHAT_COMPLETIONS_ROUTE {
                 apply_reasoning_effort(&mut req);
+                consolidate_chat_system_messages(&mut req);
             }
         }
     }
