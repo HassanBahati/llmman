@@ -3955,6 +3955,36 @@ fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
     assert_eq!(req, before);
 }
 
+/// Folding content to text drops every block that isn't text, which
+/// forwards a truncated prompt with no error.
+#[test]
+fn consolidate_chat_system_messages_keeps_non_text_blocks_while_merging() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "and cite sources"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "text", "text": "and cite sources"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
 /// A late system turn is the shape templates reject, so it moves — and
 /// reorders relative to the user turn before it, as `/v1/messages` does.
 #[test]

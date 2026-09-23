@@ -117,24 +117,74 @@ pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
     if conforming {
         return;
     }
-    let mut system = Vec::new();
+    let mut merged = MergedInstructions::default();
     messages.retain(|message| {
         if !leads(message) {
             return true;
         }
-        let text = content_text(message.get("content").unwrap_or(&serde_json::Value::Null));
-        if !text.is_empty() {
-            system.push(text);
-        }
+        merged.push(message.get("content").unwrap_or(&serde_json::Value::Null));
         false
     });
-    if system.is_empty() {
+    let Some(content) = merged.finish() else {
         return;
-    }
+    };
     messages.insert(
         0,
-        serde_json::json!({ "role": "system", "content": system.join("\n\n") }),
+        serde_json::json!({ "role": "system", "content": content }),
     );
+}
+
+/// The merged instruction content, built in order. Text joins into one
+/// run separated by a blank line; a non-text block closes that run and
+/// is kept as itself, making the result a block array.
+#[derive(Default)]
+struct MergedInstructions {
+    blocks: Vec<serde_json::Value>,
+    text: Vec<String>,
+}
+
+impl MergedInstructions {
+    fn push(&mut self, content: &serde_json::Value) {
+        match content {
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        self.push_text(part.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                    } else {
+                        self.flush_text();
+                        self.blocks.push(part.clone());
+                    }
+                }
+            }
+            other => self.push_text(&content_text(other)),
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.text.push(text.to_string());
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            let text = std::mem::take(&mut self.text).join("\n\n");
+            self.blocks
+                .push(serde_json::json!({"type": "text", "text": text}));
+        }
+    }
+
+    /// A plain string when the instructions are text alone.
+    fn finish(mut self) -> Option<serde_json::Value> {
+        self.flush_text();
+        match self.blocks.len() {
+            0 => None,
+            1 if self.blocks[0].get("type").and_then(|v| v.as_str()) == Some("text") => {
+                self.blocks[0].get("text").cloned()
+            }
+            _ => Some(serde_json::Value::Array(self.blocks)),
+        }
+    }
 }
 
 /// Mirrors a local chat completion's `reasoning_effort` into the
