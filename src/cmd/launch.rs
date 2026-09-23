@@ -2731,11 +2731,16 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
 /// `agents.root` naming one entry. `provider: openai` picks the API
 /// client, not the destination — `base_url` is what aims it here.
 ///
-/// `root` gets an `instruction` and nothing else: docker-agent sends
-/// each toolset and each `add_*` field as its own `system` message, and
-/// some chat templates reject a system message that isn't first. llmman
-/// cannot tell which model will, so it generates what they all accept;
-/// a caller who wants tools writes their own agent file.
+/// `root` gets the `shell` and `filesystem` toolsets — the two
+/// docker-agent's own guidance calls the ones most agents need. It asks
+/// before each call unless the caller passes `--yolo`, so granting an
+/// agent's writes stays the caller's decision, as it is for goose.
+///
+/// docker-agent sends each toolset's instructions as its own `system`
+/// message, which strict chat templates refuse anywhere but first. The
+/// daemon merges them (`consolidate_chat_system_messages`), so the
+/// agent that reaches the model carries one leading system message
+/// whatever the template accepts.
 fn docker_agent_document(model: &str, base_url: &str) -> String {
     let quoted_model = yaml_quote(model);
     let quoted_base_url = yaml_quote(base_url);
@@ -2746,7 +2751,9 @@ fn docker_agent_document(model: &str, base_url: &str) -> String {
          base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n\
          agents:\n  root:\n    model: {DOCKER_AGENT_MODEL_NAME}\n    \
          description: The agent `llmman launch docker-agent` runs.\n    \
-         instruction: You are a helpful AI assistant.\n"
+         instruction: You are a helpful AI assistant with access to the shell and \
+         the filesystem.\n    \
+         toolsets:\n      - type: shell\n      - type: filesystem\n"
     )
 }
 
@@ -4595,18 +4602,16 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(!document.contains("sk-"), "{document}");
     }
 
-    /// Each toolset and `add_*` field adds a `system` message, which
-    /// some chat templates reject. See `docker_agent_document`.
+    /// A launched agent that can only chat is not much of an agent. The
+    /// extra `system` message each toolset adds is handled by the daemon
+    /// (`consolidate_chat_system_messages`), not by leaving them out.
     #[test]
-    fn docker_agent_document_sends_a_single_system_message() {
+    fn docker_agent_document_gives_the_agent_shell_and_filesystem() {
         let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
         assert!(document.contains("instruction:"), "{document}");
-        for appends_a_system_message in ["toolsets:", "add_date:", "add_environment_info:"] {
-            assert!(
-                !document.contains(appends_a_system_message),
-                "{appends_a_system_message} appends a second system message\n{document}"
-            );
-        }
+        assert!(document.contains("toolsets:"), "{document}");
+        assert!(document.contains("- type: shell"), "{document}");
+        assert!(document.contains("- type: filesystem"), "{document}");
     }
 
     /// Unquoted, `docker.io/ai/qwen3.5:0.8b` parses as a mapping at the

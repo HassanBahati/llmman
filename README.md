@@ -299,28 +299,10 @@ agent file under `~/.config/llmman/launch/docker-agent/` and passes it to
 `docker-agent run`; `~/.config/cagent` stays untouched. With more than one
 Docker Agent installed, the one on `PATH` wins.
 
-That agent is deliberately chat-only: Docker Agent sends each toolset's
-instructions as a *separate* `system` message, and some chat templates
-reject a system message that isn't first. llmman cannot tell in advance
-which model will, so it generates what they all accept. To run a
-tool-using agent against the same daemon, write your own agent file and
-run `docker-agent` directly:
-
-```yaml
-models:
-  llmman:
-    provider: openai
-    model: qwen3.8
-    base_url: http://127.0.0.1:17434/v1
-    token_key: LLMMAN_API_KEY
-agents:
-  root:
-    model: llmman
-    instruction: You are a helpful AI assistant.
-    toolsets:
-      - type: shell
-      - type: filesystem
-```
+The generated agent gets the `shell` and `filesystem` toolsets. Docker
+Agent asks before each tool call unless you pass `--yolo`. To run an
+agent of your own instead, point its model at the daemon and run
+`docker-agent` directly.
 
 ### Hosted providers
 
