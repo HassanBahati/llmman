@@ -2660,7 +2660,7 @@ fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> any
         )
     })?;
 
-    let path = docker_agent_config_dir()?.join("agent.yaml");
+    let path = docker_agent_agent_file(&docker_agent_config_dir()?);
     write_docker_agent_file(&path, model, &format!("{}/v1", daemon::server()))?;
 
     let args = docker_agent_args(&path, extra_args);
@@ -2716,6 +2716,13 @@ fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
     let conf = crate::config::user_path().context("no home directory")?;
     let dir = conf.parent().context("llmman.conf has no directory")?;
     Ok(dir.join("launch").join("docker-agent"))
+}
+
+/// The agent file this launch writes, named after the running process.
+/// One fixed name would let a concurrent launch overwrite it between
+/// this write and docker-agent's read, running that launch's model.
+fn docker_agent_agent_file(dir: &Path) -> PathBuf {
+    dir.join(format!("agent-{}.yaml", std::process::id()))
 }
 
 fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
@@ -4672,6 +4679,17 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         // but does not exist is prose too.
         let absent = ["explain agent.yaml".to_string()];
         assert_eq!(docker_agent_config_argument_with(&absent, |_| false), None);
+    }
+
+    /// A fixed name would let a concurrent launch overwrite the file
+    /// before docker-agent reads it.
+    #[test]
+    fn docker_agent_names_its_agent_file_after_the_running_process() {
+        let dir = Path::new("/tmp/llmman/launch/docker-agent");
+        assert_eq!(
+            docker_agent_agent_file(dir),
+            dir.join(format!("agent-{}.yaml", std::process::id()))
+        );
     }
 
     /// The plugin directory is not on `PATH`, so without the fallback a

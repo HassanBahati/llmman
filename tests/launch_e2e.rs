@@ -1266,17 +1266,11 @@ fn docker_agent_reply_is_pong(stdout: &str) -> bool {
 /// that file" rather than "that directory is absent", because
 /// docker-agent creates it itself on first run.
 ///
-/// Unix only. `docker_agent_config_dir` resolves through
-/// `dirs::home_dir`, which on Windows reads the known-folder API rather
-/// than the `HOME`/`USERPROFILE` `run_launch` sets — so the launcher
-/// writes outside this temp home there and none of these paths exist.
-/// The document itself is asserted by `docker_agent_document`'s own unit
-/// tests, which run on every platform.
+/// Runs on every platform: `docker_agent_config_dir` hangs off
+/// `llmman.conf`'s directory, which resolves `~` through
+/// `HOME`/`USERPROFILE`, so Windows writes into this temp home too.
 fn docker_agent_left_the_users_own_config_alone(home: &Path) {
-    if cfg!(windows) {
-        return;
-    }
-    let generated = home.join(".config/llmman/launch/docker-agent/agent.yaml");
+    let generated = docker_agent_generated_file(home);
     let text = std::fs::read_to_string(&generated)
         .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));
     assert!(
@@ -1308,6 +1302,30 @@ fn docker_agent_left_the_users_own_config_alone(home: &Path) {
             theirs.display()
         );
     }
+}
+
+/// The agent file the launch wrote, matched rather than spelled out
+/// because `launch_docker_agent` names it after its own process id.
+/// This `HOME` is fresh, so exactly one launch has written here.
+fn docker_agent_generated_file(home: &Path) -> PathBuf {
+    let dir = home.join(".config/llmman/launch/docker-agent");
+    let mut written: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("read directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".yaml"))
+        })
+        .collect();
+    written.sort();
+    assert_eq!(
+        written.len(),
+        1,
+        "expected one generated agent file in {}, found {written:?}",
+        dir.display()
+    );
+    written.remove(0)
 }
 
 #[test]
