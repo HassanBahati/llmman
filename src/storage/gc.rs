@@ -85,6 +85,16 @@ impl GcFileAccount {
     }
 }
 
+/// Treats a path removed by a concurrent sweep as absent; other I/O errors
+/// still abort retained-file accounting.
+fn ignore_not_found<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(unix)]
 fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Option<GcFileIdentity> {
     use std::os::unix::fs::MetadataExt as _;
@@ -160,13 +170,17 @@ fn remember_retained_blobs(
     account: &mut GcFileAccount,
 ) -> anyhow::Result<()> {
     let blobs_dir = store_root.join("blobs").join("sha256");
-    let entries = match std::fs::read_dir(&blobs_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", blobs_dir.display())),
+    let Some(entries) = ignore_not_found(std::fs::read_dir(&blobs_dir))
+        .with_context(|| format!("read {}", blobs_dir.display()))?
+    else {
+        return Ok(());
     };
     for entry in entries {
-        let Ok(entry) = entry else { continue };
+        let Some(entry) = ignore_not_found(entry)
+            .with_context(|| format!("read entry in {}", blobs_dir.display()))?
+        else {
+            continue;
+        };
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -191,45 +205,72 @@ fn remember_retained_cache_files(
         .iter()
         .filter_map(|d| d.strip_prefix("sha256:"))
         .collect();
-    let entries = match std::fs::read_dir(cache_path) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", cache_path.display())),
+    let Some(entries) = ignore_not_found(std::fs::read_dir(cache_path))
+        .with_context(|| format!("read {}", cache_path.display()))?
+    else {
+        return Ok(());
     };
     for entry in entries {
-        let Ok(entry) = entry else { continue };
+        let Some(entry) = ignore_not_found(entry)
+            .with_context(|| format!("read entry in {}", cache_path.display()))?
+        else {
+            continue;
+        };
         let path = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let Some(file_type) = ignore_not_found(entry.file_type())
+            .with_context(|| format!("inspect {}", path.display()))?
+        else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if live_hex.contains(name) || !is_older_than(&path, grace) {
-            remember_cache_dir_files(&path, grace, account);
+            remember_cache_dir_files(&path, grace, account)?;
         }
     }
     Ok(())
 }
 
-fn remember_cache_dir_files(dir: &Path, grace: Duration, account: &mut GcFileAccount) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn remember_cache_dir_files(
+    dir: &Path,
+    grace: Duration,
+    account: &mut GcFileAccount,
+) -> anyhow::Result<()> {
+    let Some(entries) = ignore_not_found(std::fs::read_dir(dir))
+        .with_context(|| format!("read {}", dir.display()))?
+    else {
+        return Ok(());
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            remember_cache_dir_files(&path, grace, account);
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    for entry in entries {
+        let Some(entry) =
+            ignore_not_found(entry).with_context(|| format!("read entry in {}", dir.display()))?
+        else {
             continue;
         };
-        if is_cache_copy_temp_name(name) && is_older_than(&path, grace) {
+        let path = entry.path();
+        let Some(file_type) = ignore_not_found(entry.file_type())
+            .with_context(|| format!("inspect {}", path.display()))?
+        else {
+            continue;
+        };
+        if file_type.is_dir() {
+            remember_cache_dir_files(&path, grace, account)?;
+            continue;
+        }
+        let is_stale_copy_temp = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| is_cache_copy_temp_name(name) && is_older_than(&path, grace));
+        if is_stale_copy_temp {
             continue;
         }
         account.remember(&path);
     }
+    Ok(())
 }
 
 fn prune_blobs_with_account(
@@ -665,6 +706,49 @@ mod tests {
             cache_file.exists(),
             "fresh cache dir keeps its hardlink to the bytes"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn remember_cache_dir_files_ignores_missing_dirs_but_returns_other_read_errors() {
+        let root = temp_dir("remember-cache-read-error");
+        std::fs::create_dir_all(&root).unwrap();
+        remember_cache_dir_files(
+            &root.join("missing"),
+            Duration::ZERO,
+            &mut GcFileAccount::default(),
+        )
+        .unwrap();
+
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, b"cache entry").unwrap();
+
+        let error = remember_cache_dir_files(&file, Duration::ZERO, &mut GcFileAccount::default())
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("read {}", file.display())),
+            "unexpected error: {error:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remember_cache_dir_files_includes_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = temp_dir("remember-cache-non-utf8");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::write(&file, b"cache entry").unwrap();
+        let mut account = GcFileAccount::default();
+
+        remember_cache_dir_files(&root, Duration::ZERO, &mut account).unwrap();
+
+        assert_eq!(account.size(&file), 0, "retained file was not remembered");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
