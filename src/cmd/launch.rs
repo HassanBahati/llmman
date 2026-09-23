@@ -94,6 +94,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let mut thinking = None;
     let mut vision = false;
     let mut context_length = None;
+    // The window the daemon serves, for the integrations that declare
+    // one — set only in the arm below that has an answer. See `launch`.
+    let mut context_window = None;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -153,7 +156,22 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
-                None => (model, integration_key()),
+                None => {
+                    // The only launch whose window llmman can state: the
+                    // daemon serves this model itself, whole. A pair's
+                    // local half is the side the daemon overflows *away*
+                    // from (see docs/providers.md, "Which side serves a
+                    // request") — declaring its window would have the
+                    // agent compact to stay local, which is what the
+                    // overflow retry exists to avoid. A --provider model
+                    // is served by someone else entirely, and
+                    // LLMMAN_CONTEXT_LENGTH describes only this daemon.
+                    context_window = served_context_window(
+                        super::serve::context_length_from_env(),
+                        context_length,
+                    );
+                    (model, integration_key())
+                }
             }
         }
     };
@@ -165,6 +183,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         thinking.as_ref(),
         vision,
         context_length,
+        context_window,
         &args.extra_args,
     )
 }
@@ -683,6 +702,25 @@ fn accepts_install(answer: &str) -> bool {
 /// the integration's environment can do this; the ones that go through a
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
+///
+/// The two context arguments are deliberately not one. `context_window`
+/// is the window the daemon serves, already resolved by
+/// [`served_context_window`] and `None` unless this is a plain local
+/// model (see `run`); it is what the integrations that declare a window
+/// are told, opencode so far.
+///
+/// `context_length` is the raw trained context, unresolved. codex takes
+/// it because its catalog cannot omit a `context_window`, so it resolves
+/// one itself, unconditionally — for a `--provider` model and a hybrid
+/// pair too — falling back to [`CODEX_FALLBACK_CONTEXT_WINDOW`] rather
+/// than leave the field out. pi still takes it only because it has not
+/// been moved over yet: it writes the value straight into
+/// `contextWindow`, so it currently reports the trained context where
+/// `context_window` would report the served one. Collapsing the two
+/// arguments would silently extend codex's guess to everyone else.
+// Each launcher below takes its own subset of these; threading them
+// through a struct would only move the fan-out one level down.
+#[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
     model: &str,
@@ -690,11 +728,12 @@ fn launch(
     thinking: Option<&ThinkingControls>,
     vision: bool,
     context_length: Option<u64>,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
+        "opencode" => launch_opencode(model, api_key, thinking, vision, context_window, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
         "pi" => launch_pi(model, thinking, vision, context_length, extra_args),
         "cline" => launch_cline(model, extra_args),
@@ -743,13 +782,14 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants and, for a vision
-/// model, image input.
+/// /v1 endpoint, with the model's thinking variants, its window and, for
+/// a vision model, image input.
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&ThinkingControls>,
     vision: bool,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
@@ -761,6 +801,7 @@ fn launch_opencode(
         api_key,
         &opencode_variants(thinking),
         vision,
+        context_window,
     );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
@@ -835,6 +876,28 @@ fn opencode_fallback_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// opencode's own `OUTPUT_TOKEN_MAX` (`provider/transform.ts`), the cap
+/// it applies to `limit.output` and the value it substitutes for a 0.
+const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
+
+/// `limit.output` for a window of `context`. opencode puts this one
+/// field to two jobs, and it is a real trade-off rather than a free
+/// choice: it is the headroom subtracted to decide when to compact
+/// (`session/overflow.ts`, `usable` = `context - output`) *and* the
+/// `maxOutputTokens` sent on every request (`session/llm/request.ts`),
+/// so a larger value compacts sooner and a smaller one caps replies
+/// shorter.
+///
+/// A quarter of the window, never above opencode's own maximum, and
+/// never 0 — which opencode reads as "unset" and substitutes that full
+/// 32,000 for, leaving anything below a 32k window with no usable budget
+/// at all and so permanently overflowed. The quarter keeps three
+/// quarters of the window usable while still allowing a reply far longer
+/// than the model can actually produce in one turn at that size.
+fn opencode_output_reserve(context: u64) -> u64 {
+    (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
+}
+
 /// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
 /// than `json!`, whose map sorts keys: opencode cycles variants in the
 /// order listed. No variants leaves the key out.
@@ -844,6 +907,7 @@ fn opencode_config(
     api_key: &str,
     variants: &[(&'static str, serde_json::Value)],
     vision: bool,
+    context_window: Option<u64>,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -894,11 +958,19 @@ fn opencode_config(
         modalities: Option<Modalities>,
         #[serde(skip_serializing_if = "Option::is_none")]
         attachment: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<Limit>,
     }
     #[derive(serde::Serialize)]
     struct Modalities {
         input: &'static [&'static str],
         output: &'static [&'static str],
+    }
+    /// opencode's schema requires both fields once `limit` is present.
+    #[derive(serde::Serialize)]
+    struct Limit {
+        context: u64,
+        output: u64,
     }
 
     // Declare image input for a vision model so opencode will attach
@@ -906,6 +978,16 @@ fn opencode_config(
     let modalities = vision.then_some(Modalities {
         input: &["text", "image"],
         output: &["text"],
+    });
+
+    // Without `limit`, opencode normalizes a config-defined model to
+    // `{context: 0, output: 0}` and then skips overflow detection
+    // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
+    // a session never auto-compacts. Declared only when llmman knows the
+    // window; otherwise the key stays out rather than assert a guess.
+    let limit = context_window.map(|context| Limit {
+        context,
+        output: opencode_output_reserve(context),
     });
 
     let config = Config {
@@ -925,6 +1007,7 @@ fn opencode_config(
                         variants,
                         modalities,
                         attachment: vision.then_some(true),
+                        limit,
                     },
                 )],
             },
@@ -1180,14 +1263,34 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// a trained context; ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-/// What codex compacts against: a positive `LLMMAN_CONTEXT_LENGTH`
-/// (`env`), the `--ctx-size` the daemon serves, else the model's
-/// `trained` context, else [`CODEX_FALLBACK_CONTEXT_WINDOW`].
+/// What codex compacts against: [`served_context_window`], else
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`] — codex's catalog cannot omit the
+/// field, so it guesses rather than stay quiet (see `launch`).
 fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
+    served_context_window(env, trained).unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+}
+
+/// The window the daemon serves: a positive `LLMMAN_CONTEXT_LENGTH`
+/// (`env`), the `--ctx-size` it was started with, else the model's
+/// `trained` context ([`crate::daemon::ShowResponse::context_length`]).
+///
+/// The trained context is capped at [`super::serve::DEFAULT_CTX_SIZE`],
+/// because that is where `initial_ctx_size` caps it: with no explicit
+/// `LLMMAN_CONTEXT_LENGTH` a load starts at the 256k default clamped
+/// *down* to the trained context, so a model trained beyond it is still
+/// only served 256k. Reporting the full trained window for one of those
+/// would have an agent hold a history the backend then refuses. An
+/// explicit `env` is not capped — `initial_ctx_size` forwards a user's
+/// own value for a non-embedding model, so it is what gets served.
+///
+/// `None` when neither is known, which every caller but codex passes
+/// straight through as "say nothing" — an integration's own default is
+/// better than a number llmman made up. Shared with the other launchers
+/// whose config declares a window, opencode's `limit.context` first.
+fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
     env.filter(|n| *n > 0)
         .map(u64::from)
-        .or(trained)
-        .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+        .or_else(|| trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))))
 }
 
 /// The `model_catalog_json` for `model`, declaring its image input in
@@ -3708,6 +3811,7 @@ model = \"gpt-5\"
             "k",
             &variants,
             false,
+            None,
         );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
@@ -3732,13 +3836,13 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[], false);
+        let bare = opencode_config("http://h", "m", "k", &[], false, None);
         assert!(!bare.contains("variants"), "{bare}");
     }
 
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], true);
+        let text = opencode_config("http://h", "m", "k", &[], true, None);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -3747,16 +3851,54 @@ model = \"gpt-5\"
         );
         assert_eq!(model["attachment"], true);
 
-        let text_only = opencode_config("http://h", "m", "k", &[], false);
+        let text_only = opencode_config("http://h", "m", "k", &[], false, None);
         assert!(!text_only.contains("modalities"), "{text_only}");
         assert!(!text_only.contains("attachment"), "{text_only}");
+    }
+
+    /// opencode compacts at `context - output`, so the reserve has to
+    /// scale with the window: its own 32,000 default would leave any
+    /// smaller window with no usable budget and so permanently
+    /// overflowed.
+    #[test]
+    fn opencode_output_reserve_scales_with_the_window_and_is_never_zero() {
+        let cases = [
+            (4096, 1024),
+            (32768, 8192),
+            (131072, 32000),
+            // Capped at opencode's own maximum, however large the window.
+            (1 << 20, OPENCODE_OUTPUT_TOKEN_MAX),
+            // Never 0, which opencode reads as "unset" and replaces with
+            // the full 32,000.
+            (1, 1),
+            (3, 1),
+        ];
+        for (context, want) in cases {
+            assert_eq!(opencode_output_reserve(context), want, "context={context}");
+        }
+    }
+
+    /// Without `limit`, opencode normalizes the entry to a 0 context and
+    /// then never auto-compacts at all, so the window has to travel.
+    #[test]
+    fn opencode_config_declares_the_window_only_when_it_is_known() {
+        let text = opencode_config("http://h", "m", "k", &[], false, Some(8192));
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
+        assert_eq!(limit["context"], 8192);
+        // Both keys are required once `limit` is present.
+        assert_eq!(limit["output"], 2048);
+
+        // No window: the key stays out and opencode keeps its defaults.
+        let unknown = opencode_config("http://h", "m", "k", &[], false, None);
+        assert!(!unknown.contains("limit"), "{unknown}");
     }
 
     #[test]
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
         let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false))
+            serde_json::from_str(&opencode_config("http://h", model, "k", &[], false, None))
                 .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
@@ -3880,13 +4022,55 @@ model = \"gpt-5\"
             // Unset or 0: the trained context.
             (None, Some(32768), 32768),
             (Some(0), Some(32768), 32768),
-            (None, Some(1 << 20), 1 << 20),
+            // ...but only as far as the default a load actually starts
+            // at. Before `served_context_window` this reported the full
+            // trained window, which is more than the daemon serves.
+            (
+                None,
+                Some(1 << 20),
+                u64::from(super::super::serve::DEFAULT_CTX_SIZE),
+            ),
             (Some(0), None, CODEX_FALLBACK_CONTEXT_WINDOW),
             (None, None, CODEX_FALLBACK_CONTEXT_WINDOW),
         ];
         for (env, trained, want) in cases {
             assert_eq!(
                 codex_context_window(env, trained),
+                want,
+                "env={env:?} trained={trained:?}"
+            );
+        }
+    }
+
+    /// The same precedence, minus codex's guess: the launchers that may
+    /// omit the key see `None` instead of a fallback, so an integration's
+    /// own default stands rather than a number llmman invented.
+    #[test]
+    fn served_context_window_prefers_the_environment_then_the_trained_context() {
+        let cases = [
+            (Some(16384), Some(32768), Some(16384)),
+            (Some(65536), Some(32768), Some(65536)),
+            (Some(16384), None, Some(16384)),
+            (None, Some(32768), Some(32768)),
+            (Some(0), Some(32768), Some(32768)),
+            // A trained context past the 256k default is not what gets
+            // served: `initial_ctx_size` clamps the default down to the
+            // trained context, never up to it.
+            (
+                None,
+                Some(1 << 20),
+                Some(u64::from(super::super::serve::DEFAULT_CTX_SIZE)),
+            ),
+            // An explicit value is forwarded uncapped, so it stands.
+            (Some(1 << 20), Some(1 << 20), Some(1 << 20)),
+            // Neither: say nothing. This is the whole difference from
+            // codex, which guesses CODEX_FALLBACK_CONTEXT_WINDOW here.
+            (Some(0), None, None),
+            (None, None, None),
+        ];
+        for (env, trained, want) in cases {
+            assert_eq!(
+                served_context_window(env, trained),
                 want,
                 "env={env:?} trained={trained:?}"
             );
