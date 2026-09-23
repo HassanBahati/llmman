@@ -1082,23 +1082,23 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          case "${{ runner.os }}" in
-            Linux)   os=linux ;;
-            macOS)   os=darwin ;;
-            Windows) os=windows ;;
+          # A digest per asset, checked before the binary is made
+          # executable: HTTPS authenticates the host, not the bytes, and a
+          # release asset can be replaced under the same tag. Recompute
+          # these when DOCKER_AGENT_VERSION moves (`curl -sL <url> | shasum
+          # -a 256`), as the AGY step below does for its archives.
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)     asset=docker-agent-linux-amd64;       digest=3337bb2c6cd83f23e44a2f9a76f8ceaf05c242db50c2b9b783a2d6eb014d2c20 ;;
+            Linux-ARM64)   asset=docker-agent-linux-arm64;       digest=bf3ba6a4def17427cae3ed283ee3d0eef90290300fbec4ea2ecda4ea452462d8 ;;
+            macOS-X64)     asset=docker-agent-darwin-amd64;      digest=f9102143f5d96d951263d8bf9614603b328a2f51b3e824dcb56013b766f331a4 ;;
+            macOS-ARM64)   asset=docker-agent-darwin-arm64;      digest=33a3d04855f22fc65bb1d1ed02da59d5b32d761d501debbf11b92d26cb740a15 ;;
+            Windows-X64)   asset=docker-agent-windows-amd64.exe; digest=d522a46babc8ea5d1704c66b35b6a32a5ba119807c1d4a4ef88c7862d9b9a6f5 ;;
+            Windows-ARM64) asset=docker-agent-windows-arm64.exe; digest=2862312b878518fc11a2b8b7cf8c9dc5d74d7c51b22ed1cf72387cbdce966977 ;;
+            *) echo "::warning::no Docker Agent build for ${{ runner.os }}-${{ runner.arch }}; launch_docker_agent_with_model will skip"; exit 0 ;;
           esac
-          case "${{ runner.arch }}" in
-            X64)   arch=amd64 ;;
-            ARM64) arch=arm64 ;;
-            *)     echo "::warning::no Docker Agent build for ${{ runner.arch }}; launch_docker_agent_with_model will skip"; exit 0 ;;
-          esac
-          asset="docker-agent-$os-$arch"
           bin_dir="$HOME/.docker-agent/bin"
           bin="$bin_dir/docker-agent"
-          if [ "$os" = "windows" ]; then
-            asset="$asset.exe"
-            bin="$bin.exe"
-          fi
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
           mkdir -p "$bin_dir"
 
           max_attempts=6
@@ -1108,6 +1108,13 @@ jobs:
             if ! curl -fsSL -o "$bin" \
               "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
               echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif ! (cd "$bin_dir" && if command -v sha256sum >/dev/null 2>&1; then
+                      echo "$digest  $(basename "$bin")" | sha256sum -c -
+                    else
+                      echo "$digest  $(basename "$bin")" | shasum -a 256 -c -
+                    fi); then
+              echo "::error::docker-agent $asset did not match its pinned SHA-256"
+              exit 1
             else
               chmod +x "$bin"
               # `version`, not `--version`: docker-agent rejects the flag.
