@@ -17,6 +17,8 @@ always use whichever store the daemon was started with; set `LLMMAN_MODELS`
 before `llmman serve` to change it for all of them. `transfer`, `login`, and
 `logout` never touch a local store at all.
 
+If `LLMMAN_MODELS` puts the store on a different filesystem from its sibling cache (`<store>/../cache`), llmman copies cached model files instead of hardlinking them.
+
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
 ## llmman.conf
