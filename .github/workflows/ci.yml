@@ -1105,7 +1105,11 @@ jobs:
           for attempt in $(seq 1 "$max_attempts"); do
             next="retrying"
             [ "$attempt" -eq "$max_attempts" ] && next="giving up"
-            if ! curl -fsSL -o "$bin" \
+            # `--speed-time`/`--speed-limit` rather than a flat
+            # `--max-time`: a stalled transfer has to end for the retry
+            # below to mean anything, but a slow one that is still making
+            # progress should be allowed to finish.
+            if ! curl -fsSL --connect-timeout 20 --speed-time 60 --speed-limit 1000 -o "$bin" \
               "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
               echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
             elif ! (cd "$bin_dir" && if command -v sha256sum >/dev/null 2>&1; then
