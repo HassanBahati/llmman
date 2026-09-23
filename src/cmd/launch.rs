@@ -159,13 +159,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 None => {
                     // The only launch whose window llmman can state: the
                     // daemon serves this model itself, whole. A pair's
-                    // local half is the side the daemon overflows *away*
-                    // from (see docs/providers.md, "Which side serves a
-                    // request") — declaring its window would have the
-                    // agent compact to stay local, which is what the
-                    // overflow retry exists to avoid. A --provider model
-                    // is served by someone else entirely, and
-                    // LLMMAN_CONTEXT_LENGTH describes only this daemon.
+                    // local half is the side overflow routes *away* from,
+                    // so declaring its window would make the agent compact
+                    // to stay local; a `--provider` model is served
+                    // elsewhere entirely.
                     context_window = served_context_window(
                         super::serve::context_length_from_env(),
                         context_length,
@@ -703,23 +700,16 @@ fn accepts_install(answer: &str) -> bool {
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
 ///
-/// The two context arguments are deliberately not one. `context_window`
-/// is the window the daemon serves, already resolved by
-/// [`served_context_window`] and `None` unless this is a plain local
-/// model (see `run`); it is what the integrations that declare a window
-/// are told, opencode so far.
+/// The two context arguments are not one. `context_window` is what the
+/// daemon serves, resolved by [`served_context_window`] and `None`
+/// unless this is a plain local model; an integration that declares a
+/// window is told this.
 ///
-/// `context_length` is the raw trained context, unresolved. codex takes
-/// it because its catalog cannot omit a `context_window`, so it resolves
-/// one itself, unconditionally — for a `--provider` model and a hybrid
-/// pair too — falling back to [`CODEX_FALLBACK_CONTEXT_WINDOW`] rather
-/// than leave the field out. pi still takes it only because it has not
-/// been moved over yet: it writes the value straight into
-/// `contextWindow`, so it currently reports the trained context where
-/// `context_window` would report the served one. Collapsing the two
-/// arguments would silently extend codex's guess to everyone else.
-// Each launcher below takes its own subset of these; threading them
-// through a struct would only move the fan-out one level down.
+/// `context_length` is the raw trained context. codex resolves its own
+/// window from it unconditionally, falling back to
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`], because its catalog cannot omit
+/// the field; pi writes it straight into `contextWindow`. Merging the
+/// two would extend codex's guess to every other integration.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
