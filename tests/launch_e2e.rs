@@ -1265,7 +1265,17 @@ fn docker_agent_reply_is_pong(stdout: &str) -> bool {
 /// `~/.config/cagent`. The second is asserted as "no llmman settings in
 /// that file" rather than "that directory is absent", because
 /// docker-agent creates it itself on first run.
+///
+/// Unix only. `docker_agent_config_dir` resolves through
+/// `dirs::home_dir`, which on Windows reads the known-folder API rather
+/// than the `HOME`/`USERPROFILE` `run_launch` sets — so the launcher
+/// writes outside this temp home there and none of these paths exist.
+/// The document itself is asserted by `docker_agent_document`'s own unit
+/// tests, which run on every platform.
 fn docker_agent_left_the_users_own_config_alone(home: &Path) {
+    if cfg!(windows) {
+        return;
+    }
     let generated = home.join(".config/llmman/launch/docker-agent/agent.yaml");
     let text = std::fs::read_to_string(&generated)
         .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));

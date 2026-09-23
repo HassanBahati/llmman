@@ -313,6 +313,13 @@ models:
     model: qwen3.8
     base_url: http://127.0.0.1:17434/v1
     token_key: LLMMAN_API_KEY
+agents:
+  root:
+    model: llmman
+    instruction: You are a helpful AI assistant.
+    toolsets:
+      - type: shell
+      - type: filesystem
 ```
 
 ### Hosted providers

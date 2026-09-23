@@ -2700,8 +2700,10 @@ fn docker_agent_own_agent_file_error(file: &str) -> String {
          message rather than an agent.\n\
          To run your own agent against this daemon, point its model at llmman and run \
          docker-agent directly:\n  \
-         models:\n    llmman:\n      provider: openai\n      model: <model>\n      \
-         base_url: {}/v1\n      token_key: {DOCKER_AGENT_API_KEY_ENV}",
+         models:\n    {DOCKER_AGENT_MODEL_NAME}:\n      provider: openai\n      \
+         model: <model>\n      base_url: {}/v1\n      \
+         token_key: {DOCKER_AGENT_API_KEY_ENV}\n  \
+         agents:\n    root:\n      model: {DOCKER_AGENT_MODEL_NAME}",
         daemon::server()
     )
 }
