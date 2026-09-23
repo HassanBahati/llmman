@@ -93,8 +93,10 @@ pub(super) fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
 /// and a client may legitimately send several — an agent runner sends
 /// one per toolset. `/v1/messages` and `/v1/responses` already merge
 /// (`messages::from_messages_request`,
-/// `consolidate_responses_instructions`); this is the same for the third
-/// surface. Callers pass local targets only, so a provider still gets
+/// `consolidate_responses_instructions`); this does the same for the
+/// third surface, except for how text parts within one message join —
+/// `consolidate_responses_instructions` concatenates them with nothing
+/// between. Callers pass local targets only, so a provider still gets
 /// the array as written.
 pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
     fn role(message: &serde_json::Value) -> &str {
@@ -134,9 +136,10 @@ pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
     );
 }
 
-/// The merged instruction content, built in order. Text joins into one
-/// run separated by a blank line; a non-text block closes that run and
-/// is kept as itself, making the result a block array.
+/// The merged instruction content, built in order. One entry per
+/// message, its own text parts joined by a newline; the entries join
+/// into one run separated by a blank line. A non-text block closes that
+/// run and is kept as itself, making the result a block array.
 #[derive(Default)]
 struct MergedInstructions {
     blocks: Vec<serde_json::Value>,
@@ -147,17 +150,40 @@ impl MergedInstructions {
     fn push(&mut self, content: &serde_json::Value) {
         match content {
             serde_json::Value::Array(parts) => {
+                // One entry for the whole message: `flush_text`'s blank
+                // line separates messages, so pushing each part on its
+                // own would spell both boundaries the same way. `\n`
+                // rather than `""` keeps the end of one part off the
+                // start of the next.
+                let mut run: Vec<&str> = Vec::new();
                 for part in parts {
                     if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        self.push_text(part.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                        // Dropped, not joined: an empty part would become
+                        // a stray newline, or a blank line between two
+                        // real ones.
+                        let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            run.push(text);
+                        }
                     } else {
+                        // A non-text block ends the run it interrupts.
+                        self.push_run(&mut run);
                         self.flush_text();
                         self.blocks.push(part.clone());
                     }
                 }
+                self.push_run(&mut run);
             }
             other => self.push_text(&content_text(other)),
         }
+    }
+
+    /// Takes `run`'s text parts as one instruction.
+    fn push_run(&mut self, run: &mut Vec<&str>) {
+        if run.is_empty() {
+            return;
+        }
+        self.push_text(&std::mem::take(run).join("\n"));
     }
 
     fn push_text(&mut self, text: &str) {
