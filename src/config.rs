@@ -78,6 +78,9 @@ pub struct Conf {
     /// Private, like `providers`: reached through [`auth_api_keys`] only.
     #[serde(default)]
     auth: AuthConf,
+    /// Native OAuth forwarding on the daemon's TLS listener.
+    #[serde(default)]
+    pub managed: ManagedConf,
     /// `[registries."<host>"]` tables, keyed by the registry host a
     /// reference names — see [`registry_mirrors`].
     #[serde(default)]
@@ -114,6 +117,59 @@ struct AuthConf {
     /// — a string so `llmman config set auth.api_keys a,b` can write it.
     #[serde(default)]
     api_keys: Option<String>,
+}
+
+/// The `[managed]` section. Strings work with `llmman config set`.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConf {
+    /// Explicit opt-in; absent means disabled.
+    #[serde(default)]
+    pub enabled: Option<String>,
+    /// Optional upstream idle-read limit; absent or zero means no limit.
+    #[serde(default)]
+    pub read_timeout_seconds: Option<String>,
+}
+
+/// Validated forwarding settings. No provider credentials are stored here.
+#[derive(Default, Debug, Clone)]
+pub struct Managed {
+    /// Whether the daemon mounts the forwarding routes.
+    pub enabled: bool,
+    /// Maximum wait for each upstream read; no total request deadline.
+    pub read_timeout: Option<std::time::Duration>,
+}
+
+/// Loads managed settings using the normal configuration precedence.
+pub fn managed() -> Result<Managed, String> {
+    managed_from_files(files()?)
+}
+
+fn managed_from_files(files: &[File]) -> Result<Managed, String> {
+    let mut managed = Managed::default();
+    for file in files {
+        managed.apply(&file.conf.managed)?;
+    }
+    Ok(managed)
+}
+
+impl Managed {
+    /// Shared by parse-time validation and field-by-field configuration merging.
+    fn apply(&mut self, conf: &ManagedConf) -> Result<(), String> {
+        if let Some(enabled) = &conf.enabled {
+            self.enabled = enabled
+                .parse()
+                .map_err(|_| "managed.enabled must be \"true\" or \"false\"".to_string())?;
+        }
+        if let Some(seconds) = &conf.read_timeout_seconds {
+            let seconds: u32 = seconds.parse().map_err(|_| {
+                "managed.read_timeout_seconds must be an unsigned 32-bit integer".to_string()
+            })?;
+            self.read_timeout =
+                (seconds != 0).then(|| std::time::Duration::from_secs(seconds.into()));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for AuthConf {
@@ -384,6 +440,7 @@ pub(crate) fn parse(text: &str) -> Result<Conf, String> {
 /// What the TOML shape alone cannot say, checked at parse time so
 /// `llmman config set` refuses it on the spot.
 fn validate(conf: &Conf) -> Result<(), String> {
+    Managed::default().apply(&conf.managed)?;
     let mut seen: HashMap<String, &str> = HashMap::new();
     for (host, r) in &conf.registries {
         let canonical = canonical_registry_host(host).ok_or_else(|| {
@@ -1057,6 +1114,32 @@ mod tests {
         let rendered = format!("{c:?}");
         assert!(rendered.contains("gpubox:8000"), "{rendered}");
         assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+    }
+
+    #[test]
+    fn managed_configuration_is_opt_in_strict_and_uses_field_precedence() {
+        assert!(!managed_from_files(&[]).unwrap().enabled);
+        let base = file("[managed]\nenabled = \"true\"\nread_timeout_seconds = \"600\"");
+        let override_file = file("[managed]\nread_timeout_seconds = \"0\"");
+        let settings = managed_from_files(&[base, override_file]).unwrap();
+        assert!(settings.enabled);
+        assert!(settings.read_timeout.is_none());
+        let settings =
+            managed_from_files(&[file("[managed]\nread_timeout_seconds = \"300\"")]).unwrap();
+        assert_eq!(
+            settings.read_timeout,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert!(!settings.enabled);
+        for text in [
+            "[managed]\nenabled = \"yes\"",
+            "[managed]\nread_timeout_seconds = \"-1\"",
+            "[managed]\nread_timeout_seconds = \"4294967296\"",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(parse("[managed]\nenabled = true").is_err());
+        assert!(parse("[managed]\nenabeld = \"true\"").is_err());
     }
 
     // -- aggregation peers ---------------------------------------------------

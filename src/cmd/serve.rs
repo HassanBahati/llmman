@@ -37,6 +37,7 @@ mod backend;
 mod config;
 mod gemini;
 mod hybrid;
+mod managed;
 mod messages;
 mod ollama;
 mod openai;
@@ -3785,6 +3786,15 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
     let tls = tls_from_env()?;
+    let managed_config = crate::config::managed().map_err(anyhow::Error::msg)?;
+    if managed_config.enabled {
+        if let Some((_, key)) = &tls {
+            crate::config::owner_readable_only(key)
+                .map_err(anyhow::Error::msg)
+                .context("managed TLS private key permissions")?;
+        }
+    }
+    let managed_routes = managed::routes(managed_config, auth.clone(), tls.is_some())?;
     anyhow::ensure!(
         tls.is_some() == crate::daemon::tls_scheme(),
         "LLMMAN_HOST and LLMMAN_TLS_CERT/LLMMAN_TLS_KEY disagree: an https:// host needs the \
@@ -3836,7 +3846,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client,
     }));
 
-    let app = build_router(state.clone(), metrics_enabled_from_env());
+    // Managed routes have their own mandatory auth and bypass prompt logging.
+    let app = build_router(state.clone(), metrics_enabled_from_env()).merge(managed_routes);
 
     // Before the listener binds, so uptime counts from the daemon coming
     // up rather than from whenever something first scraped it.
@@ -3899,9 +3910,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     match tls {
         None => {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?
         }
         Some((cert, key)) => {
             // Both rustls providers are compiled in (reqwest's, the AWS
@@ -3926,7 +3940,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             });
             axum_server::from_tcp_rustls(listener.into_std()?, config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?
         }
     }

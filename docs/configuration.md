@@ -72,6 +72,41 @@ Unknown sections and keys are rejected rather than ignored: a misspelled
 credential that silently never takes effect, and the symptom would show up
 somewhere else entirely.
 
+### Managed OAuth forwarding
+
+Native Codex/Claude OAuth forwarding is explicitly enabled in the same file:
+
+```toml
+[auth]
+api_keys = "a-strong-daemon-key"
+
+[managed]
+enabled = "true"
+# Optional upstream idle-read timeout, in seconds; absent or "0" is unbounded.
+# read_timeout_seconds = "600"
+```
+
+Use `llmman config set managed.enabled true` and, if desired,
+`llmman config set managed.read_timeout_seconds 600`. Values are strings,
+matching the other sections. Invalid booleans or timeout values are rejected
+before `config set` saves the file, and also when the daemon reads it.
+Later files override individual fields. No additional configuration file is used.
+
+Managed forwarding requires the existing `LLMMAN_TLS_CERT` and `LLMMAN_TLS_KEY`
+settings and a matching HTTPS `LLMMAN_HOST`. The TLS private key must pass the
+existing owner-only file permission check, as must configuration files supplying
+daemon API keys. Missing keys, plaintext HTTP,
+or `LLMMAN_AUTH=off` prevent startup when managed forwarding is enabled.
+Managed forwarding is currently supported only on Unix platforms. On Windows
+and other non-Unix platforms, enabling it fails startup because owner-only key
+ACLs cannot yet be verified. Ordinary daemon operation remains available.
+
+Only loopback peers can use the forwarding routes, even when the daemon also
+serves ordinary routes on a network interface. The client sends its daemon key
+as `X-Api-Key`, leaving `Authorization` for its provider OAuth bearer. See
+[providers.md](providers.md#oauth-credential-forwarding) for routes, capability
+checks, network-policy IP pinning, and header handling.
+
 ### llmman config
 
 `llmman config` edits that file the way `git config` edits `.gitconfig`,

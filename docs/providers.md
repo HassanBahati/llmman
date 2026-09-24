@@ -276,3 +276,89 @@ block and user block), a `response_format` JSON schema becomes a forced
 tool whose arguments are returned as the reply, tools used earlier in
 the history are declared back when the client offers none, and an
 unanswered tool call gets a placeholder result.
+
+## OAuth credential forwarding
+
+Enable `[managed]` in [configuration.md](configuration.md#managed-oauth-forwarding)
+to forward native Codex and Claude requests on the daemon's existing TLS
+listener. The caller owns login, refresh, account selection, authorization,
+and network policy. llmman never persists these request-local OAuth tokens or
+falls back to stored provider keys, environment credentials, or peers.
+
+Every forwarding request must come from a loopback connection and supply all of:
+
+```text
+X-Api-Key: <configured daemon API key>
+Authorization: Bearer <current provider OAuth access token>
+X-LLMMan-Upstream-IP: <policy-authorized public IP for the provider>
+```
+
+The daemon key is checked separately and removed before forwarding. An OAuth
+bearer alone cannot authenticate to the daemon. Peer admission uses the actual
+connection address, never `Forwarded` or `X-Forwarded-For`. Neither disabling
+daemon authentication nor configuring an HTTP listener is allowed in managed mode.
+
+| Managed operation | Fixed upstream | Required model prefix |
+|---|---|---|
+| `POST /api/codex/responses` | `https://chatgpt.com/backend-api/codex/responses` | `llmman.provider/openai/` |
+| `POST /api/codex/responses/compact` | `https://chatgpt.com/backend-api/codex/responses/compact` | `llmman.provider/openai/` |
+| `POST /api/anthropic/messages` | `https://api.anthropic.com/v1/messages` | `llmman.provider/anthropic/` |
+| `POST /api/anthropic/messages/count_tokens` | `https://api.anthropic.com/v1/messages/count_tokens` | `llmman.provider/anthropic/` |
+
+The route selects the provider; no auth-profile header or account-header
+heuristic is needed. `ChatGPT-Account-ID` is optional on Codex requests and is
+never sent to Anthropic. The exact nonempty model suffix is forwarded after
+removing the table's prefix. Other native payload fields are preserved; invalid
+credentials, mismatched model prefixes, and duplicate top-level JSON fields
+are rejected before contacting a provider. Request bodies are bounded to 32 MiB.
+Encoded request bodies are rejected with 415; absent or case-insensitive
+`identity` content coding is accepted and removed before JSON is reserialized.
+
+The supervisor resolves the fixed provider hostname, authorizes a particular
+IP against its network policy, and supplies that numeric address in
+`X-LLMMan-Upstream-IP`. llmman pins the connection to it while verifying the
+provider's TLS hostname. There is no DNS fallback or caller-controlled URL.
+Special-use addresses, including private networks, loopback, and IPv6 6to4,
+are rejected. Redirects and environment proxy/CA overrides are not used.
+
+Provider extension headers pass through in both directions, including repeated
+values. Hop-by-hop headers, fields named by `Connection`, `Host`, internal
+`X-LLMMan-*` headers, daemon/alternate credentials, and cookies are removed.
+`Content-Length` is regenerated after body changes. The provider bearer and
+Codex account ID are set explicitly. Codex `originator` and `openai-beta` are
+forwarded only when supplied; llmman does not invent a client identity.
+For Claude, llmman merges `oauth-2025-04-20` into `anthropic-beta` and defaults
+`anthropic-version` to `2023-06-01` when absent. The caller supplies any required
+native system content or metadata.
+
+Successful response bodies stream with backpressure and cancellation on
+disconnect. Upstream connection establishment has a 30-second timeout; reads
+have no deadline unless `managed.read_timeout_seconds` is configured. That
+optional timeout applies to response-header waits and individual stalled reads,
+not total generation duration. A continuously active stream can outlive this
+limit; a quiet generation is interrupted when the limit expires. Choose a
+value appropriate for the workload.
+
+Provider error statuses are preserved with bearer/account values redacted from
+error bodies and response headers. JSON error bodies are decoded before
+redacting string values and keys, so escaped credentials are removed too.
+Error bodies above 1 MiB, interrupted reads,
+redirects, and encoded error bodies that cannot be safely redacted produce 502.
+llmman requests uncompressed upstream responses. Transport diagnostics are
+redacted and available with debug logging. A failure after streaming headers
+have been sent terminates the stream instead of changing its status.
+
+`GET /api/version` confirms daemon liveness. Before supplying provider tokens,
+call `GET /api/managed/capabilities` over a trusted TLS connection with the
+same daemon API key, and require the corresponding capability:
+
+```json
+{"capabilities":["codex-oauth-forwarding-v2","claude-oauth-forwarding-v2"]}
+```
+
+These routes bypass prompt-history recording and ordinary provider routing.
+They are disabled by default. The earlier draft's second listener, JSON config,
+ready file, and managed-key/auth-profile headers have been removed; callers of
+that draft must migrate configuration, paths, authentication, and capability
+checks together. A supervisor must bind readiness to the child it launched and
+invalidate it on exit; a version response alone is not a forwarding handshake.
