@@ -301,10 +301,12 @@ fn user_dir() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".config").join("llmman"))
 }
 
-/// The home directory `~` names. The environment comes first because
+/// The home directory `~` names, here and for the integrations
+/// `cmd::launch` configures. The environment comes first because
 /// `dirs::home_dir` reads the Windows known-folder API, which ignores
-/// the home a session set for every other program in it.
-fn home_dir() -> Option<PathBuf> {
+/// the home a session set for every other program in it — node's
+/// `os.homedir()` included, which is what Cline and pi resolve through.
+pub fn home_dir() -> Option<PathBuf> {
     env_home().or_else(dirs::home_dir)
 }
 

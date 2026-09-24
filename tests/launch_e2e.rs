@@ -1221,9 +1221,10 @@ fn launch_docker_agent_with_model() {
 
     // These arguments land after the `run <agent file>` that
     // `docker_agent_args` prepends, which is why neither appears here.
-    // `--exec` is docker-agent's non-interactive mode; `--yolo` would be
-    // pointless, since the generated agent declares no toolsets to
-    // approve.
+    // `--exec` is docker-agent's non-interactive mode. No `--yolo`,
+    // though the generated agent carries the shell and filesystem
+    // toolsets: a one-word reply calls neither, and granting an agent's
+    // writes stays the caller's decision.
     //
     // Strict: `inspect_home` runs only after the reply assertion
     // passes, so a tolerated miss would skip the config checks below
@@ -1305,8 +1306,8 @@ fn docker_agent_left_the_users_own_config_alone(home: &Path) {
 }
 
 /// The agent file the launch wrote, matched rather than spelled out
-/// because `launch_docker_agent` names it after its own process id.
-/// This `HOME` is fresh, so exactly one launch has written here.
+/// because `launch_docker_agent` names it after the model. One file is
+/// also the assertion that a launch leaves nothing else behind.
 fn docker_agent_generated_file(home: &Path) -> PathBuf {
     let dir = home.join(".config/llmman/launch/docker-agent");
     let mut written: Vec<PathBuf> = std::fs::read_dir(&dir)

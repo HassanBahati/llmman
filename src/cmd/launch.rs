@@ -1034,7 +1034,7 @@ const PI_PROVIDER: &str = "llmman";
 /// `cline_dir`'s own doc comment for what disagreeing there cost. The
 /// `~` handling is qwen's, for the quoted export that leaves one behind.
 fn pi_agent_dir() -> anyhow::Result<PathBuf> {
-    let home = || node_home_dir().context("no home directory");
+    let home = || crate::config::home_dir().context("no home directory");
     match std::env::var("PI_CODING_AGENT_DIR")
         .ok()
         .filter(|d| !d.trim().is_empty())
@@ -2133,12 +2133,6 @@ fn node_user_profile() -> Option<PathBuf> {
     cfg!(windows).then(|| env_dir("USERPROFILE")).flatten()
 }
 
-/// What node's `os.homedir()` answers, for the integrations that are
-/// node programs — see [`node_user_profile`].
-fn node_home_dir() -> Option<PathBuf> {
-    node_user_profile().or_else(dirs::home_dir)
-}
-
 fn resolve_cline_dir(
     cline_dir: Option<PathBuf>,
     user_profile: Option<PathBuf>,
@@ -2660,7 +2654,7 @@ fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> any
         )
     })?;
 
-    let path = docker_agent_agent_file(&docker_agent_config_dir()?);
+    let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
     write_docker_agent_file(&path, model, &format!("{}/v1", daemon::server()))?;
 
     let args = docker_agent_args(&path, extra_args);
@@ -2718,11 +2712,28 @@ fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
     Ok(dir.join("launch").join("docker-agent"))
 }
 
-/// The agent file this launch writes, named after the running process.
-/// One fixed name would let a concurrent launch overwrite it between
-/// this write and docker-agent's read, running that launch's model.
-fn docker_agent_agent_file(dir: &Path) -> PathBuf {
-    dir.join(format!("agent-{}.yaml", std::process::id()))
+/// The agent file a launch of `model` writes. One name for every model
+/// would let a concurrent launch overwrite it between this write and
+/// docker-agent's read, running that launch's model instead; naming it
+/// after the model leaves concurrent launches writing the same document
+/// and the directory holding one file per model rather than per run.
+fn docker_agent_agent_file(dir: &Path, model: &str) -> PathBuf {
+    dir.join(format!("agent-{}.yaml", path_component(model)))
+}
+
+/// `model` as one file name: everything a path separator or a Windows
+/// file name cannot carry — `/`, `:` — becomes `-`.
+fn path_component(model: &str) -> String {
+    model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
@@ -3719,10 +3730,14 @@ mod tests {
 
     /// pi is node, so its home half is the one node reads — the same
     /// `cline_dir` resolves, and the reason #535 stopped using
-    /// `dirs::home_dir` alone.
+    /// `dirs::home_dir` alone. `config::home_dir` reads `%USERPROFILE%`
+    /// first for that same reason, so one helper answers both.
     #[test]
     fn pi_agent_dir_reads_the_home_node_reads() {
-        assert_eq!(node_home_dir(), node_user_profile().or_else(dirs::home_dir));
+        assert_eq!(
+            crate::config::home_dir(),
+            node_user_profile().or_else(dirs::home_dir)
+        );
         if cfg!(windows) {
             assert_eq!(node_user_profile(), env_dir("USERPROFILE"));
         } else {
@@ -4681,15 +4696,29 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert_eq!(docker_agent_config_argument_with(&absent, |_| false), None);
     }
 
-    /// A fixed name would let a concurrent launch overwrite the file
-    /// before docker-agent reads it.
+    /// One name for every model would let a concurrent launch overwrite
+    /// the file before docker-agent reads it. The name is also one path
+    /// component, though a model id carries `/` and `:`.
     #[test]
-    fn docker_agent_names_its_agent_file_after_the_running_process() {
+    fn docker_agent_names_its_agent_file_after_the_model() {
         let dir = Path::new("/tmp/llmman/launch/docker-agent");
         assert_eq!(
-            docker_agent_agent_file(dir),
-            dir.join(format!("agent-{}.yaml", std::process::id()))
+            docker_agent_agent_file(dir, "docker.io/ai/qwen3.5:0.8b"),
+            dir.join("agent-docker.io-ai-qwen3.5-0.8b.yaml")
         );
+        assert_ne!(
+            docker_agent_agent_file(dir, "a:b"),
+            docker_agent_agent_file(dir, "a:c")
+        );
+        for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b"] {
+            let file = docker_agent_agent_file(dir, model);
+            assert_eq!(file.parent(), Some(dir), "{model} escaped its directory");
+            assert_eq!(
+                file.file_name().and_then(|n| n.to_str()),
+                Some("agent-a-b.yaml"),
+                "{model}"
+            );
+        }
     }
 
     /// The plugin directory is not on `PATH`, so without the fallback a
