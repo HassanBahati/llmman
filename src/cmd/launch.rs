@@ -2672,7 +2672,14 @@ fn check_docker_agent_args(extra_args: &[String]) -> anyhow::Result<()> {
     //
     // No `-m`: `run` has no such shorthand (`-a`, `-s`, `-w`, `-d`,
     // `-o`, `-h`), so matching it would refuse an unrelated argument.
-    if has_flag(extra_args, "--model", None) {
+    //
+    // Only up to a forwarded `--`: Cobra takes everything after one as
+    // arguments, so a prompt there that reads like a flag is a message.
+    let flags = &extra_args[..extra_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(extra_args.len())];
+    if has_flag(flags, "--model", None) {
         anyhow::bail!(
             "docker-agent's --model would replace the endpoint llmman configured and send the \
              request to api.openai.com; select the model with `llmman launch docker-agent \
@@ -2718,19 +2725,28 @@ fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
 /// after the model leaves concurrent launches writing the same document
 /// and the directory holding one file per model rather than per run.
 fn docker_agent_agent_file(dir: &Path, model: &str) -> PathBuf {
-    dir.join(format!("agent-{}.yaml", path_component(model)))
+    dir.join(format!("agent-{}.yaml", docker_agent_file_stem(model)))
 }
 
-/// `model` as one file name: everything a path separator or a Windows
-/// file name cannot carry — `/`, `:` — becomes `-`.
+/// How much of the model a file name spells out. The rest of the name
+/// is `agent-`, the digest and `.yaml`, so the whole stays well inside
+/// the 255 a file name gets and leaves room under Windows' path limit.
+const DOCKER_AGENT_NAME_MAX: usize = 80;
+
+/// `model` as one bounded file name: everything a path separator or a
+/// Windows file name cannot carry — `/`, `:` — becomes `-`, the result
+/// is cut to [`DOCKER_AGENT_NAME_MAX`], and a digest of the whole id
+/// follows it.
 ///
-/// Two ids that differ only in which separator they use take the same
-/// name, and launched at the same moment the same file. Tolerated: it
-/// needs a name and a tag that trade places (`a/b-c:d` against
-/// `a/b:c-d`), and the cost is one agent reading the other's model,
-/// which is what an unreadable hashed name would buy back.
-fn path_component(model: &str) -> String {
-    model
+/// The digest is what keeps one file per model. Without it two ids that
+/// sanitize alike (`a/b-c:d` and `a/b:c-d`) or that differ past the cut
+/// would share a file, and launched at the same moment each agent could
+/// read the other's model — the collision this name exists to prevent.
+/// A provider id is not a model reference and is never checked for
+/// length, so the cut is what keeps a long one from failing the write.
+fn docker_agent_file_stem(model: &str) -> String {
+    use sha2::Digest as _;
+    let safe: String = model
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -2739,7 +2755,10 @@ fn path_component(model: &str) -> String {
                 '-'
             }
         })
-        .collect()
+        .take(DOCKER_AGENT_NAME_MAX)
+        .collect();
+    let digest = hex::encode(sha2::Sha256::digest(model.as_bytes()));
+    format!("{safe}-{}", &digest[..8])
 }
 
 fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
@@ -4704,25 +4723,42 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
 
     /// One name for every model would let a concurrent launch overwrite
     /// the file before docker-agent reads it, so models that differ get
-    /// files that differ. Whatever the id carries, the name stays one
-    /// component of `dir`: a model is not a path.
+    /// files that differ — including ones that sanitize or cut alike.
+    /// Whatever the id carries, the name stays one component of `dir`:
+    /// a model is not a path.
     #[test]
     fn docker_agent_names_its_agent_file_after_the_model() {
         let dir = Path::new("/tmp/llmman/launch/docker-agent");
-        assert_eq!(
-            docker_agent_agent_file(dir, "docker.io/ai/qwen3.5:0.8b"),
-            dir.join("agent-docker.io-ai-qwen3.5-0.8b.yaml")
+        let file = |model: &str| docker_agent_agent_file(dir, model);
+        let name = |model: &str| {
+            file(model)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            name("docker.io/ai/qwen3.5:0.8b").starts_with("agent-docker.io-ai-qwen3.5-0.8b-"),
+            "{}",
+            name("docker.io/ai/qwen3.5:0.8b")
         );
         for (one, other) in [
             ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/qwen3.5:9b"),
             ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/gemma4:12b"),
             ("qwen/qwen3-coder", "qwen/qwen3-max"),
+            // Sanitize alike: `/` and `:` both become `-`.
+            ("a/b-c:d", "a/b:c-d"),
+            // Differ only past the cut.
+            (
+                &format!("{}one", "m".repeat(DOCKER_AGENT_NAME_MAX)),
+                &format!("{}two", "m".repeat(DOCKER_AGENT_NAME_MAX)),
+            ),
         ] {
-            assert_ne!(
-                docker_agent_agent_file(dir, one),
-                docker_agent_agent_file(dir, other)
-            );
+            assert_ne!(file(one), file(other), "{one} and {other} share a file");
         }
+        // A provider id is never length-checked, so the name is bounded
+        // here or the write fails.
+        assert!(name(&"x".repeat(4096)).len() <= 255, "name is unbounded");
         for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b", "..", "."] {
             let file = docker_agent_agent_file(dir, model);
             assert_eq!(file.parent(), Some(dir), "{model} escaped its directory");
@@ -4768,6 +4804,19 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         std::fs::write(&binary, "").unwrap();
         assert_eq!(docker_agent_fallback(&home), Some(binary));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Cobra stops parsing flags at a `--`, so a prompt after one that
+    /// reads like a flag is a message — and refusing it would refuse a
+    /// launch that works.
+    #[test]
+    fn docker_agent_reads_a_model_flag_after_the_terminator_as_a_message() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_docker_agent_args(&args(&["--exec", "--", "--model=foo"])).is_ok());
+        assert!(check_docker_agent_args(&args(&["--exec", "--", "--model", "foo"])).is_ok());
+        // The flag itself is still refused where docker-agent parses it.
+        assert!(check_docker_agent_args(&args(&["--exec", "--model=foo"])).is_err());
+        assert!(check_docker_agent_args(&args(&["--model", "foo", "--", "hi"])).is_err());
     }
 
     /// A forwarded `--model` replaces the generated entry's `base_url`
