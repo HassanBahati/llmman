@@ -306,7 +306,7 @@ fn user_dir() -> Option<PathBuf> {
 /// `dirs::home_dir` reads the Windows known-folder API, which ignores
 /// the home a session set for every other program in it — node's
 /// `os.homedir()` included, which is what Cline and pi resolve through.
-pub fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     env_home().or_else(dirs::home_dir)
 }
 

@@ -2723,6 +2723,12 @@ fn docker_agent_agent_file(dir: &Path, model: &str) -> PathBuf {
 
 /// `model` as one file name: everything a path separator or a Windows
 /// file name cannot carry — `/`, `:` — becomes `-`.
+///
+/// Two ids that differ only in which separator they use take the same
+/// name, and launched at the same moment the same file. Tolerated: it
+/// needs a name and a tag that trade places (`a/b-c:d` against
+/// `a/b:c-d`), and the cost is one agent reading the other's model,
+/// which is what an unreadable hashed name would buy back.
 fn path_component(model: &str) -> String {
     model
         .chars()
@@ -4697,8 +4703,9 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     }
 
     /// One name for every model would let a concurrent launch overwrite
-    /// the file before docker-agent reads it. The name is also one path
-    /// component, though a model id carries `/` and `:`.
+    /// the file before docker-agent reads it, so models that differ get
+    /// files that differ. Whatever the id carries, the name stays one
+    /// component of `dir`: a model is not a path.
     #[test]
     fn docker_agent_names_its_agent_file_after_the_model() {
         let dir = Path::new("/tmp/llmman/launch/docker-agent");
@@ -4706,17 +4713,27 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
             docker_agent_agent_file(dir, "docker.io/ai/qwen3.5:0.8b"),
             dir.join("agent-docker.io-ai-qwen3.5-0.8b.yaml")
         );
-        assert_ne!(
-            docker_agent_agent_file(dir, "a:b"),
-            docker_agent_agent_file(dir, "a:c")
-        );
-        for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b"] {
+        for (one, other) in [
+            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/qwen3.5:9b"),
+            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/gemma4:12b"),
+            ("qwen/qwen3-coder", "qwen/qwen3-max"),
+        ] {
+            assert_ne!(
+                docker_agent_agent_file(dir, one),
+                docker_agent_agent_file(dir, other)
+            );
+        }
+        for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b", "..", "."] {
             let file = docker_agent_agent_file(dir, model);
             assert_eq!(file.parent(), Some(dir), "{model} escaped its directory");
-            assert_eq!(
-                file.file_name().and_then(|n| n.to_str()),
-                Some("agent-a-b.yaml"),
-                "{model}"
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(
+                name.starts_with("agent-") && name.ends_with(".yaml"),
+                "{name}"
+            );
+            assert!(
+                !name.contains(std::path::MAIN_SEPARATOR) && name != ".." && name != ".",
+                "{model} produced {name}"
             );
         }
     }
