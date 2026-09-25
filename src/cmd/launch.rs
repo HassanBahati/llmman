@@ -1581,22 +1581,24 @@ fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
     served_context_window(env, trained).unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
-/// The window the daemon serves: a positive `LLMMAN_CONTEXT_LENGTH`
-/// (`env`), the `--ctx-size` it was started with, else the model's
-/// `trained` context ([`crate::daemon::ShowResponse::context_length`]).
+/// The window the daemon serves, mirroring `initial_ctx_size`:
 ///
-/// The trained context is capped at [`super::serve::DEFAULT_CTX_SIZE`],
-/// where `initial_ctx_size` caps it too: a model trained beyond the
-/// default is still only served the default, and reporting more would
-/// have an agent hold a history the backend refuses. An explicit `env`
-/// is forwarded uncapped, so it stands as given.
+/// * `LLMMAN_CONTEXT_LENGTH` set and positive — forwarded as `--ctx-size`
+///   uncapped, so it is what gets served.
+/// * Set to `0` — `--ctx-size 0`, which llama.cpp reads as the model's
+///   own `trained` context, also uncapped.
+/// * Unset — the default, clamped *down* to `trained`, so a model
+///   trained past [`super::serve::DEFAULT_CTX_SIZE`] is still served
+///   only the default.
 ///
-/// `None` when neither is known: every caller but codex passes that
+/// `None` when the window is unknown: every caller but codex passes that
 /// through as "say nothing", leaving the integration its own default.
 fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
-    env.filter(|n| *n > 0)
-        .map(u64::from)
-        .or_else(|| trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))))
+    match env {
+        Some(0) => trained,
+        Some(explicit) => Some(u64::from(explicit)),
+        None => trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))),
+    }
 }
 
 /// The `model_catalog_json` for `model`, declaring its image input in
@@ -4853,7 +4855,11 @@ model = \"gpt-5\"
             (Some(65536), Some(32768), Some(65536)),
             (Some(16384), None, Some(16384)),
             (None, Some(32768), Some(32768)),
+            // `--ctx-size 0` is the model's own context, so it is served
+            // uncapped like any other explicit value — the one case the
+            // default-clamping branch below would get wrong.
             (Some(0), Some(32768), Some(32768)),
+            (Some(0), Some(1 << 20), Some(1 << 20)),
             // Clamped down to the trained context, never up to it.
             (
                 None,
@@ -4862,7 +4868,8 @@ model = \"gpt-5\"
             ),
             // An explicit value is forwarded uncapped, so it stands.
             (Some(1 << 20), Some(1 << 20), Some(1 << 20)),
-            // Neither: say nothing, where codex would guess.
+            // Neither: say nothing, where codex would guess. A `0` with
+            // no trained context to name has nothing to forward either.
             (Some(0), None, None),
             (None, None, None),
         ];
