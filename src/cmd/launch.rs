@@ -870,20 +870,14 @@ fn opencode_fallback_paths() -> Vec<PathBuf> {
 /// it applies to `limit.output` and the value it substitutes for a 0.
 const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
 
-/// `limit.output` for a window of `context`. opencode puts this one
-/// field to two jobs, and it is a real trade-off rather than a free
-/// choice: it is the headroom subtracted to decide when to compact
-/// (`session/overflow.ts`, `usable` = `context - output`) *and* the
-/// `maxOutputTokens` sent on every request (`session/llm/request.ts`),
-/// so a larger value compacts sooner and a smaller one caps replies
-/// shorter.
+/// `limit.output` for a window of `context`: a quarter, capped at
+/// [`OPENCODE_OUTPUT_TOKEN_MAX`], never 0.
 ///
-/// A quarter of the window, never above opencode's own maximum, and
-/// never 0 — which opencode reads as "unset" and substitutes that full
-/// 32,000 for, leaving anything below a 32k window with no usable budget
-/// at all and so permanently overflowed. The quarter keeps three
-/// quarters of the window usable while still allowing a reply far longer
-/// than the model can actually produce in one turn at that size.
+/// opencode spends this field twice — the headroom it compacts at
+/// (`usable` = `context - output`) and the `maxOutputTokens` it sends —
+/// so a larger value compacts sooner and a smaller one truncates
+/// replies. A quarter leaves three quarters usable and still allows a
+/// longer reply than the model will produce in one turn.
 fn opencode_output_reserve(context: u64) -> u64 {
     (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
 }
@@ -1265,18 +1259,13 @@ fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
 /// `trained` context ([`crate::daemon::ShowResponse::context_length`]).
 ///
 /// The trained context is capped at [`super::serve::DEFAULT_CTX_SIZE`],
-/// because that is where `initial_ctx_size` caps it: with no explicit
-/// `LLMMAN_CONTEXT_LENGTH` a load starts at the 256k default clamped
-/// *down* to the trained context, so a model trained beyond it is still
-/// only served 256k. Reporting the full trained window for one of those
-/// would have an agent hold a history the backend then refuses. An
-/// explicit `env` is not capped — `initial_ctx_size` forwards a user's
-/// own value for a non-embedding model, so it is what gets served.
+/// where `initial_ctx_size` caps it too: a model trained beyond the
+/// default is still only served the default, and reporting more would
+/// have an agent hold a history the backend refuses. An explicit `env`
+/// is forwarded uncapped, so it stands as given.
 ///
-/// `None` when neither is known, which every caller but codex passes
-/// straight through as "say nothing" — an integration's own default is
-/// better than a number llmman made up. Shared with the other launchers
-/// whose config declares a window, opencode's `limit.context` first.
+/// `None` when neither is known: every caller but codex passes that
+/// through as "say nothing", leaving the integration its own default.
 fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
     env.filter(|n| *n > 0)
         .map(u64::from)
@@ -3846,20 +3835,17 @@ model = \"gpt-5\"
         assert!(!text_only.contains("attachment"), "{text_only}");
     }
 
-    /// opencode compacts at `context - output`, so the reserve has to
-    /// scale with the window: its own 32,000 default would leave any
-    /// smaller window with no usable budget and so permanently
-    /// overflowed.
+    /// The reserve scales with the window, so a small one keeps a
+    /// usable budget.
     #[test]
     fn opencode_output_reserve_scales_with_the_window_and_is_never_zero() {
         let cases = [
             (4096, 1024),
             (32768, 8192),
             (131072, 32000),
-            // Capped at opencode's own maximum, however large the window.
+            // Capped however large the window.
             (1 << 20, OPENCODE_OUTPUT_TOKEN_MAX),
-            // Never 0, which opencode reads as "unset" and replaces with
-            // the full 32,000.
+            // Never 0, which opencode would replace with its own max.
             (1, 1),
             (3, 1),
         ];
@@ -3868,8 +3854,8 @@ model = \"gpt-5\"
         }
     }
 
-    /// Without `limit`, opencode normalizes the entry to a 0 context and
-    /// then never auto-compacts at all, so the window has to travel.
+    /// Without `limit` opencode never auto-compacts, so the window has
+    /// to travel.
     #[test]
     fn opencode_config_declares_the_window_only_when_it_is_known() {
         let text = opencode_config("http://h", "m", "k", &[], false, Some(8192));
@@ -4012,9 +3998,7 @@ model = \"gpt-5\"
             // Unset or 0: the trained context.
             (None, Some(32768), 32768),
             (Some(0), Some(32768), 32768),
-            // ...but only as far as the default a load actually starts
-            // at. Before `served_context_window` this reported the full
-            // trained window, which is more than the daemon serves.
+            // ...but only as far as a load actually starts at.
             (
                 None,
                 Some(1 << 20),
@@ -4043,9 +4027,7 @@ model = \"gpt-5\"
             (Some(16384), None, Some(16384)),
             (None, Some(32768), Some(32768)),
             (Some(0), Some(32768), Some(32768)),
-            // A trained context past the 256k default is not what gets
-            // served: `initial_ctx_size` clamps the default down to the
-            // trained context, never up to it.
+            // Clamped down to the trained context, never up to it.
             (
                 None,
                 Some(1 << 20),
@@ -4053,8 +4035,7 @@ model = \"gpt-5\"
             ),
             // An explicit value is forwarded uncapped, so it stands.
             (Some(1 << 20), Some(1 << 20), Some(1 << 20)),
-            // Neither: say nothing. This is the whole difference from
-            // codex, which guesses CODEX_FALLBACK_CONTEXT_WINDOW here.
+            // Neither: say nothing, where codex would guess.
             (Some(0), None, None),
             (None, None, None),
         ];
