@@ -206,6 +206,8 @@ fn integration_key() -> String {
 /// docker-agent's "auto" selection takes the first cloud provider with a
 /// credential, then a local Docker Model Runner model, so without an
 /// explicit model the request never reaches llmman at all.
+/// OMP needs a model so the launcher can select the matching entry its
+/// Ollama discovery reads from llmman's `/api/tags`.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
@@ -215,6 +217,7 @@ const MODEL_REQUIRED: &[&str] = &[
     "grok",
     "cline",
     "pi",
+    "omp",
     "docker-agent",
 ];
 
@@ -225,6 +228,8 @@ const MODEL_REQUIRED: &[&str] = &[
 /// overriding. grok: its argument builder likewise drops the generated
 /// `--model`. Cline receives no generated arguments, so its own `--model`
 /// also wins over the provider selected in its settings.
+/// OMP's argument builder drops the generated Ollama model when the caller
+/// supplies one.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent_document` wrote, `base_url` included, so a forwarded one
 /// reaches api.openai.com. `check_docker_agent_args` refuses it rather
@@ -233,7 +238,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
 /// rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline"];
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -315,6 +320,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
     (
         "grok",
         "its model catalog cannot represent llmman's provider or hybrid routing reference",
+    ),
+    // OMP discovers the Ollama catalog from /api/tags. That endpoint lists
+    // stored models, not the synthetic provider or hybrid routing refs the
+    // daemon accepts at request time, and OMP rejects a model absent from the
+    // catalog before it sends a request.
+    (
+        "omp",
+        "its Ollama catalog cannot represent llmman's provider or hybrid routing reference",
     ),
 ];
 
@@ -503,6 +516,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "pi",
     },
     Integration {
+        name: "omp",
+        description: "OMP coding agent",
+        binary: "omp",
+    },
+    Integration {
         name: "cline",
         description: "Cline",
         binary: "cline",
@@ -632,6 +650,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
+        "omp" => find_omp(),
         "qwen" => find_qwen(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
@@ -735,6 +754,13 @@ fn launch(
         "opencode" => launch_opencode(model, api_key, thinking, vision, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
         "pi" => launch_pi(
+            model,
+            thinking.and_then(Thinking::template),
+            vision,
+            context_length,
+            extra_args,
+        ),
+        "omp" => launch_omp(
             model,
             thinking.and_then(Thinking::template),
             vision,
@@ -1024,8 +1050,214 @@ fn launch_pi(
     exec_with_env(&bin, extra_args, &[])
 }
 
+/// omp: register llmman's endpoint and the selected model in `models.yml`.
+///
+/// OMP's built-in Ollama discovery sees llmman's `/api/tags`, but model
+/// selection is resolved against its on-disk catalog before discovery has
+/// populated it. A fresh HOME therefore rejects `--model ollama/<model>`.
+/// Writing the provider and model explicitly, as Ollama's own launcher does,
+/// makes the first launch work while preserving unrelated user configuration.
+fn launch_omp(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
+    let server = daemon::server();
+    write_omp_config(model, thinking, vision, context_length, &server)?;
+    exec_with_env(
+        &bin,
+        &omp_args(model, extra_args),
+        &[("OLLAMA_BASE_URL", server.as_str())],
+    )
+}
+
+const OMP_PROVIDER: &str = "ollama";
+const OMP_SETUP_VERSION: u64 = 2;
+
+/// `PATH`, then Bun's and the standalone installer's usual user-local bins.
+fn find_omp() -> Option<PathBuf> {
+    find_on_path("omp").or_else(|| omp_fallback_paths().into_iter().find(|path| path.is_file()))
+}
+
+fn omp_fallback_paths() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let dirs = [
+        home.join(".bun").join("bin"),
+        home.join(".local").join("bin"),
+    ];
+    if cfg!(windows) {
+        return dirs
+            .into_iter()
+            .flat_map(|dir| {
+                WINDOWS_PATH_EXTS
+                    .iter()
+                    .map(move |ext| dir.join(format!("omp.{ext}")))
+            })
+            .collect();
+    }
+    dirs.into_iter().map(|dir| dir.join("omp")).collect()
+}
+
+/// OMP's agent directory. These are the paths OMP exposes for callers to
+/// configure; profile layout remains OMP's responsibility.
+fn omp_agent_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    let config = std::env::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .unwrap_or_else(|| ".omp".to_string());
+    let config = PathBuf::from(config.trim());
+    Ok(if config.is_absolute() {
+        config.join("agent")
+    } else {
+        home.join(config).join("agent")
+    })
+}
+
+fn write_omp_config(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    let dir = omp_agent_dir()?;
+    write_omp_config_in_dir(&dir, model, thinking, vision, context_length, server)
+}
+
+fn write_omp_config_in_dir(
+    dir: &Path,
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    write_omp_models_config_at(
+        &dir.join("models.yml"),
+        model,
+        thinking,
+        vision,
+        context_length,
+        server,
+    )?;
+    write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
+}
+
+fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
+    let mut config = existing.clone();
+    if let Some(config) = config.as_object_mut() {
+        let setup_version = config
+            .get("setupVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .max(OMP_SETUP_VERSION);
+        config.insert("setupVersion".into(), serde_json::json!(setup_version));
+    }
+    config
+}
+
+fn write_omp_models_config_at(
+    path: &Path,
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    let entry = pi_model_entry(model, thinking, vision, context_length);
+    write_yaml_merged(path, "omp", |existing| {
+        omp_models_merged(existing, server, &entry)
+    })
+}
+
+/// Updates only llmman's `ollama` provider and the selected model. Other
+/// providers, provider-specific options, and previously registered models are
+/// retained; endpoint and protocol fields are owned by this launcher because
+/// stale values would route the launch somewhere other than llmman.
+fn omp_models_merged(
+    existing: &serde_json::Value,
+    server: &str,
+    entry: &serde_json::Value,
+) -> serde_json::Value {
+    provider_models_merged(existing, OMP_PROVIDER, entry, true, |provider| {
+        provider.insert(
+            "baseUrl".into(),
+            serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
+        );
+        provider.insert("api".into(), serde_json::json!("openai-responses"));
+        provider.remove("auth");
+        provider.insert(
+            "apiKey".into(),
+            serde_json::json!(providers::PLACEHOLDER_API_KEY),
+        );
+        provider.insert("authHeader".into(), serde_json::json!(true));
+        provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
+    })
+}
+
+fn write_yaml_merged(
+    path: &Path,
+    label: &str,
+    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> anyhow::Result<()> {
+    write_structured_merged(
+        path,
+        label,
+        ("YAML", "yml.bak"),
+        |text| Ok(yaml_serde::from_str(text)?),
+        |value| Ok(yaml_serde::to_string(value)?),
+        |raw, backup| {
+            if !backup.exists() {
+                return true;
+            }
+            yaml_serde::from_str::<serde_json::Value>(raw)
+                .and_then(|value| yaml_serde::to_string(&value))
+                .is_ok_and(|canonical| canonical != raw)
+        },
+        merge,
+    )
+}
+
+/// Select llmman's model through OMP's Ollama provider unless the caller
+/// explicitly supplied an OMP model after `--`. Avoiding a duplicate matters
+/// both for predictable precedence and for keeping OMP's argument parser out
+/// of version-specific repeated-option behavior.
+fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    if !has_flag(extra_args, "--model", Some("-m")) {
+        args.extend(["--model".to_string(), format!("ollama/{model}")]);
+    }
+    args.extend_from_slice(extra_args);
+    args
+}
+
 /// The provider key llmman owns in pi's `models.json`.
 const PI_PROVIDER: &str = "llmman";
+
+/// The explicit agent directory understood by both Pi and OMP.
+fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
+    let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = dir.trim();
+    if !dir.starts_with('~') {
+        return Ok(Some(PathBuf::from(dir)));
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    Ok(Some(expand_tilde(dir, &home)))
+}
 
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
 ///
@@ -1034,15 +1266,13 @@ const PI_PROVIDER: &str = "llmman";
 /// `cline_dir`'s own doc comment for what disagreeing there cost. The
 /// `~` handling is qwen's, for the quoted export that leaves one behind.
 fn pi_agent_dir() -> anyhow::Result<PathBuf> {
-    let home = || crate::config::home_dir().context("no home directory");
-    match std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|d| !d.trim().is_empty())
-    {
-        Some(dir) if !dir.trim().starts_with('~') => Ok(PathBuf::from(dir.trim())),
-        Some(dir) => Ok(expand_tilde(dir.trim(), &home()?)),
-        None => Ok(home()?.join(".pi").join("agent")),
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
     }
+    Ok(crate::config::home_dir()
+        .context("no home directory")?
+        .join(".pi")
+        .join("agent"))
 }
 
 /// Writes pi's `models.json` provider and points `settings.json` at it.
@@ -1063,8 +1293,9 @@ fn write_pi_config(
     })
 }
 
-/// The model pi is told about: what it can take in, whether it thinks,
-/// and how much it can hold. Every example in pi's own `models.md`
+/// The model entry Pi and OMP are told about: its display name, what it can
+/// take in, whether it thinks, and how much it can hold. Every example in
+/// Pi's own `models.md`
 /// declares these, and what it assumes for an entry that omits them is
 /// not written down, so they are stated rather than left to it.
 fn pi_model_entry(
@@ -1080,6 +1311,7 @@ fn pi_model_entry(
     };
     let mut entry = serde_json::json!({
         "id": model,
+        "name": model,
         "input": input,
     });
     if thinking.is_some_and(|t| t.thinks) {
@@ -1089,6 +1321,57 @@ fn pi_model_entry(
         entry["contextWindow"] = serde_json::json!(context);
     }
     entry
+}
+
+/// Merge one model into a named provider while retaining unrelated providers,
+/// provider options, and models. OMP also retains unowned fields on the
+/// matching model; Pi rebuilds its matching entry from daemon metadata.
+fn provider_models_merged(
+    existing: &serde_json::Value,
+    provider_name: &str,
+    entry: &serde_json::Value,
+    preserve_existing_model_fields: bool,
+    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> serde_json::Value {
+    let mut root = existing.clone();
+    let Some(root_map) = root.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let old_models = provider
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut replaced = false;
+    let mut models = Vec::with_capacity(old_models.len() + 1);
+    for old in old_models {
+        if old.get("id") != entry.get("id") {
+            models.push(old);
+            continue;
+        }
+        if replaced {
+            continue;
+        }
+        let mut merged = if preserve_existing_model_fields {
+            old
+        } else {
+            serde_json::json!({})
+        };
+        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
+            merged.extend(update.clone());
+        } else {
+            merged = entry.clone();
+        }
+        models.push(merged);
+        replaced = true;
+    }
+    if !replaced {
+        models.push(entry.clone());
+    }
+    configure(provider);
+    provider.insert("models".into(), serde_json::json!(models));
+    root
 }
 
 /// `existing` with llmman's provider updated around `entry`, keeping
@@ -1105,41 +1388,17 @@ fn pi_models_merged(
     server: &str,
     entry: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut root = existing.clone();
-    let kept: Vec<serde_json::Value> = root
-        .get("providers")
-        .and_then(|p| p.get(PI_PROVIDER))
-        .and_then(|p| p.get("models"))
-        .and_then(serde_json::Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|m| m.get("id") != entry.get("id"))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut models = kept;
-    models.push(entry.clone());
-
-    // Both levels go through object_under: a file may legitimately hold
-    // `"providers": []`, and indexing that with a key panics.
-    let root_map = match root.as_object_mut() {
-        Some(map) => map,
-        None => return serde_json::json!({}),
-    };
-    let provider = object_under(object_under(root_map, "providers"), PI_PROVIDER);
-    provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
-    provider
-        .entry("api")
-        .or_insert_with(|| serde_json::json!("openai-completions"));
-    // A literal, not a `"$VAR"` reference pi would interpolate: see
-    // launch_pi's own doc comment.
-    provider
-        .entry("apiKey")
-        .or_insert_with(|| serde_json::json!("llmman"));
-    provider.insert("models".into(), serde_json::json!(models));
-    root
+    provider_models_merged(existing, PI_PROVIDER, entry, false, |provider| {
+        provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
+        provider
+            .entry("api")
+            .or_insert_with(|| serde_json::json!("openai-completions"));
+        // A literal, not a `"$VAR"` reference pi would interpolate: see
+        // launch_pi's own doc comment.
+        provider
+            .entry("apiKey")
+            .or_insert_with(|| serde_json::json!("llmman"));
+    })
 }
 
 /// `existing` with pi's startup provider and model pointed at this launch,
@@ -1884,22 +2143,49 @@ fn write_json_merged(
     label: &str,
     merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> anyhow::Result<()> {
+    write_structured_merged(
+        path,
+        label,
+        ("JSON", "json.bak"),
+        |text| {
+            let text = text.trim_start_matches('\u{feff}').trim();
+            Ok(serde_json::from_str(&strip_json_comments(text))?)
+        },
+        |value| {
+            let mut out = serde_json::to_string_pretty(value)?;
+            out.push('\n');
+            Ok(out)
+        },
+        |raw, backup| !backup.exists() || strip_json_comments(raw) != raw,
+        merge,
+    )
+}
+
+/// Parse, merge, back up, and atomically rewrite a user-owned structured
+/// settings file. Format-specific parsing and rendering stay at the call site.
+fn write_structured_merged(
+    path: &Path,
+    label: &str,
+    format: (&str, &str),
+    parse: impl FnOnce(&str) -> anyhow::Result<serde_json::Value>,
+    serialize: impl FnOnce(&serde_json::Value) -> anyhow::Result<String>,
+    should_backup: impl FnOnce(&str, &Path) -> bool,
+    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> anyhow::Result<()> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => Some(raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let existing = match raw
-        .as_deref()
-        .map(|r| r.trim_start_matches('\u{feff}').trim())
-    {
+    let existing = match raw.as_deref().map(str::trim) {
         None | Some("") => serde_json::json!({}),
-        Some(text) => match serde_json::from_str::<serde_json::Value>(&strip_json_comments(text)) {
+        Some(text) => match parse(text) {
             Ok(value) if value.is_object() => value,
             _ => {
                 eprintln!(
-                    "[llmman] {label}: {} is not a JSON object; leaving it alone",
-                    path.display()
+                    "[llmman] {label}: {} is not a {} object; leaving it alone",
+                    path.display(),
+                    format.0
                 );
                 return Ok(());
             }
@@ -1912,14 +2198,13 @@ fn write_json_merged(
     let dir = path.parent().context("settings path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     if let Some(raw) = &raw {
-        let bak = path.with_extension("json.bak");
-        if !bak.exists() || strip_json_comments(raw) != *raw {
-            std::fs::copy(path, &bak)
-                .with_context(|| format!("back up {} to {}", path.display(), bak.display()))?;
+        let backup = path.with_extension(format.1);
+        if should_backup(raw, &backup) {
+            std::fs::copy(path, &backup)
+                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
         }
     }
-    let mut out = serde_json::to_string_pretty(&merged)?;
-    out.push('\n');
+    let out = serialize(&merged)?;
     crate::fsutil::write_atomic(path, out.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
@@ -3030,6 +3315,226 @@ mod tests {
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
     }
 
+    #[test]
+    fn omp_is_listed_and_selects_the_model_through_ollama() {
+        let omp = INTEGRATIONS.iter().find(|i| i.name == "omp").unwrap();
+        assert_eq!(omp.binary, "omp");
+        assert!(MODEL_REQUIRED.contains(&"omp"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"omp"));
+
+        assert_eq!(
+            omp_args("docker.io/ai/qwen3.5:0.8b", &[]),
+            vec!["--model", "ollama/docker.io/ai/qwen3.5:0.8b"]
+        );
+
+        let existing = serde_json::json!({
+            "providers": {
+                "other": { "baseUrl": "https://example.com" },
+                "ollama": {
+                    "auth": "none",
+                    "headers": { "X-Custom": "kept" },
+                    "models": [
+                        {
+                            "id": "docker.io/ai/qwen3.5:0.8b",
+                            "name": "User name",
+                            "input": ["text", "image"],
+                            "maxTokens": 4096
+                        },
+                        { "id": "old", "name": "Old" }
+                    ]
+                }
+            }
+        });
+        let entry = serde_json::json!({
+            "id": "docker.io/ai/qwen3.5:0.8b",
+            "name": "docker.io/ai/qwen3.5:0.8b",
+            "input": ["text"]
+        });
+        let merged = omp_models_merged(&existing, "http://127.0.0.1:17434", &entry);
+        let provider = &merged["providers"]["ollama"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["api"], "openai-responses");
+        assert!(provider.get("auth").is_none());
+        assert_eq!(provider["apiKey"], providers::PLACEHOLDER_API_KEY);
+        assert_eq!(provider["authHeader"], true);
+        assert_eq!(provider["discovery"]["type"], "ollama");
+        assert_eq!(provider["headers"]["X-Custom"], "kept");
+        assert_eq!(provider["models"][0]["name"], entry["name"]);
+        assert_eq!(provider["models"][0]["input"], entry["input"]);
+        assert_eq!(provider["models"][0]["maxTokens"], 4096);
+        assert_eq!(provider["models"][1]["id"], "old");
+        assert_eq!(
+            merged["providers"]["other"]["baseUrl"],
+            "https://example.com"
+        );
+
+        let config = omp_config_merged(&serde_json::json!({
+            "setupVersion": OMP_SETUP_VERSION + 3,
+            "theme": "dark"
+        }));
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION + 3);
+        assert_eq!(config["theme"], "dark");
+    }
+
+    #[test]
+    fn omp_model_argument_after_separator_wins_without_a_duplicate() {
+        let strings = |values: &[&str]| values.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        for forwarded in [
+            strings(&["--model", "openrouter/anthropic/claude-sonnet-4"]),
+            strings(&["-m", "ollama/other"]),
+            strings(&["--model=ollama/other"]),
+            strings(&["-m=ollama/other"]),
+        ] {
+            assert_eq!(omp_args("local", &forwarded), forwarded);
+        }
+
+        assert_eq!(
+            omp_args("local", &strings(&["-p", "ping"])),
+            strings(&["--model", "ollama/local", "-p", "ping"])
+        );
+    }
+
+    #[test]
+    fn omp_fallback_paths_cover_bun_and_local_bin() {
+        let paths = omp_fallback_paths();
+        let binary = if cfg!(windows) { "omp.exe" } else { "omp" };
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".bun").join("bin").join(binary))));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".local").join("bin").join(binary))));
+    }
+
+    #[test]
+    fn omp_config_is_created_for_a_fresh_home_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-omp-models-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_path = dir.join("models.yml");
+        let thinks = ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec!["low", "high"],
+        };
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            Some(&thinks),
+            true,
+            Some(32_768),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        let provider = &parsed["providers"]["ollama"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["models"][0]["id"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["name"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["reasoning"], true);
+        assert_eq!(
+            provider["models"][0]["input"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(provider["models"][0]["contextWindow"], 32_768);
+        let config: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(dir.join("config.yml")).unwrap())
+                .unwrap();
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omp_models_yml_backs_up_the_exact_commented_file_before_rewriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-omp-models-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models.yml");
+        let config_path = dir.join("config.yml");
+        let original = r#"# my own notes, do not delete
+providers:
+  openai:
+    apiKey: sk-mine
+defaults:
+  temperature: 0.2   # tuned by hand
+"#;
+        std::fs::write(&path, original).unwrap();
+        let config_original = "# keep this too\ntheme: dark\n";
+        std::fs::write(&config_path, config_original).unwrap();
+
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            None,
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            Some(4096),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            original
+        );
+        let mut hand_edited = std::fs::read_to_string(&path).unwrap();
+        hand_edited.push_str("# added after the first launch\n");
+        std::fs::write(&path, &hand_edited).unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            Some(8192),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            hand_edited
+        );
+        let parsed: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["openai"]["apiKey"], "sk-mine");
+        assert_eq!(parsed["defaults"]["temperature"], 0.2);
+        assert_eq!(
+            parsed["providers"]["ollama"]["models"][0]["id"],
+            "docker.io/ai/qwen3.5:0.8b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path.with_extension("yml.bak")).unwrap(),
+            config_original
+        );
+        let config: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The only configuration goose gets: a wrong or missing one sends
     /// the session to api.openai.com instead of the daemon. `OPENAI_HOST`
     /// is the bare origin — goose appends `OPENAI_BASE_PATH` itself, so a
@@ -3779,6 +4284,7 @@ mod tests {
         };
         let entry = pi_model_entry("qwen3.5:0.8b", Some(&thinks), true, Some(32768));
         assert_eq!(entry["id"], "qwen3.5:0.8b");
+        assert_eq!(entry["name"], "qwen3.5:0.8b");
         assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
         assert_eq!(entry["reasoning"], true);
         assert_eq!(entry["contextWindow"], 32768);
