@@ -203,41 +203,6 @@ the request to a chat completion and the reply back, tool calls included.
 Providers that have the API (`openai`, `groq`, `openrouter`) are used
 natively; any other 4xx is relayed as-is.
 
-### Context window
-
-An agent that doesn't know how much the model can hold never compacts,
-and runs off the end of the window instead. So `llmman launch` declares
-the window it actually serves to the integrations whose config has a
-field for one: `codex`'s `context_window` and `opencode`'s
-`limit.context`. The value is `LLMMAN_CONTEXT_LENGTH` when it is set,
-else the model's trained context; when neither is known the field is
-left out and the integration keeps its own default, rather than being
-handed a number llmman made up. `codex` is the one exception — its
-catalog cannot omit the field, so it falls back to 128k.
-
-Only a plain local model gets one. A `--provider` model is served by
-someone else, and `LLMMAN_CONTEXT_LENGTH` describes this daemon alone; a
-hybrid pair's local half is the side the daemon overflows *away* from, so
-declaring its window would have the agent compact to stay local — the
-very thing the [overflow retry](#hybrid-model-pairs) exists to avoid.
-Both are left to the integration's own judgement.
-
-The rest are being moved over one integration at a time. `dsh` and
-`hermes` have such a field and are not written yet, so they keep their
-own defaults. `pi` is written, but from the model's trained context
-rather than the served window, and without the local-model-only rule
-above — so `LLMMAN_CONTEXT_LENGTH` does not yet reach it. `kimi` needs
-more than a field: it takes a required `max_context_size` per model in
-its own `~/.kimi/config.toml`, which `llmman launch` does not write at
-all today.
-
-The value llmman declares is the one a load actually starts at, which is
-not always the model's full trained context: without an explicit
-`LLMMAN_CONTEXT_LENGTH`, `--ctx-size` starts at the 256k default capped
-*down* to the trained context (see
-[configuration.md](configuration.md#environment-variables)), so a model
-trained beyond 256k is still served 256k and is declared as such.
-
 ### Thinking
 
 Thinking depth is set from inside the integration and reaches the model
@@ -249,9 +214,11 @@ the model's default.
 - `opencode`: variants read off the model's chat template (what `llmman
   show` lists as `thinking`), cycled with `variant_cycle` (ctrl+t) or
   `/variants`: `none`, each `reasoning_effort` level the template takes
-  (Qwen3.8: `low`, `medium`, `high`, `xhigh`), or `thinking` for a
-  template with only an `enable_thinking` switch (Gemma 4, Qwen3.5). A
-  provider's model gets `none`, `low`, `medium`, `high`.
+  (Qwen3.8: `low`, `medium`, `xhigh`), or `thinking` for a template with
+  only an `enable_thinking` switch (Gemma 4, Qwen3.5). A provider's model
+  gets the levels models.dev's `reasoning_options` list, as opencode
+  does (Claude Opus 5.5: `low` to `max`), else `none`, `low`, `medium`,
+  `high`.
 - `claude`: Claude Code's `/effort <low|medium|high|xhigh|max>`, sent as
   spelled; a level the template rejects is a 400.
 - `codex`: `model_reasoning_effort`, e.g. `-- -c
