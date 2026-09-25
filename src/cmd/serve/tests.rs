@@ -7,8 +7,9 @@ use super::ollama::{
     OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
 };
 use super::openai::{
-    apply_default_repeat_penalty, apply_reasoning_effort, mlx_embeddings_unsupported_response,
-    multipart_form, multipart_text_field, omni_image_request, omni_video_fields,
+    apply_default_repeat_penalty, apply_reasoning_effort, consolidate_chat_system_messages,
+    mlx_embeddings_unsupported_response, multipart_form, multipart_text_field, omni_image_request,
+    omni_video_fields,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{rewrite_json_response_model, rewrite_sse_line_model, set_response_model};
@@ -18,6 +19,11 @@ use super::responses::{
 };
 use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
+use super::test_support::{
+    headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
+    running_model_fixture, running_model_fixture_with_engine, serve_router, serve_router_with,
+    test_inner, test_state, test_state_at, test_state_with_budget, ws_upgrade, HOSTED, PAIR,
+};
 use super::*;
 
 // -- pull/push progress relay -------------------------------------------
@@ -81,21 +87,6 @@ fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
 }
 
 // -- request targets (local backend vs remote provider) -----------------
-
-pub(super) fn remote_target(base_url: &str) -> Target {
-    remote_target_on(base_url, Wire::OpenAi)
-}
-
-fn remote_target_on(base_url: &str, wire: Wire) -> Target {
-    Target::Remote(Arc::new(RemoteTarget {
-        provider: "mockprov".into(),
-        base_url: base_url.into(),
-        wire,
-        model: "mock-model".into(),
-        max_output: None,
-        api_key: Some("sk-test".into()),
-    }))
-}
 
 /// A local target must keep producing byte-for-byte the same loopback
 /// URLs the `format!("http://127.0.0.1:{port}{path}")` calls this
@@ -1041,32 +1032,6 @@ fn a_peer_target_is_a_local_backend_in_all_but_address() {
     }
 }
 
-/// `/llmman/node` answers `node`; every other route records its call.
-async fn mock_peer(
-    node: aggregation::Node,
-) -> (
-    String,
-    Arc<tokio::sync::Mutex<Vec<(String, HeaderMap, Bytes)>>>,
-) {
-    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let captured = seen.clone();
-    let app = Router::new()
-        .route("/llmman/node", get(move || async move { Json(node) }))
-        .fallback(move |req: Request| async move {
-            let (parts, body) = req.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            captured
-                .lock()
-                .await
-                .push((parts.uri.path().to_string(), parts.headers, body));
-            ([("content-type", "application/json")], "{}")
-        });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (origin, seen)
-}
-
 /// Store tags `docker.io/ai/m:latest` with no blobs, so a local load
 /// fails offline instead of pulling.
 fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
@@ -1092,15 +1057,6 @@ fn state_with_peers(peers: Vec<String>, memory: u64) -> AppState {
     inner.peers = peers;
     inner.memory = memory;
     AppState(Arc::new(inner))
-}
-
-fn node(memory: u64, loaded: &[&str], stored: &[&str]) -> aggregation::Node {
-    let map = |names: &[&str]| names.iter().map(|n| (n.to_string(), 1 << 30)).collect();
-    aggregation::Node {
-        memory,
-        loaded: map(loaded),
-        stored: map(stored),
-    }
 }
 
 /// A peer gets llmman's own dialect, the hop marker, no credential.
@@ -1368,23 +1324,9 @@ async fn an_unload_is_forwarded_to_every_peer() {
 
 // -- hybrid pairs (one reference, a local and a hosted half) -------------
 
-pub(super) fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in pairs {
-        headers.insert(
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-            value.parse().unwrap(),
-        );
-    }
-    headers
-}
-
 fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
     crate::hybrid::split_ref(reference).expect("test reference must be a pair")
 }
-
-pub(super) const PAIR: &str = "llmman.hybrid/gemma4,anthropic/claude-sonnet-4-5";
-pub(super) const HOSTED: &str = "llmman.provider/anthropic/claude-sonnet-4-5";
 
 /// What comes back is one half's own ordinary reference, with
 /// nothing left for anything downstream to special-case.
@@ -2067,142 +2009,6 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
 }
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
-
-pub(super) fn test_state() -> AppState {
-    test_state_at(std::env::temp_dir())
-}
-
-/// `test_state` with a real store directory, for the few tests that
-/// need `canonical_ref` to actually resolve something.
-fn test_state_at(store_path: PathBuf) -> AppState {
-    AppState(Arc::new(test_inner(store_path)))
-}
-
-/// `test_state` with a hybrid byte budget (every other test has none).
-fn test_state_with_budget(hybrid_local_bytes: u64) -> AppState {
-    let mut inner = test_inner(std::env::temp_dir());
-    inner.hybrid_local_bytes = Some(hybrid_local_bytes);
-    AppState(Arc::new(inner))
-}
-
-/// `test_state_at`'s `Inner`, for tests that set one field differently.
-fn test_inner(store_path: PathBuf) -> Inner {
-    Inner {
-        manager: Mutex::new(ModelManager {
-            running: HashMap::new(),
-            pending_loads: 0,
-        }),
-        exe: None,
-        // `path`, so a resolve could never download.
-        runtime: runtime::Lazy::new(Runtime::Path, None, None),
-        llama_cpp_version: None,
-        vllm_version: None,
-        sglang_version: None,
-        ctx_size: None,
-        ctx_size_explicit: false,
-        hybrid_local_bytes: None,
-        flash_attention: None,
-        kv_cache_type: None,
-        split_mode: None,
-        num_parallel: None,
-        threads: None,
-        cpu_limit: None,
-        // usize::MAX, not 0 — 0 now means "admit almost nothing"
-        // (see try_admit_against's doc comment), and no test here
-        // calls ensure_model (the only caller of try_admit) directly
-        // anyway.
-        max_queue: usize::MAX,
-        max_loaded_models: 0,
-        peers: Vec::new(),
-        memory: 0,
-        store_path,
-        cache_path: std::env::temp_dir(),
-        prompt_log: None,
-        shell: shell::Policy {
-            disabled: None,
-            origins: default_allowed_origins(),
-            command: Vec::new(),
-        },
-        auth: auth::Policy::default(),
-        peer_key: None,
-        client: Client::new(),
-    }
-}
-
-/// A long-lived, harmless real child process to back a test
-/// `RunningModel` — `ModelProcess::is_alive`/`Drop` both need a real
-/// `tokio::process::Child`, not a mock. `sleep` isn't on `PATH` on
-/// Windows (which this project does target — see the `#[cfg(windows)]`
-/// branches elsewhere in this module), so it's spawned differently per
-/// platform rather than assuming a Unix-only test environment.
-///
-/// Its own process group (matching `spawn_vllm_server`'s own real
-/// spawn — see its doc comment), not just the bare default: a
-/// fixture backing an `Engine::Vllm` `RunningModel` hits
-/// `ModelProcess::Drop`'s process-group-SIGKILL arm, which needs
-/// this to actually *be* one, or that kill fails and prints a
-/// spurious "SIGKILL to vllm process group ... failed" warning on
-/// every test run that uses one — confirmed live via CodeRabbit
-/// review on this repo's own git history.
-#[cfg(unix)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("sleep")
-        .arg("60")
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `sleep` process")
-}
-
-#[cfg(windows)]
-fn spawn_placeholder_process() -> tokio::process::Child {
-    tokio::process::Command::new("cmd")
-        .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn placeholder `cmd /C timeout` process")
-}
-
-fn running_model_fixture(
-    keep_alive: Option<Duration>,
-    idle_for: Duration,
-    in_flight: u32,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(Engine::LlamaServer, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now() - idle_for,
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: None,
-        keep_alive,
-        in_flight,
-    }
-}
-
-/// Like `running_model_fixture`, but with a caller-chosen `Engine`
-/// and `backend_model_path` — used by `backend_wire_model`'s own
-/// tests below, which need to distinguish an `Engine::Mlx` backend
-/// from every other one, and by the `engine_label` test.
-fn running_model_fixture_with_engine(
-    engine: Engine,
-    backend_model_path: Option<&str>,
-) -> RunningModel {
-    RunningModel {
-        process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
-        port: 0,
-        digest: String::new(),
-        size: 0,
-        started_at: now_rfc3339(),
-        last_active: Instant::now(),
-        last_active_wall: chrono::Utc::now(),
-        backend_model_path: backend_model_path.map(|s| s.to_string()),
-        keep_alive: None,
-        in_flight: 0,
-    }
-}
 
 /// The container arm reports the engine it runs, not the runtime that
 /// runs it. `tokio::test` because the fixture spawns a real child.
@@ -3981,6 +3787,264 @@ fn consolidate_responses_instructions_is_a_no_op_without_developer_or_system_ite
     assert_eq!(req, before);
 }
 
+/// An agent runner sends one `system` message per toolset, which a
+/// strict template refuses past the first.
+#[test]
+fn consolidate_chat_system_messages_merges_them_into_one_leading_message() {
+    let mut req = serde_json::json!({
+        "model": "docker.io/ai/qwen3.5:0.8b",
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "## Shell Tools"},
+            {"role": "developer", "content": [{"type": "text", "text": "## Filesystem Tools"}]}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content":
+                "you are a helpful assistant\n\n## Shell Tools\n\n## Filesystem Tools"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// The common shape, and the one every ordinary request pays for:
+/// already-leading system message, returned byte for byte.
+#[test]
+fn consolidate_chat_system_messages_leaves_a_single_leading_one_alone() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "you are a helpful assistant"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// Rebuilding a conforming request would flatten its content to text
+/// and drop every block that isn't.
+#[test]
+fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+}
+
+/// Folding content to text drops every block that isn't text, which
+/// forwards a truncated prompt with no error.
+#[test]
+fn consolidate_chat_system_messages_keeps_non_text_blocks_while_merging() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "and cite sources"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": [
+                {"type": "text", "text": "be terse"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "text", "text": "and cite sources"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// The blank line separates messages, so one message's own parts must
+/// not use it too — two parts would read as two instructions.
+#[test]
+fn consolidate_chat_system_messages_keep_a_messages_own_parts_off_the_blank_line() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"}
+            ]},
+            {"role": "user", "content": "hi"},
+            // Without this the request conforms and is returned as written.
+            {"role": "developer", "content": "developer instruction"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"][0]["content"],
+        "part one\npart two\n\ndeveloper instruction"
+    );
+}
+
+/// A non-text block ends the run it interrupts: parts before it stay one
+/// instruction, parts after it start another. The image is the object
+/// shape an OpenAI client sends, asserted back whole — `push` clones a
+/// non-text block rather than reading it, so its shape does not matter.
+#[test]
+fn consolidate_chat_system_messages_let_a_non_text_block_end_the_run() {
+    let image = serde_json::json!({
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}
+    });
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "before one"},
+                {"type": "text", "text": "before two"},
+                image,
+                {"type": "text", "text": "after"}
+            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "developer", "content": "and cite sources"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"][0]["content"],
+        serde_json::json!([
+            {"type": "text", "text": "before one\nbefore two"},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+            {"type": "text", "text": "after\n\nand cite sources"}
+        ])
+    );
+    // Non-instruction turns are left alone.
+    assert_eq!(
+        req["messages"][1],
+        serde_json::json!({"role": "user", "content": "hi"})
+    );
+    assert_eq!(req["messages"].as_array().map(Vec::len), Some(2));
+}
+
+/// An empty part is dropped, not joined: it would otherwise leave a
+/// stray newline at either end of the run, or a blank line mid-message.
+#[test]
+fn consolidate_chat_system_messages_drop_empty_parts_from_the_run() {
+    let cases = [
+        // Leading, trailing and lone empties leave no trace.
+        (
+            serde_json::json!([{"type": "text", "text": "a"},
+                            {"type": "text", "text": ""}]),
+            "a\n\ndev",
+        ),
+        (
+            serde_json::json!([{"type": "text", "text": ""},
+                            {"type": "text", "text": "b"}]),
+            "b\n\ndev",
+        ),
+        (
+            serde_json::json!([{"type": "text", "text": ""},
+                            {"type": "text", "text": ""}]),
+            "dev",
+        ),
+        // One between two real parts does not split them.
+        (
+            serde_json::json!([{"type": "text", "text": "a"},
+                            {"type": "text", "text": ""},
+                            {"type": "text", "text": "b"}]),
+            "a\nb\n\ndev",
+        ),
+    ];
+    for (content, want) in cases {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": content},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "dev"}
+            ]
+        });
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req["messages"][0]["content"], want);
+    }
+}
+
+/// A late system turn is the shape templates reject, so it moves — and
+/// reorders relative to the user turn before it, as `/v1/messages` does.
+#[test]
+fn consolidate_chat_system_messages_moves_a_late_lone_system_turn_to_the_front() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "a mid-conversation reminder"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "a mid-conversation reminder"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
+/// A request with no system message must not gain one.
+#[test]
+fn consolidate_chat_system_messages_is_a_no_op_without_any() {
+    let mut req = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let before = req.clone();
+    consolidate_chat_system_messages(&mut req);
+    assert_eq!(req, before);
+
+    // An embeddings-shaped body has no `messages` at all.
+    let mut input_only = serde_json::json!({"input": "hi"});
+    let before = input_only.clone();
+    consolidate_chat_system_messages(&mut input_only);
+    assert_eq!(input_only, before);
+}
+
+/// An empty system message must not join a blank line into the merge.
+#[test]
+fn consolidate_chat_system_messages_drops_empty_ones() {
+    let mut req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "the only real instruction"}
+        ]
+    });
+
+    consolidate_chat_system_messages(&mut req);
+
+    assert_eq!(
+        req["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "the only real instruction"},
+            {"role": "user", "content": "hi"}
+        ])
+    );
+}
+
 // -- Tests ported from ollama ---------------------------------------------
 //
 // The tests below are ported from ollama's own unit-test suites for the
@@ -4815,19 +4879,6 @@ async fn stream_ollama_true_returns_ndjson_chunks() {
     assert!(chunks[0].get("eval_count").is_none());
 }
 
-/// The process-wide registry against placeholder gauges.
-fn rendered_registry() -> String {
-    metrics::render(&metrics::Snapshot {
-        version: "test".into(),
-        start_time_seconds: 0,
-        scheduling_requests_in_flight: 0,
-        scheduling_capacity: 1,
-        models_loaded: 0,
-        models_loading: 0,
-        models: Vec::new(),
-    })
-}
-
 /// One model's unload counter from the process-wide registry; `0`
 /// while the series does not exist yet.
 fn unload_count(model: &str, reason: &str) -> u64 {
@@ -5046,19 +5097,6 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
 
 // -- web UI ---------------------------------------------------------
 
-/// Binds `build_router(state, false)` on a free loopback port.
-async fn serve_router(state: AppState) -> String {
-    serve_router_with(state, false).await
-}
-
-async fn serve_router_with(state: AppState, metrics: bool) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = build_router(state, metrics);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{}", addr.port())
-}
-
 /// `/` is the page only for a client that asks for HTML; everything
 /// else gets the liveness line scripts have always seen.
 #[tokio::test]
@@ -5160,19 +5198,6 @@ fn shell_state(policy: shell::Policy) -> AppState {
     let mut inner = test_inner(std::env::temp_dir());
     inner.shell = policy;
     AppState(Arc::new(inner))
-}
-
-fn ws_upgrade(client: &Client, url: &str, origin: Option<&str>) -> reqwest::RequestBuilder {
-    let mut req = client
-        .get(url)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
-    if let Some(origin) = origin {
-        req = req.header("origin", origin);
-    }
-    req
 }
 
 /// A plain GET reports the policy; an upgrade under a disabled policy

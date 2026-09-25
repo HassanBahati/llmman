@@ -5,7 +5,7 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `codex`, `cline`, `grok`, `qwen`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
 //! `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks.
 //! That's the only way this actually verifies anything: every one of the
@@ -1068,6 +1068,26 @@ fn launch_pi_with_model() {
 }
 
 #[test]
+fn launch_omp_with_model() {
+    eprintln!("[test] launch_omp_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_omp_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("omp") {
+        eprintln!("skipping: omp not on PATH — https://omp.sh/");
+        return;
+    }
+
+    // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
+    // `ollama/<model>` while run_launch's fresh HOME ensures the test does
+    // not succeed because of a developer's pre-existing OMP configuration.
+    launch_and_assert_strict("omp", &["-p", PROMPT]);
+}
+
+#[test]
 fn launch_cline_with_model() {
     eprintln!("[test] launch_cline_with_model: acquiring SERIAL");
     let _guard = lock_serial();
@@ -1197,6 +1217,136 @@ fn launch_grok_with_model() {
     // against llmman's `/v1` endpoint, using the model table llmman writes
     // into Grok's config.
     launch_and_assert_strict("grok", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_docker_agent_with_model() {
+    eprintln!("[test] launch_docker_agent_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_docker_agent_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    // `on_path` alone, though `find_docker_agent` also looks in
+    // `~/.docker/cli-plugins`: `run_launch` replaces `HOME` with a fresh
+    // temp directory, so that fallback can never fire under this
+    // harness. CI installs the binary onto `PATH` for that reason.
+    if !on_path("docker-agent") {
+        eprintln!(
+            "skipping: docker-agent not on PATH — https://github.com/docker/docker-agent/releases"
+        );
+        return;
+    }
+
+    // These arguments land after the `run <agent file>` that
+    // `docker_agent_args` prepends, which is why neither appears here.
+    // `--exec` is docker-agent's non-interactive mode. No `--yolo`,
+    // though the generated agent carries the shell and filesystem
+    // toolsets: a one-word reply calls neither, and granting an agent's
+    // writes stays the caller's decision.
+    //
+    // Strict: `inspect_home` runs only after the reply assertion
+    // passes, so a tolerated miss would skip the config checks below
+    // and leave the test asserting nothing. A timeout is still
+    // forgiven when the daemon is shown to be alive.
+    launch_and_assert_with(
+        "docker-agent",
+        &["--exec", PROMPT],
+        |_stdout, _stderr| NonzeroDisposition::Reject,
+        |_stdout| false,
+        docker_agent_reply_is_pong,
+        true,
+        docker_agent_left_the_users_own_config_alone,
+    );
+}
+
+/// Whether the model's *reply* was "pong", ignoring the reasoning
+/// docker-agent prints above it.
+///
+/// A thinking model reasons about the prompt, so the word appears in its
+/// reasoning whether or not it ever answers — `stdout.contains("pong")`
+/// passes on a run that produced no reply. The reply is the last
+/// non-empty line.
+fn docker_agent_reply_is_pong(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .is_some_and(|reply| {
+            reply
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("pong")
+        })
+}
+
+/// Checks what `launch_docker_agent` promises: it writes its own agent
+/// file under `~/.config/llmman`, and puts nothing in docker-agent's own
+/// `~/.config/cagent`. The second is asserted as "no llmman settings in
+/// that file" rather than "that directory is absent", because
+/// docker-agent creates it itself on first run.
+///
+/// Runs on every platform: `docker_agent_config_dir` hangs off
+/// `llmman.conf`'s directory, which resolves `~` through
+/// `HOME`/`USERPROFILE`, so Windows writes into this temp home too.
+fn docker_agent_left_the_users_own_config_alone(home: &Path) {
+    let generated = docker_agent_generated_file(home);
+    let text = std::fs::read_to_string(&generated)
+        .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));
+    assert!(
+        text.contains(&format!("base_url: \"{}/v1\"", llmman::daemon::server())),
+        "generated agent does not route at the daemon: {text}"
+    );
+    assert!(
+        // MODEL as `launch` resolves it before the launcher sees it,
+        // spelled out the way `launch_cline_with_model` does.
+        text.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
+        "generated agent does not name the resolved model: {text}"
+    );
+    // The key is named, not written, so a `--provider` launch cannot
+    // leave a real credential in this file.
+    assert!(
+        text.contains("token_key: LLMMAN_API_KEY"),
+        "generated agent does not read its key from the environment: {text}"
+    );
+    assert!(
+        !text.contains("api_key"),
+        "generated agent persisted a credential: {text}"
+    );
+
+    let theirs = home.join(".config/cagent/config.yaml");
+    if let Ok(text) = std::fs::read_to_string(&theirs) {
+        assert!(
+            !text.contains("llmman"),
+            "llmman wrote into docker-agent's own config at {}: {text}",
+            theirs.display()
+        );
+    }
+}
+
+/// The agent file the launch wrote, matched rather than spelled out
+/// because `launch_docker_agent` names it after the model. One file is
+/// also the assertion that a launch leaves nothing else behind.
+fn docker_agent_generated_file(home: &Path) -> PathBuf {
+    let dir = home.join(".config/llmman/launch/docker-agent");
+    let mut written: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("read directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".yaml"))
+        })
+        .collect();
+    written.sort();
+    assert_eq!(
+        written.len(),
+        1,
+        "expected one generated agent file in {}, found {written:?}",
+        dir.display()
+    );
+    written.remove(0)
 }
 
 #[test]

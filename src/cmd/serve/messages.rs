@@ -183,7 +183,7 @@ fn push_system_text(system: &mut Vec<String>, content: &Value) {
 
 /// Text blocks of string-or-blocks content, one per line; other blocks
 /// are not text.
-fn content_text(content: &Value) -> String {
+pub(super) fn content_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => text_lines(blocks),

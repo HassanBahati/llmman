@@ -128,9 +128,15 @@ Without a prompt it opens a `>>> ` loop where `/set width|height|steps|seed|cfg|
 adjusts the settings. The same model answers `/v1/images/generations`, `/v1/videos` and
 `/v1/audio/speech` on `llmman serve`.
 
-Diffusion repositories published as Diffusers-layout safetensors (a root `model_index.json`)
-are instead served by [vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve
---omni`; install `vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
+Qwen-Image 2.1 runs from its Diffusers-layout safetensors the same way:
+
+```sh
+llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"               # an RGBA png
+```
+
+Other Diffusers-layout repositories (a root `model_index.json`) are served by
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) (`vllm serve --omni`; install
+`vllm-omni` next to `vllm`, or use `--runtime docker` for the `vllm/vllm-omni` image).
 See [docs/backends.md](docs/backends.md#vllm-omni-diffusers-pipelines).
 
 ## OCI-native models
@@ -271,15 +277,16 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 llmman launch cline --model qwen3.8 -- --json "Explain this repository"
 llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Pi, Cline, Aider, Qwen Code, Gemini CLI,
-Grok Build,
-AGY, DeepSeek Harness, ...) and whether each is installed. Installing an
+(Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
+Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, ...) and whether
+each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed
@@ -292,6 +299,17 @@ support. llmman writes Gemini mode to its own stable settings directory at
 
 Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
 and `globalState.json`, honouring `CLINE_DIR` like Cline does.
+
+Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
+Desktop and `brew install docker-agent` put it. llmman generates its own
+agent file under `~/.config/llmman/launch/docker-agent/` and passes it to
+`docker-agent run`; `~/.config/cagent` stays untouched. With more than one
+Docker Agent installed, the one on `PATH` wins.
+
+The generated agent gets the `shell` and `filesystem` toolsets. Docker
+Agent asks before each tool call unless you pass `--yolo`. To run an
+agent of your own instead, point its model at the daemon and run
+`docker-agent` directly.
 
 ### Hosted providers
 

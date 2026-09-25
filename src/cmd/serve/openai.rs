@@ -14,6 +14,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
+use super::messages::content_text;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_rewriting_model, relay, relay_chat_upstream, stream_rewriting_model,
@@ -82,6 +83,133 @@ pub(super) async fn handle_openai_models(
 pub(super) fn apply_default_repeat_penalty(req: &mut serde_json::Value) {
     if req.get("repeat_penalty").is_none() {
         req["repeat_penalty"] = serde_json::json!(DEFAULT_REPEAT_PENALTY);
+    }
+}
+
+/// Merges every `system` and `developer` message into one leading
+/// `system` message, joined by a blank line.
+///
+/// Strict chat templates refuse a system message anywhere but index 0,
+/// and a client may legitimately send several — an agent runner sends
+/// one per toolset. `/v1/messages` and `/v1/responses` already merge
+/// (`messages::from_messages_request`,
+/// `consolidate_responses_instructions`); this does the same for the
+/// third surface, except for how text parts within one message join —
+/// `consolidate_responses_instructions` concatenates them with nothing
+/// between. Callers pass local targets only, so a provider still gets
+/// the array as written.
+pub(super) fn consolidate_chat_system_messages(req: &mut serde_json::Value) {
+    fn role(message: &serde_json::Value) -> &str {
+        message.get("role").and_then(|v| v.as_str()).unwrap_or("")
+    }
+    fn leads(message: &serde_json::Value) -> bool {
+        matches!(role(message), "system" | "developer")
+    }
+
+    let Some(messages) = req.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    // Already one leading system message: return it untouched rather
+    // than rebuild it, which would flatten block content to text.
+    let conforming = messages
+        .iter()
+        .enumerate()
+        .all(|(i, m)| !leads(m) || i == 0)
+        && messages.first().map(role) != Some("developer");
+    if conforming {
+        return;
+    }
+    let mut merged = MergedInstructions::default();
+    messages.retain(|message| {
+        if !leads(message) {
+            return true;
+        }
+        merged.push(message.get("content").unwrap_or(&serde_json::Value::Null));
+        false
+    });
+    let Some(content) = merged.finish() else {
+        return;
+    };
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": content }),
+    );
+}
+
+/// The merged instruction content, built in order. One entry per
+/// message, its own text parts joined by a newline; the entries join
+/// into one run separated by a blank line. A non-text block closes that
+/// run and is kept as itself, making the result a block array.
+#[derive(Default)]
+struct MergedInstructions {
+    blocks: Vec<serde_json::Value>,
+    text: Vec<String>,
+}
+
+impl MergedInstructions {
+    fn push(&mut self, content: &serde_json::Value) {
+        match content {
+            serde_json::Value::Array(parts) => {
+                // One entry for the whole message: `flush_text`'s blank
+                // line separates messages, so pushing each part on its
+                // own would spell both boundaries the same way. `\n`
+                // rather than `""` keeps the end of one part off the
+                // start of the next.
+                let mut run: Vec<&str> = Vec::new();
+                for part in parts {
+                    if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        // Dropped, not joined: an empty part would become
+                        // a stray newline, or a blank line between two
+                        // real ones.
+                        let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            run.push(text);
+                        }
+                    } else {
+                        // A non-text block ends the run it interrupts.
+                        self.push_run(&mut run);
+                        self.flush_text();
+                        self.blocks.push(part.clone());
+                    }
+                }
+                self.push_run(&mut run);
+            }
+            other => self.push_text(&content_text(other)),
+        }
+    }
+
+    /// Takes `run`'s text parts as one instruction.
+    fn push_run(&mut self, run: &mut Vec<&str>) {
+        if run.is_empty() {
+            return;
+        }
+        self.push_text(&std::mem::take(run).join("\n"));
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.text.push(text.to_string());
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            let text = std::mem::take(&mut self.text).join("\n\n");
+            self.blocks
+                .push(serde_json::json!({"type": "text", "text": text}));
+        }
+    }
+
+    /// A plain string when the instructions are text alone.
+    fn finish(mut self) -> Option<serde_json::Value> {
+        self.flush_text();
+        match self.blocks.len() {
+            0 => None,
+            1 if self.blocks[0].get("type").and_then(|v| v.as_str()) == Some("text") => {
+                self.blocks[0].get("text").cloned()
+            }
+            _ => Some(serde_json::Value::Array(self.blocks)),
+        }
     }
 }
 
@@ -266,6 +394,7 @@ async fn proxy_openai_generation_to(
             apply_default_repeat_penalty(&mut req);
             if llama_path == CHAT_COMPLETIONS_ROUTE {
                 apply_reasoning_effort(&mut req);
+                consolidate_chat_system_messages(&mut req);
             }
         }
     }

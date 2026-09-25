@@ -87,10 +87,16 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("cline") {
         ensure_cline_installed()?;
     }
-    // The local model's thinking controls (see `opencode_variants`),
-    // whether it takes images (see `write_dsh_settings`) and its trained
-    // context (see `codex_context_window`); a provider's model has none
-    // of these to read.
+    // Rejects the arguments after `--` that docker-agent cannot be
+    // launched with. Here rather than in the launcher so the refusal
+    // comes before the daemon starts and a model is pulled.
+    if name.eq_ignore_ascii_case("docker-agent") {
+        check_docker_agent_args(&args.extra_args)?;
+    }
+    // The model's thinking choices (see `opencode_variants`), from its
+    // template or the catalog; whether it takes images (see
+    // `write_dsh_settings`) and its trained context (see
+    // `codex_context_window`) only a local model has.
     let mut thinking = None;
     let mut vision = false;
     let mut context_length = None;
@@ -108,7 +114,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            resolve_provider_model(provider, args.model.as_deref(), name, per_request)?
+            let (model, api_key, levels) =
+                resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
+            thinking = levels.map(Thinking::Listed);
+            (model, api_key)
         }
         None => {
             // resolve_ollama_api, not resolve: every integration this
@@ -140,7 +149,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // the integration.
             if !model.is_empty() {
                 let info = crate::daemon::ensure_model_pulled(&model)?;
-                thinking = info.thinking_controls();
+                thinking = info.thinking_controls().map(Thinking::Template);
                 vision = info.vision();
                 context_length = info.context_length();
             }
@@ -152,7 +161,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     check_provider_supported(name)?;
                     let per_request =
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-                    let (remote, api_key) =
+                    // The local half, which serves by default, keeps
+                    // its thinking choices.
+                    let (remote, api_key, _) =
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
@@ -208,8 +219,23 @@ fn integration_key() -> String {
 /// Grok Build and Cline have hosted defaults of their own; without an
 /// explicit local model they would send those ids to llmman's endpoint
 /// instead.
+/// docker-agent's "auto" selection takes the first cloud provider with a
+/// credential, then a local Docker Model Runner model, so without an
+/// explicit model the request never reaches llmman at all.
+/// OMP needs a model so the launcher can select the matching entry its
+/// Ollama discovery reads from llmman's `/api/tags`.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok", "cline", "pi"];
+const MODEL_REQUIRED: &[&str] = &[
+    "qwen",
+    "dsh",
+    "agy",
+    "goose",
+    "grok",
+    "cline",
+    "pi",
+    "omp",
+    "docker-agent",
+];
 
 /// Integrations whose launcher yields to a `--model` after `--`, and so
 /// warrant the warning below. qwen: `qwen_args` drops its own `--model`
@@ -218,11 +244,17 @@ const MODEL_REQUIRED: &[&str] = &["qwen", "dsh", "agy", "goose", "grok", "cline"
 /// overriding. grok: its argument builder likewise drops the generated
 /// `--model`. Cline receives no generated arguments, so its own `--model`
 /// also wins over the provider selected in its settings.
+/// OMP's argument builder drops the generated Ollama model when the caller
+/// supplies one.
+/// Not docker-agent: its `--model` replaces the whole model entry
+/// `docker_agent_document` wrote, `base_url` included, so a forwarded one
+/// reaches api.openai.com. `check_docker_agent_args` refuses it rather
+/// than letting it "win".
 /// Not dsh: `dsh_args` does not yield, and dsh takes no
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
 /// rejects the unknown flag on its own.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline"];
+const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -305,6 +337,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
         "grok",
         "its model catalog cannot represent llmman's provider or hybrid routing reference",
     ),
+    // OMP discovers the Ollama catalog from /api/tags. That endpoint lists
+    // stored models, not the synthetic provider or hybrid routing refs the
+    // daemon accepts at request time, and OMP rejects a model absent from the
+    // catalog before it sends a request.
+    (
+        "omp",
+        "its Ollama catalog cannot represent llmman's provider or hybrid routing reference",
+    ),
 ];
 
 /// Integrations llmman configures through a file on disk. They take a
@@ -357,8 +397,9 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
 
 /// Validates `--provider`/`--model` against the running daemon's catalog
 /// (see [`crate::daemon::provider`]), returning the reference the daemon
-/// routes on (see [`crate::providers::REMOTE_PREFIX`]) and the key
-/// `integration` should authenticate with.
+/// routes on (see [`crate::providers::REMOTE_PREFIX`]), the key
+/// `integration` should authenticate with, and the model's catalog
+/// thinking levels (see [`Thinking::Listed`]).
 ///
 /// `key_travels_per_request` is false for the integrations in
 /// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
@@ -377,7 +418,7 @@ fn resolve_provider_model(
     model: Option<&str>,
     integration: &str,
     key_travels_per_request: bool,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, String, Option<Vec<String>>)> {
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
@@ -452,7 +493,11 @@ fn resolve_provider_model(
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
-    Ok((providers::format_remote_ref(provider, model), key))
+    Ok((
+        providers::format_remote_ref(provider, model),
+        key,
+        entry.thinking_levels(model),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +530,11 @@ const INTEGRATIONS: &[Integration] = &[
         name: "pi",
         description: "Pi coding agent",
         binary: "pi",
+    },
+    Integration {
+        name: "omp",
+        description: "OMP coding agent",
+        binary: "omp",
     },
     Integration {
         name: "cline",
@@ -545,6 +595,11 @@ const INTEGRATIONS: &[Integration] = &[
         name: "grok",
         description: "Grok Build",
         binary: "grok",
+    },
+    Integration {
+        name: "docker-agent",
+        description: "Docker Agent",
+        binary: "docker-agent",
     },
 ];
 
@@ -611,10 +666,12 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "opencode" => find_opencode(),
+        "omp" => find_omp(),
         "qwen" => find_qwen(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
         "grok" => find_grok(),
+        "docker-agent" => find_docker_agent(),
         _ => find_on_path(i.binary),
     }
 }
@@ -715,7 +772,7 @@ fn launch(
     name: &str,
     model: &str,
     api_key: &str,
-    thinking: Option<&ThinkingControls>,
+    thinking: Option<&Thinking>,
     vision: bool,
     context_length: Option<u64>,
     context_window: Option<u64>,
@@ -725,7 +782,20 @@ fn launch(
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, context_window, extra_args),
         "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
-        "pi" => launch_pi(model, thinking, vision, context_length, extra_args),
+        "pi" => launch_pi(
+            model,
+            thinking.and_then(Thinking::template),
+            vision,
+            context_length,
+            extra_args,
+        ),
+        "omp" => launch_omp(
+            model,
+            thinking.and_then(Thinking::template),
+            vision,
+            context_length,
+            extra_args,
+        ),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -738,6 +808,7 @@ fn launch(
         "dsh" => launch_dsh(model, api_key, vision, extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, extra_args),
+        "docker-agent" => launch_docker_agent(model, api_key, extra_args),
         other => anyhow::bail!(
             "unknown integration {:?}\nRun 'llmman launch' without arguments to list supported integrations.",
             other
@@ -777,7 +848,7 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 fn launch_opencode(
     model: &str,
     api_key: &str,
-    thinking: Option<&ThinkingControls>,
+    thinking: Option<&Thinking>,
     vision: bool,
     context_window: Option<u64>,
     extra_args: &[String],
@@ -797,24 +868,47 @@ fn launch_opencode(
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
-/// The choices offered when the model's template could not be read (a
-/// provider's model): thinking off, then the levels every wire accepts
+/// The thinking choices a model offers an integration, in cycle order.
+enum Thinking {
+    /// A local model's, read off its chat template.
+    Template(ThinkingControls),
+    /// A provider's model's, from the catalog (see
+    /// `crate::providers::Model::thinking`).
+    Listed(Vec<String>),
+}
+
+impl Thinking {
+    fn choices(&self) -> Vec<&str> {
+        match self {
+            Thinking::Template(controls) => controls.choices(),
+            Thinking::Listed(levels) => levels.iter().map(String::as_str).collect(),
+        }
+    }
+
+    fn template(&self) -> Option<&ThinkingControls> {
+        match self {
+            Thinking::Template(controls) => Some(controls),
+            Thinking::Listed(_) => None,
+        }
+    }
+}
+
+/// The choices offered when neither a template nor the catalog says:
+/// thinking off, then the levels every wire accepts
 /// (`anthropic::portable_efforts`).
 const PORTABLE_THINKING_LEVELS: &[&str] = &["none", "low", "medium", "high"];
 
 /// opencode's `variants` for the model, in cycle order (`variant_cycle`,
-/// ctrl+t by default): the template's own choices (see
-/// [`ThinkingControls::choices`]), or [`PORTABLE_THINKING_LEVELS`] without
-/// a template. A model that does not think gets none. Each variant is the
-/// request options `@ai-sdk/openai-compatible` sends: `reasoningEffort`
-/// as `reasoning_effort`, other keys verbatim. opencode derives variants
-/// only for models it knows from models.dev, so without these a local
-/// model has nothing to cycle.
-fn opencode_variants(
-    thinking: Option<&ThinkingControls>,
-) -> Vec<(&'static str, serde_json::Value)> {
+/// ctrl+t by default): [`Thinking::choices`], or
+/// [`PORTABLE_THINKING_LEVELS`] without them. A model that does not think
+/// gets none. Each variant is the request options
+/// `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
+/// `reasoning_effort`, other keys verbatim. opencode derives variants
+/// only for models it knows from models.dev, so without these a model
+/// has nothing to cycle.
+fn opencode_variants(thinking: Option<&Thinking>) -> Vec<(&str, serde_json::Value)> {
     let choices = match thinking {
-        Some(controls) => controls.choices(),
+        Some(thinking) => thinking.choices(),
         None => PORTABLE_THINKING_LEVELS.to_vec(),
     };
     choices
@@ -889,7 +983,7 @@ fn opencode_config(
     server: &str,
     model: &str,
     api_key: &str,
-    variants: &[(&'static str, serde_json::Value)],
+    variants: &[(&str, serde_json::Value)],
     vision: bool,
     context_window: Option<u64>,
 ) -> String {
@@ -937,7 +1031,7 @@ fn opencode_config(
     struct Model<'a> {
         name: &'a str,
         #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
-        variants: &'a [(&'static str, serde_json::Value)],
+        variants: &'a [(&'a str, serde_json::Value)],
         #[serde(skip_serializing_if = "Option::is_none")]
         modalities: Option<Modalities>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1023,8 +1117,214 @@ fn launch_pi(
     exec_with_env(&bin, extra_args, &[])
 }
 
+/// omp: register llmman's endpoint and the selected model in `models.yml`.
+///
+/// OMP's built-in Ollama discovery sees llmman's `/api/tags`, but model
+/// selection is resolved against its on-disk catalog before discovery has
+/// populated it. A fresh HOME therefore rejects `--model ollama/<model>`.
+/// Writing the provider and model explicitly, as Ollama's own launcher does,
+/// makes the first launch work while preserving unrelated user configuration.
+fn launch_omp(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
+    let server = daemon::server();
+    write_omp_config(model, thinking, vision, context_length, &server)?;
+    exec_with_env(
+        &bin,
+        &omp_args(model, extra_args),
+        &[("OLLAMA_BASE_URL", server.as_str())],
+    )
+}
+
+const OMP_PROVIDER: &str = "ollama";
+const OMP_SETUP_VERSION: u64 = 2;
+
+/// `PATH`, then Bun's and the standalone installer's usual user-local bins.
+fn find_omp() -> Option<PathBuf> {
+    find_on_path("omp").or_else(|| omp_fallback_paths().into_iter().find(|path| path.is_file()))
+}
+
+fn omp_fallback_paths() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let dirs = [
+        home.join(".bun").join("bin"),
+        home.join(".local").join("bin"),
+    ];
+    if cfg!(windows) {
+        return dirs
+            .into_iter()
+            .flat_map(|dir| {
+                WINDOWS_PATH_EXTS
+                    .iter()
+                    .map(move |ext| dir.join(format!("omp.{ext}")))
+            })
+            .collect();
+    }
+    dirs.into_iter().map(|dir| dir.join("omp")).collect()
+}
+
+/// OMP's agent directory. These are the paths OMP exposes for callers to
+/// configure; profile layout remains OMP's responsibility.
+fn omp_agent_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    let config = std::env::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .unwrap_or_else(|| ".omp".to_string());
+    let config = PathBuf::from(config.trim());
+    Ok(if config.is_absolute() {
+        config.join("agent")
+    } else {
+        home.join(config).join("agent")
+    })
+}
+
+fn write_omp_config(
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    let dir = omp_agent_dir()?;
+    write_omp_config_in_dir(&dir, model, thinking, vision, context_length, server)
+}
+
+fn write_omp_config_in_dir(
+    dir: &Path,
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    write_omp_models_config_at(
+        &dir.join("models.yml"),
+        model,
+        thinking,
+        vision,
+        context_length,
+        server,
+    )?;
+    write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
+}
+
+fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
+    let mut config = existing.clone();
+    if let Some(config) = config.as_object_mut() {
+        let setup_version = config
+            .get("setupVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            .max(OMP_SETUP_VERSION);
+        config.insert("setupVersion".into(), serde_json::json!(setup_version));
+    }
+    config
+}
+
+fn write_omp_models_config_at(
+    path: &Path,
+    model: &str,
+    thinking: Option<&ThinkingControls>,
+    vision: bool,
+    context_length: Option<u64>,
+    server: &str,
+) -> anyhow::Result<()> {
+    let entry = pi_model_entry(model, thinking, vision, context_length);
+    write_yaml_merged(path, "omp", |existing| {
+        omp_models_merged(existing, server, &entry)
+    })
+}
+
+/// Updates only llmman's `ollama` provider and the selected model. Other
+/// providers, provider-specific options, and previously registered models are
+/// retained; endpoint and protocol fields are owned by this launcher because
+/// stale values would route the launch somewhere other than llmman.
+fn omp_models_merged(
+    existing: &serde_json::Value,
+    server: &str,
+    entry: &serde_json::Value,
+) -> serde_json::Value {
+    provider_models_merged(existing, OMP_PROVIDER, entry, true, |provider| {
+        provider.insert(
+            "baseUrl".into(),
+            serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
+        );
+        provider.insert("api".into(), serde_json::json!("openai-responses"));
+        provider.remove("auth");
+        provider.insert(
+            "apiKey".into(),
+            serde_json::json!(providers::PLACEHOLDER_API_KEY),
+        );
+        provider.insert("authHeader".into(), serde_json::json!(true));
+        provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
+    })
+}
+
+fn write_yaml_merged(
+    path: &Path,
+    label: &str,
+    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> anyhow::Result<()> {
+    write_structured_merged(
+        path,
+        label,
+        ("YAML", "yml.bak"),
+        |text| Ok(yaml_serde::from_str(text)?),
+        |value| Ok(yaml_serde::to_string(value)?),
+        |raw, backup| {
+            if !backup.exists() {
+                return true;
+            }
+            yaml_serde::from_str::<serde_json::Value>(raw)
+                .and_then(|value| yaml_serde::to_string(&value))
+                .is_ok_and(|canonical| canonical != raw)
+        },
+        merge,
+    )
+}
+
+/// Select llmman's model through OMP's Ollama provider unless the caller
+/// explicitly supplied an OMP model after `--`. Avoiding a duplicate matters
+/// both for predictable precedence and for keeping OMP's argument parser out
+/// of version-specific repeated-option behavior.
+fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    if !has_flag(extra_args, "--model", Some("-m")) {
+        args.extend(["--model".to_string(), format!("ollama/{model}")]);
+    }
+    args.extend_from_slice(extra_args);
+    args
+}
+
 /// The provider key llmman owns in pi's `models.json`.
 const PI_PROVIDER: &str = "llmman";
+
+/// The explicit agent directory understood by both Pi and OMP.
+fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
+    let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = dir.trim();
+    if !dir.starts_with('~') {
+        return Ok(Some(PathBuf::from(dir)));
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    Ok(Some(expand_tilde(dir, &home)))
+}
 
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
 ///
@@ -1033,15 +1333,13 @@ const PI_PROVIDER: &str = "llmman";
 /// `cline_dir`'s own doc comment for what disagreeing there cost. The
 /// `~` handling is qwen's, for the quoted export that leaves one behind.
 fn pi_agent_dir() -> anyhow::Result<PathBuf> {
-    let home = || node_home_dir().context("no home directory");
-    match std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|d| !d.trim().is_empty())
-    {
-        Some(dir) if !dir.trim().starts_with('~') => Ok(PathBuf::from(dir.trim())),
-        Some(dir) => Ok(expand_tilde(dir.trim(), &home()?)),
-        None => Ok(home()?.join(".pi").join("agent")),
+    if let Some(dir) = configured_pi_agent_dir()? {
+        return Ok(dir);
     }
+    Ok(crate::config::home_dir()
+        .context("no home directory")?
+        .join(".pi")
+        .join("agent"))
 }
 
 /// Writes pi's `models.json` provider and points `settings.json` at it.
@@ -1062,8 +1360,9 @@ fn write_pi_config(
     })
 }
 
-/// The model pi is told about: what it can take in, whether it thinks,
-/// and how much it can hold. Every example in pi's own `models.md`
+/// The model entry Pi and OMP are told about: its display name, what it can
+/// take in, whether it thinks, and how much it can hold. Every example in
+/// Pi's own `models.md`
 /// declares these, and what it assumes for an entry that omits them is
 /// not written down, so they are stated rather than left to it.
 fn pi_model_entry(
@@ -1079,6 +1378,7 @@ fn pi_model_entry(
     };
     let mut entry = serde_json::json!({
         "id": model,
+        "name": model,
         "input": input,
     });
     if thinking.is_some_and(|t| t.thinks) {
@@ -1088,6 +1388,57 @@ fn pi_model_entry(
         entry["contextWindow"] = serde_json::json!(context);
     }
     entry
+}
+
+/// Merge one model into a named provider while retaining unrelated providers,
+/// provider options, and models. OMP also retains unowned fields on the
+/// matching model; Pi rebuilds its matching entry from daemon metadata.
+fn provider_models_merged(
+    existing: &serde_json::Value,
+    provider_name: &str,
+    entry: &serde_json::Value,
+    preserve_existing_model_fields: bool,
+    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> serde_json::Value {
+    let mut root = existing.clone();
+    let Some(root_map) = root.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let old_models = provider
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut replaced = false;
+    let mut models = Vec::with_capacity(old_models.len() + 1);
+    for old in old_models {
+        if old.get("id") != entry.get("id") {
+            models.push(old);
+            continue;
+        }
+        if replaced {
+            continue;
+        }
+        let mut merged = if preserve_existing_model_fields {
+            old
+        } else {
+            serde_json::json!({})
+        };
+        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
+            merged.extend(update.clone());
+        } else {
+            merged = entry.clone();
+        }
+        models.push(merged);
+        replaced = true;
+    }
+    if !replaced {
+        models.push(entry.clone());
+    }
+    configure(provider);
+    provider.insert("models".into(), serde_json::json!(models));
+    root
 }
 
 /// `existing` with llmman's provider updated around `entry`, keeping
@@ -1104,41 +1455,17 @@ fn pi_models_merged(
     server: &str,
     entry: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut root = existing.clone();
-    let kept: Vec<serde_json::Value> = root
-        .get("providers")
-        .and_then(|p| p.get(PI_PROVIDER))
-        .and_then(|p| p.get("models"))
-        .and_then(serde_json::Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|m| m.get("id") != entry.get("id"))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut models = kept;
-    models.push(entry.clone());
-
-    // Both levels go through object_under: a file may legitimately hold
-    // `"providers": []`, and indexing that with a key panics.
-    let root_map = match root.as_object_mut() {
-        Some(map) => map,
-        None => return serde_json::json!({}),
-    };
-    let provider = object_under(object_under(root_map, "providers"), PI_PROVIDER);
-    provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
-    provider
-        .entry("api")
-        .or_insert_with(|| serde_json::json!("openai-completions"));
-    // A literal, not a `"$VAR"` reference pi would interpolate: see
-    // launch_pi's own doc comment.
-    provider
-        .entry("apiKey")
-        .or_insert_with(|| serde_json::json!("llmman"));
-    provider.insert("models".into(), serde_json::json!(models));
-    root
+    provider_models_merged(existing, PI_PROVIDER, entry, false, |provider| {
+        provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
+        provider
+            .entry("api")
+            .or_insert_with(|| serde_json::json!("openai-completions"));
+        // A literal, not a `"$VAR"` reference pi would interpolate: see
+        // launch_pi's own doc comment.
+        provider
+            .entry("apiKey")
+            .or_insert_with(|| serde_json::json!("llmman"));
+    })
 }
 
 /// `existing` with pi's startup provider and model pointed at this launch,
@@ -1898,22 +2225,49 @@ fn write_json_merged(
     label: &str,
     merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> anyhow::Result<()> {
+    write_structured_merged(
+        path,
+        label,
+        ("JSON", "json.bak"),
+        |text| {
+            let text = text.trim_start_matches('\u{feff}').trim();
+            Ok(serde_json::from_str(&strip_json_comments(text))?)
+        },
+        |value| {
+            let mut out = serde_json::to_string_pretty(value)?;
+            out.push('\n');
+            Ok(out)
+        },
+        |raw, backup| !backup.exists() || strip_json_comments(raw) != raw,
+        merge,
+    )
+}
+
+/// Parse, merge, back up, and atomically rewrite a user-owned structured
+/// settings file. Format-specific parsing and rendering stay at the call site.
+fn write_structured_merged(
+    path: &Path,
+    label: &str,
+    format: (&str, &str),
+    parse: impl FnOnce(&str) -> anyhow::Result<serde_json::Value>,
+    serialize: impl FnOnce(&serde_json::Value) -> anyhow::Result<String>,
+    should_backup: impl FnOnce(&str, &Path) -> bool,
+    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+) -> anyhow::Result<()> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => Some(raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let existing = match raw
-        .as_deref()
-        .map(|r| r.trim_start_matches('\u{feff}').trim())
-    {
+    let existing = match raw.as_deref().map(str::trim) {
         None | Some("") => serde_json::json!({}),
-        Some(text) => match serde_json::from_str::<serde_json::Value>(&strip_json_comments(text)) {
+        Some(text) => match parse(text) {
             Ok(value) if value.is_object() => value,
             _ => {
                 eprintln!(
-                    "[llmman] {label}: {} is not a JSON object; leaving it alone",
-                    path.display()
+                    "[llmman] {label}: {} is not a {} object; leaving it alone",
+                    path.display(),
+                    format.0
                 );
                 return Ok(());
             }
@@ -1926,14 +2280,13 @@ fn write_json_merged(
     let dir = path.parent().context("settings path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     if let Some(raw) = &raw {
-        let bak = path.with_extension("json.bak");
-        if !bak.exists() || strip_json_comments(raw) != *raw {
-            std::fs::copy(path, &bak)
-                .with_context(|| format!("back up {} to {}", path.display(), bak.display()))?;
+        let backup = path.with_extension(format.1);
+        if should_backup(raw, &backup) {
+            std::fs::copy(path, &backup)
+                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
         }
     }
-    let mut out = serde_json::to_string_pretty(&merged)?;
-    out.push('\n');
+    let out = serialize(&merged)?;
     crate::fsutil::write_atomic(path, out.as_bytes())
         .with_context(|| format!("write {}", path.display()))
 }
@@ -2145,12 +2498,6 @@ fn cline_dir() -> anyhow::Result<PathBuf> {
 /// reads `$HOME` and `dirs` agrees.
 fn node_user_profile() -> Option<PathBuf> {
     cfg!(windows).then(|| env_dir("USERPROFILE")).flatten()
-}
-
-/// What node's `os.homedir()` answers, for the integrations that are
-/// node programs — see [`node_user_profile`].
-fn node_home_dir() -> Option<PathBuf> {
-    node_user_profile().or_else(dirs::home_dir)
 }
 
 fn resolve_cline_dir(
@@ -2644,6 +2991,237 @@ fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// docker-agent (Docker Agent)
+// ---------------------------------------------------------------------------
+
+/// The env var the generated `token_key` names, so no key reaches disk
+/// (same role as `QWEN_ENV_KEY` and `DSH_API_KEY_ENV`).
+const DOCKER_AGENT_API_KEY_ENV: &str = "LLMMAN_API_KEY";
+
+/// The generated model entry's name, which its `root` agent selects it by.
+const DOCKER_AGENT_MODEL_NAME: &str = "llmman";
+
+/// docker-agent: write an agent file whose single `openai`-provider model
+/// points at this daemon, then hand that file to `docker-agent run`.
+///
+/// An agent file, not docker-agent's own `~/.config/cagent/config.yaml`:
+/// a `models:` map there is ignored, and the entry cannot then be
+/// selected. Writing one llmman owns also leaves `~/.config/cagent`
+/// alone.
+fn launch_docker_agent(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    // `run` has already rejected these arguments before starting the
+    // daemon; repeated so a direct call to `launch` rejects them too.
+    check_docker_agent_args(extra_args)?;
+    let bin = find_docker_agent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "docker-agent is not installed\n\n\
+             llmman looks for it on PATH and in ~/.docker/cli-plugins, where Docker Desktop \
+             and `brew install docker-agent` put it.\n\
+             Releases: https://github.com/docker/docker-agent/releases"
+        )
+    })?;
+
+    let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
+    write_docker_agent_file(&path, model, &format!("{}/v1", daemon::server()))?;
+
+    let args = docker_agent_args(&path, extra_args);
+    exec_with_env(&bin, &args, &[(DOCKER_AGENT_API_KEY_ENV, api_key)])
+}
+
+/// Rejects the arguments after `--` that docker-agent cannot be launched
+/// with: its own `--model`, and a second agent file. Neither needs the
+/// daemon to decide, so `run` calls this before `ensure_server` and the
+/// refusal costs no daemon start and no model pull.
+fn check_docker_agent_args(extra_args: &[String]) -> anyhow::Result<()> {
+    // Refused, not warned about: `--model` replaces the generated entry
+    // including its `base_url`, so the request goes to api.openai.com —
+    // carrying the real key under `--provider`.
+    //
+    // No `-m`: `run` has no such shorthand (`-a`, `-s`, `-w`, `-d`,
+    // `-o`, `-h`), so matching it would refuse an unrelated argument.
+    //
+    // Only up to a forwarded `--`: Cobra takes everything after one as
+    // arguments, so a prompt there that reads like a flag is a message.
+    let flags = &extra_args[..extra_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(extra_args.len())];
+    if has_flag(flags, "--model", None) {
+        anyhow::bail!(
+            "docker-agent's --model would replace the endpoint llmman configured and send the \
+             request to api.openai.com; select the model with `llmman launch docker-agent \
+             --model <model>` instead"
+        );
+    }
+    if let Some(file) = docker_agent_config_argument(extra_args) {
+        anyhow::bail!(docker_agent_own_agent_file_error(file));
+    }
+    Ok(())
+}
+
+/// Split from `check_docker_agent_args` so a test can render a
+/// Windows-shaped path on any platform. `{file}`, never `{file:?}`:
+/// Debug doubles the `\` separators of a Windows path.
+fn docker_agent_own_agent_file_error(file: &str) -> String {
+    format!(
+        "llmman launch docker-agent passes its own agent file, so `{file}` would be read as a \
+         message rather than an agent.\n\
+         To run your own agent against this daemon, point its model at llmman and run \
+         docker-agent directly:\n  \
+         models:\n    {DOCKER_AGENT_MODEL_NAME}:\n      provider: openai\n      \
+         model: <model>\n      base_url: {}/v1\n      \
+         token_key: {DOCKER_AGENT_API_KEY_ENV}\n  \
+         agents:\n    root:\n      model: {DOCKER_AGENT_MODEL_NAME}",
+        daemon::server()
+    )
+}
+
+/// `~/.config/llmman/launch/docker-agent`, derived from `llmman.conf`'s
+/// directory so the two cannot drift (as `dsh_config_dir` does).
+/// docker-agent reads nothing here on its own; `docker_agent_args`
+/// passes it the path.
+fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
+    let conf = crate::config::user_path().context("no home directory")?;
+    let dir = conf.parent().context("llmman.conf has no directory")?;
+    Ok(dir.join("launch").join("docker-agent"))
+}
+
+/// The agent file a launch of `model` writes. One name for every model
+/// would let a concurrent launch overwrite it between this write and
+/// docker-agent's read, running that launch's model instead; naming it
+/// after the model leaves concurrent launches writing the same document
+/// and the directory holding one file per model rather than per run.
+fn docker_agent_agent_file(dir: &Path, model: &str) -> PathBuf {
+    dir.join(format!("agent-{}.yaml", docker_agent_file_stem(model)))
+}
+
+/// How much of the model a file name spells out. The rest of the name
+/// is `agent-`, the digest and `.yaml`, so the whole stays well inside
+/// the 255 a file name gets and leaves room under Windows' path limit.
+const DOCKER_AGENT_NAME_MAX: usize = 80;
+
+/// `model` as one bounded file name: everything a path separator or a
+/// Windows file name cannot carry — `/`, `:` — becomes `-`, the result
+/// is cut to [`DOCKER_AGENT_NAME_MAX`], and a digest of the whole id
+/// follows it.
+///
+/// The digest is what keeps one file per model. Without it two ids that
+/// sanitize alike (`a/b-c:d` and `a/b:c-d`) or that differ past the cut
+/// would share a file, and launched at the same moment each agent could
+/// read the other's model — the collision this name exists to prevent.
+/// A provider id is not a model reference and is never checked for
+/// length, so the cut is what keeps a long one from failing the write.
+fn docker_agent_file_stem(model: &str) -> String {
+    use sha2::Digest as _;
+    let safe: String = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(DOCKER_AGENT_NAME_MAX)
+        .collect();
+    let digest = hex::encode(sha2::Sha256::digest(model.as_bytes()));
+    format!("{safe}-{}", &digest[..8])
+}
+
+fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let contents = docker_agent_document(model, base_url);
+    crate::fsutil::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// The agent file docker-agent reads: a `models:` map, and an
+/// `agents.root` naming one entry. `provider: openai` picks the API
+/// client, not the destination — `base_url` is what aims it here.
+///
+/// `root` gets the `shell` and `filesystem` toolsets — the two
+/// docker-agent's own guidance calls the ones most agents need. It asks
+/// before each call unless the caller passes `--yolo`, so granting an
+/// agent's writes stays the caller's decision, as it is for goose.
+///
+/// docker-agent sends each toolset's instructions as its own `system`
+/// message, which strict chat templates refuse anywhere but first. The
+/// daemon merges them (`consolidate_chat_system_messages`), so the
+/// agent that reaches the model carries one leading system message
+/// whatever the template accepts.
+fn docker_agent_document(model: &str, base_url: &str) -> String {
+    let quoted_model = yaml_quote(model);
+    let quoted_base_url = yaml_quote(base_url);
+    format!(
+        "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
+         version: \"2\"\n\
+         models:\n  {DOCKER_AGENT_MODEL_NAME}:\n    provider: openai\n    model: {quoted_model}\n    \
+         base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n\
+         agents:\n  root:\n    model: {DOCKER_AGENT_MODEL_NAME}\n    \
+         description: The agent `llmman launch docker-agent` runs.\n    \
+         instruction: You are a helpful AI assistant with access to the shell and \
+         the filesystem.\n    \
+         toolsets:\n      - type: shell\n      - type: filesystem\n"
+    )
+}
+
+/// `run`, then the generated agent file, then the caller's arguments.
+/// The file goes first because `run` reads its first positional as the
+/// agent, so anything placed ahead of it would be taken for one.
+fn docker_agent_args(path: &Path, extra_args: &[String]) -> Vec<String> {
+    let mut args = vec!["run".to_string(), path.to_string_lossy().into_owned()];
+    args.extend_from_slice(extra_args);
+    args
+}
+
+/// The caller's own agent file, if the first argument names one.
+///
+/// Narrow on purpose: refusing a launch someone meant is worse than the
+/// confusion this prevents. It must be the first argument, not a flag,
+/// and a file that exists — so a message ending in `.yaml`, or a path
+/// that is some flag's value, is left alone. A file behind a boolean
+/// flag is missed, and reaches docker-agent as a message.
+fn docker_agent_config_argument(extra_args: &[String]) -> Option<&String> {
+    docker_agent_config_argument_with(extra_args, |path| Path::new(path).is_file())
+}
+
+/// Split from [`docker_agent_config_argument`] so which arguments count
+/// can be asserted without creating files.
+fn docker_agent_config_argument_with(
+    extra_args: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Option<&String> {
+    const EXTENSIONS: &[&str] = &[".yaml", ".yml", ".hcl"];
+    let first = extra_args.first()?;
+    if first.starts_with('-') {
+        return None;
+    }
+    let lowered = first.to_lowercase();
+    let named_like_one = EXTENSIONS.iter().any(|ext| lowered.ends_with(ext));
+    (named_like_one && exists(first)).then_some(first)
+}
+
+/// `PATH`, then `~/.docker/cli-plugins` — where Docker Desktop and
+/// `brew install docker-agent` put it. That is not a `PATH` entry, so
+/// without the fallback a working install reports itself missing.
+fn find_docker_agent() -> Option<PathBuf> {
+    find_on_path("docker-agent").or_else(|| docker_agent_fallback(&dirs::home_dir()?))
+}
+
+/// Split so the lookup can be asserted against a synthetic home.
+fn docker_agent_fallback(home: &Path) -> Option<PathBuf> {
+    let binary = if cfg!(windows) {
+        "docker-agent.exe"
+    } else {
+        "docker-agent"
+    };
+    let candidate = home.join(".docker").join("cli-plugins").join(binary);
+    candidate.is_file().then_some(candidate)
+}
+
+// ---------------------------------------------------------------------------
 // Process execution helper
 // ---------------------------------------------------------------------------
 
@@ -2817,6 +3395,226 @@ mod tests {
             assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
         }
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
+    }
+
+    #[test]
+    fn omp_is_listed_and_selects_the_model_through_ollama() {
+        let omp = INTEGRATIONS.iter().find(|i| i.name == "omp").unwrap();
+        assert_eq!(omp.binary, "omp");
+        assert!(MODEL_REQUIRED.contains(&"omp"));
+        assert!(MODEL_FLAG_FORWARDED.contains(&"omp"));
+
+        assert_eq!(
+            omp_args("docker.io/ai/qwen3.5:0.8b", &[]),
+            vec!["--model", "ollama/docker.io/ai/qwen3.5:0.8b"]
+        );
+
+        let existing = serde_json::json!({
+            "providers": {
+                "other": { "baseUrl": "https://example.com" },
+                "ollama": {
+                    "auth": "none",
+                    "headers": { "X-Custom": "kept" },
+                    "models": [
+                        {
+                            "id": "docker.io/ai/qwen3.5:0.8b",
+                            "name": "User name",
+                            "input": ["text", "image"],
+                            "maxTokens": 4096
+                        },
+                        { "id": "old", "name": "Old" }
+                    ]
+                }
+            }
+        });
+        let entry = serde_json::json!({
+            "id": "docker.io/ai/qwen3.5:0.8b",
+            "name": "docker.io/ai/qwen3.5:0.8b",
+            "input": ["text"]
+        });
+        let merged = omp_models_merged(&existing, "http://127.0.0.1:17434", &entry);
+        let provider = &merged["providers"]["ollama"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["api"], "openai-responses");
+        assert!(provider.get("auth").is_none());
+        assert_eq!(provider["apiKey"], providers::PLACEHOLDER_API_KEY);
+        assert_eq!(provider["authHeader"], true);
+        assert_eq!(provider["discovery"]["type"], "ollama");
+        assert_eq!(provider["headers"]["X-Custom"], "kept");
+        assert_eq!(provider["models"][0]["name"], entry["name"]);
+        assert_eq!(provider["models"][0]["input"], entry["input"]);
+        assert_eq!(provider["models"][0]["maxTokens"], 4096);
+        assert_eq!(provider["models"][1]["id"], "old");
+        assert_eq!(
+            merged["providers"]["other"]["baseUrl"],
+            "https://example.com"
+        );
+
+        let config = omp_config_merged(&serde_json::json!({
+            "setupVersion": OMP_SETUP_VERSION + 3,
+            "theme": "dark"
+        }));
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION + 3);
+        assert_eq!(config["theme"], "dark");
+    }
+
+    #[test]
+    fn omp_model_argument_after_separator_wins_without_a_duplicate() {
+        let strings = |values: &[&str]| values.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        for forwarded in [
+            strings(&["--model", "openrouter/anthropic/claude-sonnet-4"]),
+            strings(&["-m", "ollama/other"]),
+            strings(&["--model=ollama/other"]),
+            strings(&["-m=ollama/other"]),
+        ] {
+            assert_eq!(omp_args("local", &forwarded), forwarded);
+        }
+
+        assert_eq!(
+            omp_args("local", &strings(&["-p", "ping"])),
+            strings(&["--model", "ollama/local", "-p", "ping"])
+        );
+    }
+
+    #[test]
+    fn omp_fallback_paths_cover_bun_and_local_bin() {
+        let paths = omp_fallback_paths();
+        let binary = if cfg!(windows) { "omp.exe" } else { "omp" };
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".bun").join("bin").join(binary))));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(Path::new(".local").join("bin").join(binary))));
+    }
+
+    #[test]
+    fn omp_config_is_created_for_a_fresh_home_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-omp-models-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_path = dir.join("models.yml");
+        let thinks = ThinkingControls {
+            thinks: true,
+            enable_thinking: true,
+            efforts: vec!["low", "high"],
+        };
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            Some(&thinks),
+            true,
+            Some(32_768),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(&models_path).unwrap()).unwrap();
+        let provider = &parsed["providers"]["ollama"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
+        assert_eq!(provider["models"][0]["id"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["name"], "docker.io/ai/qwen3.5:0.8b");
+        assert_eq!(provider["models"][0]["reasoning"], true);
+        assert_eq!(
+            provider["models"][0]["input"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(provider["models"][0]["contextWindow"], 32_768);
+        let config: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(dir.join("config.yml")).unwrap())
+                .unwrap();
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omp_models_yml_backs_up_the_exact_commented_file_before_rewriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-omp-models-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models.yml");
+        let config_path = dir.join("config.yml");
+        let original = r#"# my own notes, do not delete
+providers:
+  openai:
+    apiKey: sk-mine
+defaults:
+  temperature: 0.2   # tuned by hand
+"#;
+        std::fs::write(&path, original).unwrap();
+        let config_original = "# keep this too\ntheme: dark\n";
+        std::fs::write(&config_path, config_original).unwrap();
+
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            None,
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            Some(4096),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            original
+        );
+        let mut hand_edited = std::fs::read_to_string(&path).unwrap();
+        hand_edited.push_str("# added after the first launch\n");
+        std::fs::write(&path, &hand_edited).unwrap();
+        write_omp_config_in_dir(
+            &dir,
+            "docker.io/ai/qwen3.5:0.8b",
+            None,
+            false,
+            Some(8192),
+            "http://127.0.0.1:17434",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("yml.bak")).unwrap(),
+            hand_edited
+        );
+        let parsed: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["openai"]["apiKey"], "sk-mine");
+        assert_eq!(parsed["defaults"]["temperature"], 0.2);
+        assert_eq!(
+            parsed["providers"]["ollama"]["models"][0]["id"],
+            "docker.io/ai/qwen3.5:0.8b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path.with_extension("yml.bak")).unwrap(),
+            config_original
+        );
+        let config: serde_json::Value =
+            yaml_serde::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["setupVersion"], OMP_SETUP_VERSION);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The only configuration goose gets: a wrong or missing one sends
@@ -3544,10 +4342,14 @@ mod tests {
 
     /// pi is node, so its home half is the one node reads — the same
     /// `cline_dir` resolves, and the reason #535 stopped using
-    /// `dirs::home_dir` alone.
+    /// `dirs::home_dir` alone. `config::home_dir` reads `%USERPROFILE%`
+    /// first for that same reason, so one helper answers both.
     #[test]
     fn pi_agent_dir_reads_the_home_node_reads() {
-        assert_eq!(node_home_dir(), node_user_profile().or_else(dirs::home_dir));
+        assert_eq!(
+            crate::config::home_dir(),
+            node_user_profile().or_else(dirs::home_dir)
+        );
         if cfg!(windows) {
             assert_eq!(node_user_profile(), env_dir("USERPROFILE"));
         } else {
@@ -3564,6 +4366,7 @@ mod tests {
         };
         let entry = pi_model_entry("qwen3.5:0.8b", Some(&thinks), true, Some(32768));
         assert_eq!(entry["id"], "qwen3.5:0.8b");
+        assert_eq!(entry["name"], "qwen3.5:0.8b");
         assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
         assert_eq!(entry["reasoning"], true);
         assert_eq!(entry["contextWindow"], 32768);
@@ -3890,7 +4693,7 @@ model = \"gpt-5\"
             efforts: vec![],
         };
         assert_eq!(
-            opencode_variants(Some(&gemma4)),
+            opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
             [
                 ("none", serde_json::json!({ "reasoningEffort": "none" })),
                 (
@@ -3900,21 +4703,45 @@ model = \"gpt-5\"
             ]
         );
         let qwen3_8 = ThinkingControls {
-            efforts: vec!["low", "xhigh"],
+            efforts: vec!["low", "medium", "xhigh"],
             ..gemma4
         };
         assert_eq!(
-            opencode_variants(Some(&qwen3_8)),
+            opencode_variants(Some(&Thinking::Template(qwen3_8))),
             [
                 ("none", serde_json::json!({ "reasoningEffort": "none" })),
                 ("low", serde_json::json!({ "reasoningEffort": "low" })),
+                ("medium", serde_json::json!({ "reasoningEffort": "medium" })),
                 ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
             ]
         );
-        assert!(opencode_variants(Some(&ThinkingControls::default())).is_empty());
+        let plain = Thinking::Template(ThinkingControls::default());
+        assert!(opencode_variants(Some(&plain)).is_empty());
         let fallback = opencode_variants(None);
         assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
         assert_eq!(fallback[0].0, "none");
+    }
+
+    /// A provider's model cycles exactly the catalog's levels, with no
+    /// added `none`; an empty list means no variants, not the portable set.
+    #[test]
+    fn opencode_variants_follow_the_catalogs_levels() {
+        let claude = Thinking::Listed(
+            ["low", "medium", "high", "xhigh", "max"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let variants = opencode_variants(Some(&claude));
+        assert_eq!(
+            variants.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            variants[4].1,
+            serde_json::json!({ "reasoningEffort": "max" })
+        );
+        assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
+        assert!(claude.template().is_none());
     }
 
     #[test]
@@ -4389,5 +5216,339 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(cleaned.contains("# a comment"));
         assert!(cleaned.contains("channels:"));
         assert!(cleaned.contains("  telegram: {}"));
+    }
+
+    // -----------------------------------------------------------------
+    // docker-agent
+    // -----------------------------------------------------------------
+
+    /// Needs a model, but carries its key in the environment, so it is on
+    /// neither `PROVIDER_UNSUPPORTED` nor `PROVIDER_NEEDS_DAEMON_KEY` —
+    /// and not on `MODEL_FLAG_FORWARDED` either, since a forwarded
+    /// `--model` is refused rather than obeyed.
+    #[test]
+    fn docker_agent_is_a_real_model_required_integration_provider_can_drive() {
+        let entry = INTEGRATIONS
+            .iter()
+            .find(|i| i.name == "docker-agent")
+            .expect("docker-agent is not an integration");
+        assert_eq!(entry.binary, "docker-agent");
+        assert!(MODEL_REQUIRED.contains(&"docker-agent"));
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"docker-agent"));
+        assert!(check_provider_supported("docker-agent").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"docker-agent"));
+    }
+
+    /// `print_integrations` pads each name into a 12-wide column and
+    /// prints a space after it, so every description starts at the same
+    /// place — including "docker-agent", which fills the column exactly.
+    /// A longer name would push its own description right instead.
+    #[test]
+    fn every_integration_name_fits_the_listings_column() {
+        let longest = INTEGRATIONS.iter().map(|i| i.name.len()).max().unwrap();
+        assert!(
+            longest <= 12,
+            "{longest}-character name overflows the `{{:<12}}` column in print_integrations"
+        );
+    }
+
+    /// llmman's file must lead, being `run`'s first positional —
+    /// `run "say pong"` is parsed as an OCI reference and fails. The
+    /// caller's arguments follow unchanged.
+    #[test]
+    fn docker_agent_args_lead_with_run_and_the_generated_agent_file() {
+        let path = Path::new("/tmp/llmman/agent.yaml");
+        let extra = ["--exec".to_string(), "say pong".to_string()];
+        assert_eq!(
+            docker_agent_args(path, &extra),
+            vec![
+                "run".to_string(),
+                "/tmp/llmman/agent.yaml".to_string(),
+                "--exec".to_string(),
+                "say pong".to_string(),
+            ]
+        );
+        assert_eq!(
+            docker_agent_args(path, &[]),
+            vec!["run".to_string(), "/tmp/llmman/agent.yaml".to_string()]
+        );
+    }
+
+    /// `base_url` is what makes an `openai`-provider model reach this
+    /// daemon instead of api.openai.com.
+    #[test]
+    fn docker_agent_document_routes_an_openai_provider_model_at_the_daemon() {
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        assert!(document.contains("provider: openai"), "{document}");
+        assert!(document.contains("model: \"m\""), "{document}");
+        assert!(
+            document.contains("base_url: \"http://127.0.0.1:17434/v1\""),
+            "{document}"
+        );
+        // The agent selects the entry by the name the model map gives it.
+        assert!(
+            document.contains(&format!("  {DOCKER_AGENT_MODEL_NAME}:")),
+            "{document}"
+        );
+        assert!(
+            document.contains(&format!("model: {DOCKER_AGENT_MODEL_NAME}\n")),
+            "{document}"
+        );
+    }
+
+    /// The key is named, never written, so a `--provider` launch does
+    /// not persist a real credential — as `write_qwen_settings_at` and
+    /// `write_dsh_settings` also promise.
+    #[test]
+    fn docker_agent_document_names_the_key_variable_rather_than_a_key() {
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        assert!(
+            document.contains(&format!("token_key: {DOCKER_AGENT_API_KEY_ENV}")),
+            "{document}"
+        );
+        assert!(!document.contains("api_key"), "{document}");
+        assert!(!document.contains("sk-"), "{document}");
+    }
+
+    /// A launched agent that can only chat is not much of an agent. The
+    /// extra `system` message each toolset adds is handled by the daemon
+    /// (`consolidate_chat_system_messages`), not by leaving them out.
+    #[test]
+    fn docker_agent_document_gives_the_agent_shell_and_filesystem() {
+        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        assert!(document.contains("instruction:"), "{document}");
+        assert!(document.contains("toolsets:"), "{document}");
+        assert!(document.contains("- type: shell"), "{document}");
+        assert!(document.contains("- type: filesystem"), "{document}");
+    }
+
+    /// Unquoted, `docker.io/ai/qwen3.5:0.8b` parses as a mapping at the
+    /// colon rather than as the model's name.
+    #[test]
+    fn docker_agent_document_quotes_the_values_it_interpolates() {
+        let document = docker_agent_document("docker.io/ai/qwen3.5:0.8b", "http://h:1/v1");
+        assert!(
+            document.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
+            "{document}"
+        );
+        assert!(
+            document.contains("base_url: \"http://h:1/v1\""),
+            "{document}"
+        );
+    }
+
+    /// llmman supplies the agent file, so a second one would be read as a
+    /// *message* — silently, with the caller's agent never running.
+    #[test]
+    fn docker_agent_spots_a_caller_supplied_agent_file() {
+        for file in ["team.yaml", "./agent.yml", "/tmp/AGENT.YAML", "infra.hcl"] {
+            let extra = [file.to_string(), "do the thing".to_string()];
+            assert_eq!(
+                docker_agent_config_argument_with(&extra, |_| true).map(String::as_str),
+                Some(file),
+                "{file} was not recognized as an agent file"
+            );
+        }
+    }
+
+    /// Arguments that must not be taken for an agent file, because
+    /// refusing any of them would block a launch the caller meant. The
+    /// first implementation scanned every argument for the extension and
+    /// so rejected `--exec "summarize the config.yaml"`, a message.
+    #[test]
+    fn docker_agent_does_not_mistake_a_message_or_a_flag_value_for_an_agent_file() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "a message that ends in .yaml",
+                &["--exec", "summarize the config.yaml"],
+            ),
+            ("a flag's value", &["--prompt-file", "notes.yaml"]),
+            ("a leading flag", &["--exec", "--yolo", "say pong"]),
+            ("a question about a file", &["what does agent.yaml do?"]),
+        ];
+        for (why, args) in cases {
+            let extra: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            // `|_| true`: even if every path existed, none of these is the
+            // first positional, so none may be refused.
+            assert_eq!(
+                docker_agent_config_argument_with(&extra, |_| true),
+                None,
+                "refused {why}: {args:?}"
+            );
+        }
+        // The remaining guard: a first argument that names a config file
+        // but does not exist is prose too.
+        let absent = ["explain agent.yaml".to_string()];
+        assert_eq!(docker_agent_config_argument_with(&absent, |_| false), None);
+    }
+
+    /// One name for every model would let a concurrent launch overwrite
+    /// the file before docker-agent reads it, so models that differ get
+    /// files that differ — including ones that sanitize or cut alike.
+    /// Whatever the id carries, the name stays one component of `dir`:
+    /// a model is not a path.
+    #[test]
+    fn docker_agent_names_its_agent_file_after_the_model() {
+        let dir = Path::new("/tmp/llmman/launch/docker-agent");
+        let file = |model: &str| docker_agent_agent_file(dir, model);
+        let name = |model: &str| {
+            file(model)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            name("docker.io/ai/qwen3.5:0.8b").starts_with("agent-docker.io-ai-qwen3.5-0.8b-"),
+            "{}",
+            name("docker.io/ai/qwen3.5:0.8b")
+        );
+        for (one, other) in [
+            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/qwen3.5:9b"),
+            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/gemma4:12b"),
+            ("qwen/qwen3-coder", "qwen/qwen3-max"),
+            // Sanitize alike: `/` and `:` both become `-`.
+            ("a/b-c:d", "a/b:c-d"),
+            // Differ only past the cut.
+            (
+                &format!("{}one", "m".repeat(DOCKER_AGENT_NAME_MAX)),
+                &format!("{}two", "m".repeat(DOCKER_AGENT_NAME_MAX)),
+            ),
+        ] {
+            assert_ne!(file(one), file(other), "{one} and {other} share a file");
+        }
+        // A provider id is never length-checked, so the name is bounded
+        // here or the write fails.
+        assert!(name(&"x".repeat(4096)).len() <= 255, "name is unbounded");
+        for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b", "..", "."] {
+            let file = docker_agent_agent_file(dir, model);
+            assert_eq!(file.parent(), Some(dir), "{model} escaped its directory");
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(
+                name.starts_with("agent-") && name.ends_with(".yaml"),
+                "{name}"
+            );
+            assert!(
+                !name.contains(std::path::MAIN_SEPARATOR) && name != ".." && name != ".",
+                "{model} produced {name}"
+            );
+        }
+    }
+
+    /// The plugin directory is not on `PATH`, so without the fallback a
+    /// working install reports itself missing.
+    #[test]
+    fn docker_agent_fallback_finds_the_cli_plugin_directory() {
+        let home = std::env::temp_dir().join(format!(
+            "llmman-docker-agent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plugins = home.join(".docker").join("cli-plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        assert_eq!(docker_agent_fallback(&home), None);
+        let binary = plugins.join(if cfg!(windows) {
+            "docker-agent.exe"
+        } else {
+            "docker-agent"
+        });
+        std::fs::create_dir(&binary).unwrap();
+        assert_eq!(
+            docker_agent_fallback(&home),
+            None,
+            "a directory is not a binary"
+        );
+        std::fs::remove_dir(&binary).unwrap();
+        std::fs::write(&binary, "").unwrap();
+        assert_eq!(docker_agent_fallback(&home), Some(binary));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Cobra stops parsing flags at a `--`, so a prompt after one that
+    /// reads like a flag is a message — and refusing it would refuse a
+    /// launch that works.
+    #[test]
+    fn docker_agent_reads_a_model_flag_after_the_terminator_as_a_message() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_docker_agent_args(&args(&["--exec", "--", "--model=foo"])).is_ok());
+        assert!(check_docker_agent_args(&args(&["--exec", "--", "--model", "foo"])).is_ok());
+        // The flag itself is still refused where docker-agent parses it.
+        assert!(check_docker_agent_args(&args(&["--exec", "--model=foo"])).is_err());
+        assert!(check_docker_agent_args(&args(&["--model", "foo", "--", "hi"])).is_err());
+    }
+
+    /// A forwarded `--model` replaces the generated entry's `base_url`
+    /// too, sending the request — and, under `--provider`, a real key —
+    /// to api.openai.com.
+    #[test]
+    fn docker_agent_refuses_a_forwarded_model_flag() {
+        for spelling in ["--model", "--model=openai/gpt-5"] {
+            let extra = [spelling.to_string(), "openai/gpt-5".to_string()];
+            let error = launch_docker_agent("m", "k", &extra)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("api.openai.com"), "{spelling}: {error}");
+        }
+    }
+
+    /// `run`'s single-letter flags are `-a`, `-s`, `-w`, `-d`, `-o`,
+    /// `-h` — no `-m`. Guards the `Some("-m")` this once passed to
+    /// `has_flag`, which refused unrelated arguments.
+    ///
+    /// Asserted through `has_flag`, not `launch_docker_agent`: with
+    /// nothing to refuse that call reaches `exec_with_env`, whose
+    /// `process::exit` took the test harness down once already.
+    #[test]
+    fn docker_agent_leaves_an_unrelated_short_flag_to_docker_agent() {
+        for spelling in ["-m", "-m=openai/gpt-5"] {
+            let extra = [spelling.to_string(), "openai/gpt-5".to_string()];
+            assert!(
+                !has_flag(&extra, "--model", None),
+                "{spelling} was read as --model"
+            );
+        }
+        // The flag it really does have, still caught.
+        assert!(has_flag(&["--model".to_string()], "--model", None));
+    }
+
+    /// The refusal prints a working model entry, so a caller with their
+    /// own agent file is told how to point it here.
+    #[test]
+    fn docker_agent_refuses_a_caller_supplied_agent_file_with_the_way_forward() {
+        // A real file, because the guard requires one — and because
+        // without the refusal this call would reach `exec_with_env`,
+        // which never returns.
+        let path = std::env::temp_dir().join(format!(
+            "llmman-docker-agent-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "agents: {}\n").unwrap();
+        let named = path.to_string_lossy().into_owned();
+        let error = launch_docker_agent("m", "k", std::slice::from_ref(&named))
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(error.contains(&named), "{error}");
+        assert!(error.contains("provider: openai"), "{error}");
+        assert!(error.contains(DOCKER_AGENT_API_KEY_ENV), "{error}");
+    }
+
+    /// `{file:?}` echoed `C:\Users\...` back as `C:\\Users\\...`, twice
+    /// the backslashes the caller typed. Only the Windows CI legs had
+    /// separators to double, so only they caught it.
+    #[test]
+    fn docker_agent_agent_file_error_does_not_escape_a_windows_path() {
+        let windows = r"C:\Users\me\AppData\Local\Temp\team.yaml";
+        let error = docker_agent_own_agent_file_error(windows);
+        assert!(error.contains(windows), "{error}");
+        assert!(!error.contains(r"\\"), "separators were doubled: {error}");
     }
 }
