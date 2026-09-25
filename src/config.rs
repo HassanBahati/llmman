@@ -7,7 +7,7 @@
 //!
 //! The same paths on every platform, with no llmman-specific variable
 //! to move them: one documented answer to "where does this go". (`~` is
-//! `$HOME` as usual.)
+//! `$HOME`, or `%USERPROFILE%` on Windows.)
 //!
 //! ```toml
 //! [aliases]                            # crate::shortnames
@@ -352,9 +352,47 @@ fn system_dir() -> PathBuf {
 }
 
 /// `~/.config/llmman`, on every platform. No llmman-specific override;
-/// `~` is `$HOME` as usual.
+/// `~` is the home directory below.
 fn user_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config").join("llmman"))
+    home_dir().map(|h| h.join(".config").join("llmman"))
+}
+
+/// The home directory `~` names, here and for the integrations
+/// `cmd::launch` configures. The environment comes first because
+/// `dirs::home_dir` reads the Windows known-folder API, which ignores
+/// the home a session set for every other program in it — node's
+/// `os.homedir()` included, which is what Cline and pi resolve through.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    env_home().or_else(dirs::home_dir)
+}
+
+/// The variables that name the home directory. `%USERPROFILE%` is what
+/// a Windows session sets and what node's `os.homedir()` reads; `HOME`
+/// is not consulted there, because a POSIX shell exports it in a form
+/// Windows reads as drive-relative.
+const HOME_KEYS: &[&str] = if cfg!(windows) {
+    &["USERPROFILE"]
+} else {
+    &["HOME"]
+};
+
+/// The first of [`HOME_KEYS`] that names an absolute path. A relative
+/// or empty one would anchor the config on the current drive rather
+/// than at a home directory.
+fn env_home() -> Option<PathBuf> {
+    env_home_from(HOME_KEYS, |key| std::env::var_os(key))
+}
+
+/// Split from [`env_home`] so the rule can be asserted without changing
+/// the process environment.
+fn env_home_from(
+    keys: &[&str],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    keys.iter()
+        .filter_map(|key| lookup(key))
+        .map(PathBuf::from)
+        .find(|value| value.is_absolute())
 }
 
 /// Where a user's own config belongs, for a message that has to name
@@ -844,6 +882,38 @@ mod tests {
 
     fn conf(text: &str) -> Conf {
         parse(text).expect("valid conf")
+    }
+
+    /// `$HOME` is what `dirs::home_dir` reads on Unix anyway, so this
+    /// pins the Windows half: `%USERPROFILE%`, which it ignores.
+    #[test]
+    fn a_home_comes_from_the_environment_when_it_is_absolute() {
+        let expected: &[&str] = if cfg!(windows) {
+            &["USERPROFILE"]
+        } else {
+            &["HOME"]
+        };
+        assert_eq!(HOME_KEYS, expected);
+
+        let take = |value: &str| {
+            let value = value.to_string();
+            env_home_from(HOME_KEYS, move |_| {
+                Some(std::ffi::OsString::from(value.clone()))
+            })
+        };
+        let home = if cfg!(windows) {
+            "C:\\Users\\u"
+        } else {
+            "/home/u"
+        };
+        assert_eq!(take(home), Some(PathBuf::from(home)));
+        assert_eq!(take(""), None);
+        assert_eq!(take("relative/home"), None);
+        // What a POSIX shell exports to a Windows binary: rooted, but
+        // not absolute, so it would follow the current drive.
+        #[cfg(windows)]
+        assert_eq!(take("/c/Users/u"), None);
+        assert_eq!(env_home_from(HOME_KEYS, |_| None), None);
     }
 
     /// A key must not reach a log through the derived `Debug` of the

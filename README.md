@@ -284,8 +284,8 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, Pi, Cline, Aider, Qwen Code, Gemini CLI,
-Grok Build,
-AGY, DeepSeek Harness, ...) and whether each is installed. Installing an
+Grok Build, AGY, DeepSeek Harness, Docker Agent, ...) and whether each is
+installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed
@@ -298,6 +298,17 @@ support. llmman writes Gemini mode to its own stable settings directory at
 
 Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
 and `globalState.json`, honouring `CLINE_DIR` like Cline does.
+
+Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
+Desktop and `brew install docker-agent` put it. llmman generates its own
+agent file under `~/.config/llmman/launch/docker-agent/` and passes it to
+`docker-agent run`; `~/.config/cagent` stays untouched. With more than one
+Docker Agent installed, the one on `PATH` wins.
+
+The generated agent gets the `shell` and `filesystem` toolsets. Docker
+Agent asks before each tool call unless you pass `--yolo`. To run an
+agent of your own instead, point its model at the daemon and run
+`docker-agent` directly.
 
 ### Hosted providers
 

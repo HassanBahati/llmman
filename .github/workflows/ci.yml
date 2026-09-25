@@ -55,6 +55,12 @@ env:
   # integration contract under test. The macOS GitHub runner kills 3.0.62;
   # that failure is runner-specific, not a general macOS release failure.
   CLINE_CLI_VERSION: "2.18.0"
+  # Docker Agent release used by launch_e2e's real `launch docker-agent`
+  # test. Pinned because the agent-file contract launch_docker_agent
+  # writes is what that test verifies; bump deliberately and rerun the
+  # launch suite. Not the v1.50.0 Docker Desktop ships: that build answers
+  # this test with a 600s timeout.
+  DOCKER_AGENT_VERSION: "1.142.0"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -654,8 +660,8 @@ jobs:
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
-  # <claude|agy|opencode|pi|codex|cline|grok|qwen|hermes|openclaw|dsh|goose>
-  # --model
+  # <claude|agy|opencode|pi|codex|cline|grok|qwen|hermes|openclaw|dsh|
+  # goose|docker-agent> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
@@ -695,34 +701,34 @@ jobs:
     # that reason, and its own identical `if:` condition below — or when
     # dispatched by hand on a branch (see `workflow_dispatch` above).
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    # 12 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 12's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 13 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 13's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 12*30 + 10 = 370 min. Exhausting
+    # tests (guarded by WARM's own Once). 13*30 + 10 = 400 min. Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
     #
-    # +90 (460) for the vllm-plugin steps' own per-step budgets below: up
+    # +90 (490) for the vllm-plugin steps' own per-step budgets below: up
     # to 60 min for "Install vLLM (e2e)" (wheel downloads, but a
     # slow/retried one on a bad connection) plus up to 30 min for
     # "pytest -m e2e (vllm-plugin)".
     #
-    # +10 (470) for `serve_mlx_safetensors_model`'s own single TIMEOUT
+    # +10 (500) for `serve_mlx_safetensors_model`'s own single TIMEOUT
     # budget (10 min, same 600s as warm_model's) — it doesn't go through
     # launch_and_assert's retry loop at all (a real failure there is
     # always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 11 launch tests above
+    # small-model sampling variance), so unlike the 13 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
     #
     # +60 more for `serve_vllm_safetensors_model` and
     # `serve_sglang_safetensors_model` (20 min each, no retries, like the
     # mlx test) and "Install SGLang (e2e)"'s 40-minute budget.
     #
-    # 530 in total, but 360 is GitHub's own hard limit for a hosted-runner
+    # 560 in total, but 360 is GitHub's own hard limit for a hosted-runner
     # job and kills a run past it regardless, so the number here stays at
     # 400 rather than chasing a budget neither it nor GitHub can grant.
     timeout-minutes: 400
@@ -1066,6 +1072,71 @@ jobs:
             fi
           done
           echo "::error::grok never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
+          exit 1
+
+      # One static binary per platform, covering every E2E target. Onto
+      # PATH rather than ~/.docker/cli-plugins, which run_launch's fresh
+      # HOME puts out of reach. No login needed: the generated agent file
+      # carries the endpoint, and the key arrives in LLMMAN_API_KEY.
+      - name: Install Docker Agent (e2e)
+        shell: bash
+        run: |
+          set -o pipefail
+          # A digest per asset, checked before the binary is made
+          # executable: HTTPS authenticates the host, not the bytes, and a
+          # release asset can be replaced under the same tag. Recompute
+          # these when DOCKER_AGENT_VERSION moves (`curl -sL <url> | shasum
+          # -a 256`), as the AGY step below does for its archives.
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)     asset=docker-agent-linux-amd64;       digest=3337bb2c6cd83f23e44a2f9a76f8ceaf05c242db50c2b9b783a2d6eb014d2c20 ;;
+            Linux-ARM64)   asset=docker-agent-linux-arm64;       digest=bf3ba6a4def17427cae3ed283ee3d0eef90290300fbec4ea2ecda4ea452462d8 ;;
+            macOS-X64)     asset=docker-agent-darwin-amd64;      digest=f9102143f5d96d951263d8bf9614603b328a2f51b3e824dcb56013b766f331a4 ;;
+            macOS-ARM64)   asset=docker-agent-darwin-arm64;      digest=33a3d04855f22fc65bb1d1ed02da59d5b32d761d501debbf11b92d26cb740a15 ;;
+            Windows-X64)   asset=docker-agent-windows-amd64.exe; digest=d522a46babc8ea5d1704c66b35b6a32a5ba119807c1d4a4ef88c7862d9b9a6f5 ;;
+            Windows-ARM64) asset=docker-agent-windows-arm64.exe; digest=2862312b878518fc11a2b8b7cf8c9dc5d74d7c51b22ed1cf72387cbdce966977 ;;
+            *) echo "::warning::no Docker Agent build for ${{ runner.os }}-${{ runner.arch }}; launch_docker_agent_with_model will skip"; exit 0 ;;
+          esac
+          bin_dir="$HOME/.docker-agent/bin"
+          bin="$bin_dir/docker-agent"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          mkdir -p "$bin_dir"
+
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            next="retrying"
+            [ "$attempt" -eq "$max_attempts" ] && next="giving up"
+            # `--speed-time`/`--speed-limit` rather than a flat
+            # `--max-time`: a stalled transfer has to end for the retry
+            # below to mean anything, but a slow one that is still making
+            # progress should be allowed to finish.
+            if ! curl -fsSL --connect-timeout 20 --speed-time 60 --speed-limit 1000 -o "$bin" \
+              "https://github.com/docker/docker-agent/releases/download/v$DOCKER_AGENT_VERSION/$asset"; then
+              echo "::warning::docker-agent download failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next"
+            elif ! (cd "$bin_dir" && if command -v sha256sum >/dev/null 2>&1; then
+                      echo "$digest  $(basename "$bin")" | sha256sum -c -
+                    else
+                      echo "$digest  $(basename "$bin")" | shasum -a 256 -c -
+                    fi); then
+              echo "::error::docker-agent $asset did not match its pinned SHA-256"
+              exit 1
+            else
+              chmod +x "$bin"
+              # `version`, not `--version`: docker-agent rejects the flag.
+              if version_output=$("$bin" version 2>&1); then
+                if command -v cygpath >/dev/null 2>&1; then
+                  cygpath -w "$bin_dir" >> "$GITHUB_PATH"
+                else
+                  echo "$bin_dir" >> "$GITHUB_PATH"
+                fi
+                exit 0
+              fi
+              echo "::warning::docker-agent installed but \"docker-agent version\" failed on ${{ runner.os }} ${{ runner.arch }} (attempt $attempt/$max_attempts); $next — output: $version_output"
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep "$((2 ** (attempt - 1)))"
+            fi
+          done
+          echo "::error::docker-agent never produced a working binary on ${{ runner.os }} ${{ runner.arch }} after $max_attempts attempts"
           exit 1
 
       # Pinned official AGY release; verify each runner's archive before installing.
