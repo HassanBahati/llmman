@@ -2865,6 +2865,10 @@ struct ProviderModelResponse {
     /// See [`crate::providers::Model::thinking`]; absent is not empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Vec<String>>,
+    /// See [`crate::providers::Model::max_context`]; absent where the
+    /// catalog names no window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -2896,6 +2900,7 @@ impl ProviderResponse {
                         output: c.output,
                     }),
                     thinking: m.thinking.clone(),
+                    context: m.max_context,
                 })
                 .collect(),
         }
@@ -2936,10 +2941,13 @@ async fn handle_llmman_provider(
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
+            // A provider defined in llmman.conf: its models come from
+            // the endpoint's own /v1/models, which names no window.
             .map(|id| ProviderModelResponse {
                 id,
                 cost: None,
                 thinking: None,
+                context: None,
             })
             .collect();
     }

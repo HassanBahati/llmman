@@ -114,7 +114,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            let (model, api_key, levels) =
+            let (model, api_key, levels, _hosted_window) =
                 resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
             thinking = levels.map(Thinking::Listed);
             (model, api_key)
@@ -163,21 +163,19 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
                     // The local half, which serves by default, keeps
                     // its thinking choices.
-                    let (remote, api_key, _) =
+                    let (remote, api_key, _, hosted_window) =
                         resolve_provider_model(provider, Some(hosted), name, per_request)?;
+                    context_window = pair_context_window(
+                        local_context_window(&model, context_length),
+                        hosted_window,
+                    );
                     (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
                 }
                 None => {
-                    // The only launch whose window llmman can state: the
-                    // daemon serves this model itself, whole. A pair's
-                    // local half is the side overflow routes *away* from,
-                    // so declaring its window would make the agent compact
-                    // to stay local; a `--provider` model is served
-                    // elsewhere entirely.
-                    context_window = served_context_window(
-                        super::serve::context_length_from_env(),
-                        context_length,
-                    );
+                    // A `--provider` model is served by someone else, so
+                    // this is the only arm whose window is the local one
+                    // alone.
+                    context_window = local_context_window(&model, context_length);
                     (model, integration_key())
                 }
             }
@@ -401,6 +399,11 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
 /// `integration` should authenticate with, and the model's catalog
 /// thinking levels (see [`Thinking::Listed`]).
 ///
+/// What [`resolve_provider_model`] resolves: the hosted model's full
+/// reference, the key it authenticates with, the thinking levels the
+/// catalog lists for it, and the window it can hold.
+type ResolvedProvider = (String, String, Option<Vec<String>>, Option<u64>);
+
 /// `key_travels_per_request` is false for the integrations in
 /// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
 /// cannot carry a real key — so this shell having one is beside the
@@ -418,7 +421,7 @@ fn resolve_provider_model(
     model: Option<&str>,
     integration: &str,
     key_travels_per_request: bool,
-) -> anyhow::Result<(String, String, Option<Vec<String>>)> {
+) -> anyhow::Result<ResolvedProvider> {
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
@@ -497,6 +500,7 @@ fn resolve_provider_model(
         providers::format_remote_ref(provider, model),
         key,
         entry.thinking_levels(model),
+        entry.context_window(model),
     ))
 }
 
@@ -781,7 +785,7 @@ fn launch(
     match name.to_lowercase().as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(model, api_key, thinking, vision, context_window, extra_args),
-        "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
+        "codex" => launch_codex(model, api_key, vision, context_window, extra_args),
         "pi" => launch_pi(
             model,
             thinking.and_then(Thinking::template),
@@ -1483,11 +1487,11 @@ fn launch_codex(
     model: &str,
     api_key: &str,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config(model, vision, context_length)?;
+    write_codex_config(model, vision, context_window)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -1529,7 +1533,7 @@ fn launch_codex(
 fn write_codex_config(
     model: &str,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let config_dir = home.join(".codex");
@@ -1545,8 +1549,7 @@ fn write_codex_config(
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        let context_window =
-            codex_context_window(super::serve::context_length_from_env(), context_length);
+        let context_window = codex_context_window(context_window);
         write_codex_file(
             &catalog_path,
             &codex_model_catalog(model, vision, context_window),
@@ -1574,11 +1577,12 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// a trained context; ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-/// What codex compacts against: [`served_context_window`], else
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`] — codex's catalog cannot omit the
-/// field, so it guesses rather than stay quiet (see `launch`).
-fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
-    served_context_window(env, trained).unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+/// What codex compacts against: the window `launch` resolved — live from
+/// the loaded runner, and a hybrid pair's larger half — else
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`]. codex's catalog cannot omit the
+/// field, so it guesses where every other integration stays quiet.
+fn codex_context_window(window: Option<u64>) -> u64 {
+    window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
 /// The window the daemon serves, mirroring `initial_ctx_size`:
@@ -1593,6 +1597,33 @@ fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
 ///
 /// `None` when the window is unknown: every caller but codex passes that
 /// through as "say nothing", leaving the integration its own default.
+/// The window the daemon serves for `model`, read back from the loaded
+/// runner rather than predicted: an OOM retry halves `--ctx-size` during
+/// the load, and a reused daemon keeps whatever it was started with.
+/// [`served_context_window`] is the fallback for a backend that reports
+/// none of its own, vLLM and MLX among them.
+fn local_context_window(model: &str, trained: Option<u64>) -> Option<u64> {
+    crate::daemon::loaded_context_length(model)
+        .or_else(|| served_context_window(super::serve::context_length_from_env(), trained))
+}
+
+/// A hybrid pair's window: whichever half holds more.
+///
+/// Requests above the local budget are routed to the hosted half, so the
+/// pair can hold the larger of the two whichever way round they are —
+/// declaring only the local window makes the agent compact before a
+/// request is ever big enough to route, and declaring only the hosted
+/// one understates a local half that is larger.
+///
+/// `hosted` is `None` for a provider defined in `llmman.conf`, which has
+/// no catalog entry; the local window then stands on its own.
+fn pair_context_window(local: Option<u64>, hosted: Option<u64>) -> Option<u64> {
+    match (local, hosted) {
+        (Some(local), Some(hosted)) => Some(local.max(hosted)),
+        (window, None) | (None, window) => window,
+    }
+}
+
 fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
     match env {
         Some(0) => trained,
@@ -4817,32 +4848,41 @@ model = \"gpt-5\"
         );
     }
 
+    /// codex takes the window `launch` resolved, like every other
+    /// integration; it differs only in having to name one when there is
+    /// none. What that window is made of — live, env, trained, a pair's
+    /// larger half — is `served_context_window`'s and
+    /// `pair_context_window`'s own business, tested there.
     #[test]
-    fn codex_context_window_is_what_the_daemon_serves() {
-        let cases = [
-            // A positive LLMMAN_CONTEXT_LENGTH is the served --ctx-size.
-            (Some(16384), Some(32768), 16384),
-            (Some(65536), Some(32768), 65536),
-            (Some(16384), None, 16384),
-            // Unset or 0: the trained context.
-            (None, Some(32768), 32768),
-            (Some(0), Some(32768), 32768),
-            // ...but only as far as a load actually starts at.
-            (
-                None,
-                Some(1 << 20),
-                u64::from(super::super::serve::DEFAULT_CTX_SIZE),
-            ),
-            (Some(0), None, CODEX_FALLBACK_CONTEXT_WINDOW),
-            (None, None, CODEX_FALLBACK_CONTEXT_WINDOW),
-        ];
-        for (env, trained, want) in cases {
-            assert_eq!(
-                codex_context_window(env, trained),
-                want,
-                "env={env:?} trained={trained:?}"
-            );
-        }
+    fn codex_context_window_falls_back_only_when_there_is_no_window() {
+        assert_eq!(codex_context_window(Some(16384)), 16384);
+        assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
+        assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
+    }
+
+    /// Requests above the local budget route to the hosted half, so the
+    /// pair holds the larger window whichever way round the two are.
+    /// Declaring the local one alone has the agent compact before a
+    /// request is ever big enough to route — the bug this fixes.
+    #[test]
+    fn pair_context_window_takes_whichever_half_holds_more() {
+        // The usual pairing: a small local model overflowing to a large
+        // hosted one.
+        assert_eq!(
+            pair_context_window(Some(262_144), Some(1 << 20)),
+            Some(1 << 20)
+        );
+        // Reversed — paired for quality, not capacity. The hosted window
+        // must not shrink what the local half can already hold.
+        assert_eq!(
+            pair_context_window(Some(1 << 20), Some(200_000)),
+            Some(1 << 20)
+        );
+        // A provider from llmman.conf names no window, so the local one
+        // stands alone rather than being discarded.
+        assert_eq!(pair_context_window(Some(262_144), None), Some(262_144));
+        assert_eq!(pair_context_window(None, Some(200_000)), Some(200_000));
+        assert_eq!(pair_context_window(None, None), None);
     }
 
     /// The same precedence, minus codex's guess: the launchers that may
