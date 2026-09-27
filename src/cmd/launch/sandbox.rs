@@ -720,10 +720,14 @@ fn plan(
         }
     }
     // Git runs hooks and config settings (`core.fsmonitor`) from here on
-    // the host. A mount point also can't be renamed away.
-    let git = active.workspace.join(".git");
-    if git.exists() {
-        mounts.push(mount(&git, &git, true)?);
+    // the host. A mount point also can't be renamed away. A linked worktree
+    // has a `.git` file instead of a directory; its gitdir and commondir are
+    // outside the workspace and must be mounted too for read-only Git access.
+    for git_path in git_metadata_paths(&active.workspace)? {
+        let next = mount(&git_path, &git_path, true)?;
+        if !mounts.iter().any(|m| m.guest == next.guest) {
+            mounts.push(next);
+        }
     }
     let mut env = guest_env(home, env, |name| std::env::var(name).ok())?;
     if active.sandbox == Sandbox::Microsandbox {
@@ -747,6 +751,67 @@ fn mount_path(path: &Path) -> anyhow::Result<String> {
         "--sandbox cannot mount {text}: it contains ':' or ','"
     );
     Ok(text.to_string())
+}
+
+/// Paths Git needs to read repository metadata in `workspace`. Normal
+/// repositories have a `.git` directory. Linked worktrees and submodules
+/// instead have a `.git` file pointing at a gitdir; linked worktrees also
+/// have a `commondir` file pointing at the shared object database and refs.
+fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let dot_git = workspace.join(".git");
+    if !dot_git.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = vec![dot_git.clone()];
+    if !dot_git.is_file() {
+        return Ok(paths);
+    }
+
+    let contents = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("read Git worktree pointer {}", dot_git.display()))?;
+    let Some(target) = contents.trim().strip_prefix("gitdir: ") else {
+        return Ok(paths);
+    };
+    let target = Path::new(target);
+    let git_dir = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        workspace.join(target)
+    };
+    anyhow::ensure!(
+        git_dir.is_dir(),
+        "Git metadata directory {} referenced by {} does not exist",
+        git_dir.display(),
+        dot_git.display()
+    );
+    let git_dir = git_dir
+        .canonicalize()
+        .with_context(|| format!("resolve Git metadata directory {}", git_dir.display()))?;
+    paths.push(git_dir.clone());
+
+    let common_file = git_dir.join("commondir");
+    if common_file.is_file() {
+        let common = std::fs::read_to_string(&common_file)
+            .with_context(|| format!("read Git common directory {}", common_file.display()))?;
+        let common = Path::new(common.trim());
+        let common = if common.is_absolute() {
+            common.to_path_buf()
+        } else {
+            git_dir.join(common)
+        };
+        anyhow::ensure!(
+            common.is_dir(),
+            "Git common directory {} referenced by {} does not exist",
+            common.display(),
+            common_file.display()
+        );
+        paths.push(
+            common
+                .canonicalize()
+                .with_context(|| format!("resolve Git common directory {}", common.display()))?,
+        );
+    }
+    Ok(paths)
 }
 
 fn guest_env(
@@ -1207,6 +1272,106 @@ mod tests {
         // A home directory under Git falls back to the current one.
         std::fs::create_dir_all(home.join(".git")).unwrap();
         assert_eq!(workspace(&plain, &home).unwrap(), plain);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn container_plan_mounts_linked_worktree_git_metadata_read_only() {
+        let root = temp_dir("linked-worktree");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git should be installed for this test");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=llmman test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+                "--quiet",
+            ],
+        );
+        git(
+            &repo,
+            &["worktree", "add", "-b", "linked", "../worktree", "--quiet"],
+        );
+
+        let git_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ));
+        let common_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+
+        // Windows drive letters are rejected by the existing `mount_path` contract
+        // before a container plan can be built. Still check real Git worktree
+        // pointers there; assert the resulting read-only mounts on Unix.
+        let metadata_paths = git_metadata_paths(&worktree).unwrap();
+        assert_eq!(metadata_paths[0], worktree.join(".git"));
+        for metadata in [git_dir, common_dir] {
+            let metadata = metadata.canonicalize().unwrap();
+            assert!(
+                metadata_paths.contains(&metadata),
+                "missing Git metadata path {}: {metadata_paths:?}",
+                metadata.display()
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            let home = dirs::home_dir().unwrap();
+            let workspace = workspace(&worktree, &home).unwrap();
+            let active = Active {
+                sandbox: Sandbox::Docker,
+                integration: format!("worktree-test-{}", std::process::id()),
+                server: "http://127.0.0.1:17434".into(),
+                workspace,
+                home,
+                image: Some("test/image".into()),
+                state: vec![],
+            };
+            let plan = plan(&active, Path::new("codex"), &[], &[]).unwrap();
+            for metadata in metadata_paths {
+                let host = metadata
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let guest = metadata.to_string_lossy().into_owned();
+                assert!(
+                    plan.mounts.iter().any(|mount| {
+                        mount.host == host && mount.guest == guest && mount.read_only
+                    }),
+                    "missing read-only git metadata mount for {}: {:?}",
+                    metadata.display(),
+                    plan.mounts
+                        .iter()
+                        .map(|m| (&m.host, &m.guest, m.read_only))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
