@@ -1531,10 +1531,37 @@ async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() 
     );
 }
 
+/// vLLM and MLX expose no `/props`, so there is no live `n_ctx` to
+/// report: `/api/ps` falls back to the window this daemon gave the
+/// load.
+#[tokio::test]
+async fn ps_reports_the_configured_window_when_the_backend_exposes_none() {
+    let state = test_state();
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    // Port 0 answers nothing, standing in for a backend with no /props.
+    loaded.port = 0;
+    loaded.context_window = Some(32_768);
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert("m:latest".into(), loaded);
+
+    let resp = handle_ps(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ps: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ps["models"][0]["context_length"], 32_768);
+}
+
 /// A crashed runner keeps its entry until the next `check_running`
 /// reaps it, but not its window: routing on a dead process's figure
-/// would send every large request away and leave nothing to notice the
-/// process had died.
+/// sends every large request away, so nothing ever notices it died.
 #[tokio::test]
 async fn a_dead_local_half_is_budgeted_as_if_it_were_not_loaded() {
     let state = test_state_with_budget(262_144 * 4);
@@ -1556,6 +1583,15 @@ async fn a_dead_local_half_is_budgeted_as_if_it_were_not_loaded() {
             .unwrap(),
         "gemma4",
         "the daemon-wide budget stands, so ensure_model still reloads it"
+    );
+    // And it is that budget, not no budget: past it, the pair still
+    // routes away.
+    let past_the_daemons_own = headers_with(&[("content-length", "2000000")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&past_the_daemons_own))
+            .await
+            .unwrap(),
+        HOSTED
     );
 }
 

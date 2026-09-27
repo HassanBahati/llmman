@@ -87,9 +87,9 @@ async fn local_budget(state: &AppState, local: &str) -> Option<u64> {
     }
     let key = running_key(state, local);
     // A crashed runner stays in `running` until the next `check_running`
-    // reaps it, and its window went with the process: budget as if it
-    // were unloaded, so a large request still routes local, reloads it
-    // and clears the entry rather than being sent away indefinitely.
+    // reaps it. Budget as if unloaded, so a large request still routes
+    // local and reloads it, rather than being sent away by a window the
+    // process took with it.
     let loaded = state
         .0
         .manager

@@ -132,8 +132,8 @@ pub(super) async fn handle_ps(
         // The live figure first; failing that, the window this daemon
         // gave the load. vLLM and MLX expose no `/props`, and a caller
         // reading this back (see `local_context_window` in cmd::launch)
-        // would otherwise predict one from its own environment, which
-        // is not the daemon's when the daemon is someone else's.
+        // would otherwise predict one from its own environment, not
+        // the daemon's.
         let context_length = query_context_length(&state.0.client, entry.port)
             .await
             .or_else(|| entry.context_window.map(u64::from));
