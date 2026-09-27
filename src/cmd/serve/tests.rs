@@ -1437,6 +1437,54 @@ async fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
 
+/// `LLMMAN_CONTEXT_LENGTH=0` means the model's trained context, not
+/// "no window": recording `None` for it would leave a hybrid pair with
+/// no budget at all and the size rule silently off.
+#[test]
+fn a_zero_context_length_records_the_trained_context_it_stands_for() {
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), Some(32_768), None, true),
+        Some(32_768)
+    );
+    // --ctx-size 0 cannot be scaled up, so llama-server splits the
+    // trained context across the slots and a request gets one slot's.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), Some(32_768), Some(4), true),
+        Some(8_192)
+    );
+    // Nothing to stand in for: a GGUF whose header names no context.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(0), None, None, true),
+        None
+    );
+}
+
+/// Each engine reports the window it was handed, and `None` where it
+/// was left to choose.
+#[test]
+fn a_loads_window_is_the_one_its_own_engine_was_given() {
+    // The ordinary case: the clamped, possibly shrunk --ctx-size.
+    assert_eq!(
+        loaded_context_window(Engine::LlamaServer, Some(32_768), Some(32_768), None, false),
+        Some(32_768)
+    );
+    // vLLM only gets --max-model-len for an explicit length; left to
+    // its own, the daemon does not know what it chose.
+    assert_eq!(
+        loaded_context_window(Engine::Vllm, Some(8_192), None, None, true),
+        Some(8_192)
+    );
+    assert_eq!(
+        loaded_context_window(Engine::Vllm, Some(8_192), None, None, false),
+        None
+    );
+    // MLX takes no window at all.
+    assert_eq!(
+        loaded_context_window(Engine::Mlx, Some(8_192), Some(8_192), None, true),
+        None
+    );
+}
+
 /// The loaded window, not the daemon-wide default, is what a pair is
 /// routed against: a half loaded with 32k tokens holds 128 KiB, so a
 /// 200 KB body leaves the machine even though the daemon started with
@@ -1469,6 +1517,14 @@ async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() 
     let fits = headers_with(&[("content-length", "131072")]);
     assert_eq!(
         resolve_hybrid_side(&state, &pair(PAIR), Some(&fits))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
+    // A chunked request declares no size, so there is nothing to
+    // compare a budget against and none is resolved.
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[])))
             .await
             .unwrap(),
         "gemma4"

@@ -1435,6 +1435,10 @@ pub struct ProviderModel {
     /// `llmman.conf`, which has no catalog entry.
     #[serde(default)]
     pub context: Option<u64>,
+    /// The most this model will emit in one reply (models.dev
+    /// `limit.output`), `None` on the same terms as `context`.
+    #[serde(default)]
+    pub output: Option<u32>,
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
@@ -1487,6 +1491,18 @@ impl ProviderDetail {
             .iter()
             .find(|m| m.id == model)
             .and_then(|m| m.context)
+    }
+
+    /// The catalog's output ceiling for `model` (models.dev
+    /// `limit.output`), on the same terms as [`Self::context_window`].
+    /// What the provider will actually accept as a max-output request,
+    /// which is not derivable from the window: a 128k-context model may
+    /// still refuse to be asked for more than 8k of reply.
+    pub fn max_output(&self, model: &str) -> Option<u32> {
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.output)
     }
 
     /// Where a key for this provider would go (see

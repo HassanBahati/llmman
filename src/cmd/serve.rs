@@ -344,11 +344,11 @@ struct RunningModel {
     /// `Some(sglang_served_model_name(..))` for `Engine::Sglang` (`:` is
     /// its LoRA separator), `None` otherwise.
     backend_model_path: Option<String>,
-    /// The per-request context window this load ended up with: the
-    /// `--ctx-size` after any clamp to the model's trained context and
-    /// any OOM shrink, or a vLLM/SGLang `--max-model-len`. `None` when
-    /// the backend was left to pick its own (`Engine::Mlx`, a vLLM with
-    /// no explicit length, `LLMMAN_CONTEXT_LENGTH=0`).
+    /// The per-request context window this load ended up with — see
+    /// [`loaded_context_window`], which resolves it per engine. `None`
+    /// only where the backend was left to pick its own (`Engine::Mlx`,
+    /// a vLLM with no explicit length, a GGUF whose header names no
+    /// trained context).
     ///
     /// Read by `hybrid::local_budget`, which would otherwise budget a
     /// pair against the daemon-wide default — many times this window
@@ -2223,17 +2223,14 @@ async fn resolve_target(
         Engine::Sglang => Some(sglang_served_model_name(model_ref)),
         Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
     };
-    // See RunningModel::context_window — whichever window this engine
-    // was actually given, `ctx_size` carrying any shrink the retry loop
-    // above applied.
-    let context_window = match process.engine() {
-        Engine::LlamaServer => ctx_size,
-        Engine::Vllm | Engine::VllmOmni | Engine::Sglang => {
-            vllm_max_model_len(ctx_size, state.0.ctx_size_explicit)
-        }
-        Engine::Mlx => None,
-    }
-    .filter(|n| *n > 0);
+    // `ctx_size` carries any shrink the retry loop above applied.
+    let context_window = loaded_context_window(
+        process.engine(),
+        ctx_size,
+        trained_ctx,
+        num_parallel,
+        state.0.ctx_size_explicit,
+    );
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
@@ -2263,6 +2260,35 @@ async fn resolve_target(
         Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
+}
+
+/// The per-request context window a finished load ended up serving, for
+/// [`RunningModel::context_window`]: whichever window this engine was
+/// actually given, `None` where it was left to pick its own.
+///
+/// `ctx_size` is the value the load settled on, after any clamp to
+/// `trained_ctx` and any OOM shrink. A zero is not "no window": it is
+/// `LLMMAN_CONTEXT_LENGTH=0` asking llama.cpp for the model's trained
+/// context, which `backend_ctx_size` cannot scale up, so llama-server
+/// splits that one across the `--parallel` slots.
+fn loaded_context_window(
+    engine: Engine,
+    ctx_size: Option<u32>,
+    trained_ctx: Option<u32>,
+    num_parallel: Option<u32>,
+    ctx_size_explicit: bool,
+) -> Option<u32> {
+    match engine {
+        Engine::LlamaServer if ctx_size == Some(0) => {
+            trained_ctx.map(|trained| trained / num_parallel.unwrap_or(1))
+        }
+        Engine::LlamaServer => ctx_size,
+        Engine::Vllm | Engine::VllmOmni | Engine::Sglang => {
+            vllm_max_model_len(ctx_size, ctx_size_explicit)
+        }
+        Engine::Mlx => None,
+    }
+    .filter(|n| *n > 0)
 }
 
 /// The `"model"` value to actually put in the JSON request body sent to
@@ -2936,6 +2962,10 @@ struct ProviderModelResponse {
     /// catalog names no window.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<u64>,
+    /// See [`crate::providers::Model::max_output`]; absent where the
+    /// catalog names no ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<u32>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -2977,6 +3007,7 @@ impl ProviderResponse {
                     }),
                     thinking: m.thinking.clone(),
                     context: m.max_context,
+                    output: m.max_output,
                 })
                 .collect(),
         }
@@ -3018,12 +3049,14 @@ async fn handle_llmman_provider(
             .await
             .into_iter()
             // A provider defined in llmman.conf: its models come from
-            // the endpoint's own /v1/models, which names no window.
+            // the endpoint's own /v1/models, which names no window and
+            // no output ceiling.
             .map(|id| ProviderModelResponse {
                 id,
                 cost: None,
                 thinking: None,
                 context: None,
+                output: None,
             })
             .collect();
     }

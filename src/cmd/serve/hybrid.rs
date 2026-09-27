@@ -37,12 +37,12 @@ pub(super) async fn resolve_hybrid_side(
         .and_then(|h| h.get(reqwest::header::CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    // Only when the size rule can decide: a pin makes `route` ignore
-    // the budget, and resolving one reads the store and takes the
-    // manager lock.
-    let budget = match pin {
-        Some(_) => None,
-        None => local_budget(state, pair.local).await,
+    // Only when the size rule can decide: `route` ignores the budget
+    // for a pinned request and for one that declared no length, and
+    // resolving one reads the store and takes the manager lock.
+    let budget = match (pin, request_bytes) {
+        (None, Some(_)) => local_budget(state, pair.local).await,
+        _ => None,
     };
     let decision = crate::hybrid::route(pin, request_bytes, budget);
 
