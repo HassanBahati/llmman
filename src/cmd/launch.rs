@@ -101,8 +101,10 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let mut vision = false;
     let mut context_length = None;
     // The window the daemon serves, for the integrations that declare
-    // one — set only in the arm below that has an answer. See `launch`.
-    let mut context_window = None;
+    // one: the local model's, the hosted model's, or a pair's larger
+    // half, set by whichever arm below resolves the model. `None` when
+    // no side of it is known. See `launch`.
+    let context_window: Option<u64>;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -114,9 +116,12 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            let (model, api_key, levels, _hosted_window) =
+            let (model, api_key, levels, hosted_window) =
                 resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
             thinking = levels.map(Thinking::Listed);
+            // Nothing local is loaded here, so the catalog's window is
+            // the only one, and the one the provider enforces.
+            context_window = hosted_window;
             (model, api_key)
         }
         None => {
@@ -761,10 +766,12 @@ fn accepts_install(answer: &str) -> bool {
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
 ///
-/// The two context arguments are not one. `context_window` is what the
-/// daemon serves, resolved by [`served_context_window`] and `None`
-/// unless this is a plain local model; an integration that declares a
-/// window is told this.
+/// The two context arguments are not one. `context_window` is the
+/// window a request may fill: a local model's loaded one (see
+/// [`local_context_window`]), a `--provider` model's catalog one, or a
+/// pair's larger half (see [`pair_context_window`]); `None` when none
+/// of them is known. An integration that declares a window is told
+/// this.
 ///
 /// `context_length` is the raw trained context. codex resolves its own
 /// window from it unconditionally, falling back to
