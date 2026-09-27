@@ -78,22 +78,27 @@ pub(super) async fn resolve_hybrid_side(
 ///    stated rather than one llmman derived.
 /// 2. The loaded half's own window.
 /// 3. `hybrid_local_bytes`, the daemon-wide figure, while the half is
-///    unloaded or reports no window (`Engine::Mlx`, a vLLM left to its
-///    own length). Falling back, not disabling the rule: an unknown
-///    window is not a boundless one.
+///    unloaded, dead, or reports no window (`Engine::Mlx`, a vLLM left
+///    to its own length). Falling back, not disabling the rule: an
+///    unknown window is not a boundless one.
 async fn local_budget(state: &AppState, local: &str) -> Option<u64> {
     if state.0.hybrid_local_bytes_explicit {
         return state.0.hybrid_local_bytes;
     }
     let key = running_key(state, local);
+    // A crashed runner stays in `running` until the next `check_running`
+    // reaps it, and its window went with the process: budget as if it
+    // were unloaded, so a large request still routes local, reloads it
+    // and clears the entry rather than being sent away indefinitely.
     let loaded = state
         .0
         .manager
         .lock()
         .await
         .running
-        .get(&key)
-        .and_then(|m| m.context_window);
+        .get_mut(&key)
+        .and_then(|m| m.process.is_alive().then_some(m.context_window))
+        .flatten();
     loaded
         .and_then(crate::hybrid::budget_bytes_for_ctx)
         .or(state.0.hybrid_local_bytes)

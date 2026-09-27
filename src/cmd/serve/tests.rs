@@ -1531,6 +1531,34 @@ async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() 
     );
 }
 
+/// A crashed runner keeps its entry until the next `check_running`
+/// reaps it, but not its window: routing on a dead process's figure
+/// would send every large request away and leave nothing to notice the
+/// process had died.
+#[tokio::test]
+async fn a_dead_local_half_is_budgeted_as_if_it_were_not_loaded() {
+    let state = test_state_with_budget(262_144 * 4);
+    let big = headers_with(&[("content-length", "200000")]);
+
+    let mut dead = running_model_fixture(None, Duration::ZERO, 0);
+    dead.context_window = Some(32_768);
+    match &mut dead.process {
+        ModelProcess::Local(_, child, _) | ModelProcess::Container(_, _, child) => {
+            child.kill().await.expect("kill the placeholder process")
+        }
+    }
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, dead);
+
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4",
+        "the daemon-wide budget stands, so ensure_model still reloads it"
+    );
+}
+
 /// An explicit `LLMMAN_HYBRID_LOCAL_BYTES` is not replaced by a load,
 /// however small the window that load ended up with.
 #[tokio::test]

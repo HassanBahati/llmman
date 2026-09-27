@@ -97,6 +97,9 @@ struct PsEntry {
     processor: String,
     started_at: String,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// See `RunningModel::context_window` — the window this load was
+    /// given, for a backend that reports none of its own.
+    context_window: Option<u32>,
 }
 
 pub(super) async fn handle_ps(
@@ -119,13 +122,21 @@ pub(super) async fn handle_ps(
                     .keep_alive
                     .and_then(|d| chrono::Duration::from_std(d).ok())
                     .map(|d| m.last_active_wall + d),
+                context_window: m.context_window,
             })
             .collect()
     };
 
     let mut models = Vec::with_capacity(entries.len());
     for entry in entries {
-        let context_length = query_context_length(&state.0.client, entry.port).await;
+        // The live figure first; failing that, the window this daemon
+        // gave the load. vLLM and MLX expose no `/props`, and a caller
+        // reading this back (see `local_context_window` in cmd::launch)
+        // would otherwise predict one from its own environment, which
+        // is not the daemon's when the daemon is someone else's.
+        let context_length = query_context_length(&state.0.client, entry.port)
+            .await
+            .or_else(|| entry.context_window.map(u64::from));
         models.push(OllamaRunningModelInfo {
             name: entry.name.clone(),
             model: entry.name,
