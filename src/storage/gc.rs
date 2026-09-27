@@ -52,16 +52,19 @@ struct GcFileAccount {
 }
 
 impl GcFileAccount {
-    fn remember(&mut self, path: &Path) {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return;
+    fn remember(&mut self, path: &Path) -> anyhow::Result<()> {
+        let Some(meta) = ignore_not_found(std::fs::symlink_metadata(path))
+            .with_context(|| format!("inspect {}", path.display()))?
+        else {
+            return Ok(());
         };
         if !meta.is_file() {
-            return;
+            return Ok(());
         }
         if let Some(identity) = file_identity(path, &meta) {
             self.identities.insert(identity);
         }
+        Ok(())
     }
 
     fn size(&mut self, path: &Path) -> u64 {
@@ -144,7 +147,9 @@ fn prune_blobs(
     live: &HashSet<String>,
     grace: Duration,
 ) -> anyhow::Result<GcStats> {
-    prune_blobs_with_account(store_root, live, grace, &mut GcFileAccount::default())
+    let mut account = GcFileAccount::default();
+    remember_retained_blobs(store_root, live, grace, &mut account)?;
+    prune_blobs_with_account(store_root, live, grace, &mut account)
 }
 
 /// Prunes blobs and cache with one file-identity account, so hardlinked
@@ -189,7 +194,7 @@ fn remember_retained_blobs(
             continue;
         }
         if live.contains(&format!("sha256:{name}")) || !is_older_than(&path, grace) {
-            account.remember(&path);
+            account.remember(&path)?;
         }
     }
     Ok(())
@@ -268,7 +273,7 @@ fn remember_cache_dir_files(
         if is_stale_copy_temp {
             continue;
         }
-        account.remember(&path);
+        account.remember(&path)?;
     }
     Ok(())
 }
@@ -297,7 +302,6 @@ fn prune_blobs_with_account(
             continue;
         }
         if live.contains(&format!("sha256:{name}")) {
-            account.remember(&path);
             continue;
         }
         if !is_older_than(&path, grace) {
@@ -730,6 +734,29 @@ mod tests {
             error
                 .to_string()
                 .contains(&format!("read {}", file.display())),
+            "unexpected error: {error:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remember_ignores_missing_paths_but_returns_other_metadata_errors() {
+        let root = temp_dir("remember-metadata-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut account = GcFileAccount::default();
+        account.remember(&root.join("missing")).unwrap();
+
+        let not_a_dir = root.join("not-a-directory");
+        std::fs::write(&not_a_dir, b"cache entry").unwrap();
+        let child = not_a_dir.join("child");
+
+        let error = account.remember(&child).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("inspect {}", child.display())),
             "unexpected error: {error:#}"
         );
         std::fs::remove_dir_all(&root).unwrap();
