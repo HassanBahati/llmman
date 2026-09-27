@@ -1330,10 +1330,12 @@ fn pair(reference: &'static str) -> crate::hybrid::Pair<'static> {
 
 /// What comes back is one half's own ordinary reference, with
 /// nothing left for anything downstream to special-case.
-#[test]
-fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
+#[tokio::test]
+async fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
     let state = test_state();
-    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[]))).unwrap();
+    let local = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers_with(&[])))
+        .await
+        .unwrap();
     assert_eq!(local, "gemma4");
 
     let cloud = resolve_hybrid_side(
@@ -1341,45 +1343,54 @@ fn a_pair_resolves_to_an_ordinary_reference_for_the_half_it_picks() {
         &pair(PAIR),
         Some(&headers_with(&[("x-llmman-route", "cloud")])),
     )
+    .await
     .unwrap();
     assert_eq!(cloud, HOSTED);
     assert!(crate::providers::is_remote_ref(&cloud));
 }
 
 /// A surface with no headers to offer keeps a pair local.
-#[test]
-fn a_pair_without_headers_stays_local() {
+#[tokio::test]
+async fn a_pair_without_headers_stays_local() {
     let state = test_state();
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), None).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), None)
+            .await
+            .unwrap(),
         "gemma4"
     );
 }
 
 /// The one automatic rule that sends data off the machine, wired to
 /// a real `Content-Length` and a real budget.
-#[test]
-fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
+#[tokio::test]
+async fn a_request_too_large_for_this_host_goes_to_the_hosted_half() {
     let state = test_state_with_budget(262_144);
     let fits = headers_with(&[("content-length", "262144")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits))
+            .await
+            .unwrap(),
         "gemma4"
     );
     let does_not = headers_with(&[("content-length", "262145")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&does_not))
+            .await
+            .unwrap(),
         HOSTED
     );
 }
 
 /// `LLMMAN_HYBRID_LOCAL_BYTES=0`: size alone never routes away.
-#[test]
-fn without_a_budget_size_never_routes_a_pair_away() {
+#[tokio::test]
+async fn without_a_budget_size_never_routes_a_pair_away() {
     let state = test_state();
     let huge = headers_with(&[("content-length", "999999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge))
+            .await
+            .unwrap(),
         "gemma4"
     );
 }
@@ -1387,12 +1398,14 @@ fn without_a_budget_size_never_routes_a_pair_away() {
 /// `/v1/audio/transcriptions` relays multipart bytes it cannot
 /// rewrite, so a pair takes its local half regardless of size there,
 /// consulting the pin only.
-#[test]
-fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
+#[tokio::test]
+async fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
     let state = test_state_with_budget(1);
     let huge = headers_with(&[("content-length", "99999999")]);
     assert_eq!(
-        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge)).unwrap(),
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&huge))
+            .await
+            .unwrap(),
         HOSTED,
         "the generic path still routes on size"
     );
@@ -1406,13 +1419,75 @@ fn a_transcription_pair_takes_its_local_half_whatever_its_size() {
 }
 
 /// An unreadable pin is a 400, not a guess. See `hybrid::parse_pin`.
-#[test]
-fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
+#[tokio::test]
+async fn an_unreadable_route_header_is_rejected_rather_than_guessed() {
     let state = test_state();
     let headers = headers_with(&[("x-llmman-route", "on-device")]);
     let err = resolve_hybrid_side(&state, &pair(PAIR), Some(&headers))
+        .await
         .expect_err("an unknown side must not be guessed at");
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+}
+
+/// The loaded window, not the daemon-wide default, is what a pair is
+/// routed against: a half loaded with 32k tokens holds 128 KiB, so a
+/// 200 KB body leaves the machine even though the daemon started with
+/// a 256k default.
+#[tokio::test]
+async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() {
+    // The default budget: DEFAULT_CTX_SIZE tokens' worth.
+    let state = test_state_with_budget(262_144 * 4);
+    let big = headers_with(&[("content-length", "200000")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4",
+        "nothing is loaded yet, so the daemon-wide budget stands"
+    );
+
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    loaded.context_window = Some(32_768);
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, loaded);
+
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        HOSTED,
+        "past the 32k this half loaded with, whatever the daemon's default"
+    );
+    let fits = headers_with(&[("content-length", "131072")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&fits))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
+}
+
+/// An explicit `LLMMAN_HYBRID_LOCAL_BYTES` is not replaced by a load,
+/// however small the window that load ended up with.
+#[tokio::test]
+async fn a_stated_budget_is_not_overridden_by_the_loaded_window() {
+    let mut inner = test_inner(std::env::temp_dir());
+    inner.hybrid_local_bytes = Some(1_000_000);
+    inner.hybrid_local_bytes_explicit = true;
+    let state = AppState(Arc::new(inner));
+
+    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
+    loaded.context_window = Some(4_096);
+    let key = running_key(&state, "gemma4");
+    state.0.manager.lock().await.running.insert(key, loaded);
+
+    let big = headers_with(&[("content-length", "999999")]);
+    assert_eq!(
+        resolve_hybrid_side(&state, &pair(PAIR), Some(&big))
+            .await
+            .unwrap(),
+        "gemma4"
+    );
 }
 
 /// An invalid local half is rejected exactly as a bare one is (see

@@ -69,6 +69,7 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         ctx_size: None,
         ctx_size_explicit: false,
         hybrid_local_bytes: None,
+        hybrid_local_bytes_explicit: false,
         flash_attention: None,
         kv_cache_type: None,
         split_mode: None,
@@ -180,6 +181,7 @@ pub(super) fn running_model_fixture(
         last_active: Instant::now() - idle_for,
         last_active_wall: chrono::Utc::now(),
         backend_model_path: None,
+        context_window: None,
         keep_alive,
         in_flight,
     }
@@ -202,6 +204,7 @@ pub(super) fn running_model_fixture_with_engine(
         last_active: Instant::now(),
         last_active_wall: chrono::Utc::now(),
         backend_model_path: backend_model_path.map(|s| s.to_string()),
+        context_window: None,
         keep_alive: None,
         in_flight: 0,
     }

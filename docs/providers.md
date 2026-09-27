@@ -141,10 +141,14 @@ Which side serves a request:
    value, or the header given twice, is a `400`, never a guess; a blank
    value counts as absent.
 2. **Otherwise, size.** A request larger than the local context can hold
-   goes to the provider. The budget is four bytes per token of the
-   daemon's context size (`LLMMAN_CONTEXT_LENGTH`); `LLMMAN_HYBRID_LOCAL_BYTES`
-   sets it directly, `0` turns the rule off. A request that declares no
-   `Content-Length` stays local.
+   goes to the provider. The budget is four bytes per token of the window
+   the local half actually loaded with — the same window `llmman launch`
+   declares to the integration, so what an agent is told it can send and
+   what stays on this machine agree. Until that half is loaded, the
+   daemon's context size (`LLMMAN_CONTEXT_LENGTH`) stands in.
+   `LLMMAN_HYBRID_LOCAL_BYTES` sets the budget directly and is never
+   overridden by a load, `0` turns the rule off. A request that declares
+   no `Content-Length` stays local.
 3. **Otherwise, local.**
 
 Local is the default because the two mistakes are not equal: a worse
