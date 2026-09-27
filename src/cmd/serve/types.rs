@@ -740,7 +740,11 @@ pub(super) struct OAIChunkDelta {
 /// incrementally as a partial JSON string; see `ToolCallAccumulator`.
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct OAIToolCallDelta {
-    pub(super) index: usize,
+    /// Absent from Gemini's OpenAI-compatible endpoint, which sends each
+    /// call whole; the call's position in the delta stands in for it, as
+    /// in `responses` and `messages`.
+    #[serde(default)]
+    pub(super) index: Option<usize>,
     #[serde(default)]
     pub(super) id: Option<String>,
     #[serde(default)]
@@ -794,8 +798,8 @@ pub(super) fn accumulate_tool_call_deltas(
         return;
     }
     let mut acc = acc.borrow_mut();
-    for delta in deltas {
-        let entry = acc.entry(delta.index).or_default();
+    for (position, delta) in deltas.into_iter().enumerate() {
+        let entry = acc.entry(delta.index.unwrap_or(position)).or_default();
         if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
             if entry.id.is_empty() {
                 entry.id = id;

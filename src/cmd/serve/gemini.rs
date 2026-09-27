@@ -1158,6 +1158,22 @@ mod tests {
         assert!(!GeminiMethod::CountTokens.generates());
     }
 
+    /// The `google` provider's OpenAI endpoint sends a whole tool call,
+    /// with no `index`, on its finish chunk.
+    #[test]
+    fn folding_a_stream_keeps_a_call_sent_without_an_index() {
+        let response = fold_gemini_stream([
+            r#"data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"0","type":"function","function":{"name":"lookup","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls","index":0}]}"#,
+            "data: [DONE]",
+        ])
+        .expect("complete stream");
+
+        assert_eq!(
+            response["candidates"][0]["content"]["parts"],
+            serde_json::json!([{"functionCall": {"id": "0", "name": "lookup", "args": {"id": 1}}}])
+        );
+    }
+
     #[test]
     fn folding_a_stream_joins_deltas_and_keeps_calls_finish_and_usage() {
         let response = fold_gemini_stream([
