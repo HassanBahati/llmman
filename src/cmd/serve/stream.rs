@@ -635,6 +635,27 @@ mod tests {
         assert!(fold.metrics.total_duration.is_some());
     }
 
+    /// Gemini's OpenAI-compatible endpoint (the `google` provider) sends
+    /// each tool call whole, on the finish chunk, with no `index`. The
+    /// call, and the finish that chunk carries, must still come through.
+    #[test]
+    fn fold_ollama_lines_keeps_a_tool_call_sent_without_an_index() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"0","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls","index":0}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5}}"#,
+            "data: [DONE]",
+        ]
+        .map(String::from);
+        let fold = fold_ollama_lines(lines);
+        assert!(fold.done, "the finish chunk was dropped");
+        let calls = fold.tool_calls.expect("the tool call was dropped");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("0"));
+        assert_eq!(calls[0].function.index, 0);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments["city"], "Paris");
+    }
+
     /// A provider's cached prefix is not counted as evaluated too, and an
     /// over-report is clamped to the prompt.
     #[test]
