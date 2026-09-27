@@ -2283,10 +2283,10 @@ fn loaded_context_window(
             trained_ctx.map(|trained| trained / num_parallel.unwrap_or(1))
         }
         Engine::LlamaServer => ctx_size,
-        Engine::Vllm | Engine::VllmOmni | Engine::Sglang => {
-            vllm_max_model_len(ctx_size, ctx_size_explicit)
-        }
-        Engine::Mlx => None,
+        Engine::Vllm | Engine::Sglang => vllm_max_model_len(ctx_size, ctx_size_explicit),
+        // `vllm_omni_serve_args` passes no `--max-model-len` at all, so
+        // the Omni engine's window is its own, like MLX's.
+        Engine::VllmOmni | Engine::Mlx => None,
     }
     .filter(|n| *n > 0)
 }

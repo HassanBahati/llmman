@@ -695,7 +695,7 @@ struct RawModel {
     /// and a listing column is not worth `--provider x` breaking over.
     #[serde(default)]
     cost: Option<serde_json::Value>,
-    /// Untyped for the same reason; only `output` is read.
+    /// Untyped for the same reason; `output` and `context` are read.
     #[serde(default)]
     limit: Option<serde_json::Value>,
     /// Untyped for the same reason.

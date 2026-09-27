@@ -195,6 +195,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 vision = info.vision();
                 context_length = info.context_length();
             }
+            // Resolved once, and only for an integration that has
+            // somewhere to put it: reading the live window loads the
+            // model (see `local_context_window`), which every other
+            // launch would wait for and never use.
+            let local_window = (declares_context_window(name) && !model.is_empty())
+                .then(|| local_context_window(&model, context_length))
+                .flatten();
             match overflow {
                 // The hosted half is validated and keyed exactly as a
                 // bare --provider model would be, then paired with the
@@ -206,10 +213,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     // The local half, which serves by default, keeps
                     // its thinking choices.
                     let remote = resolve_provider_model(provider, Some(hosted), name, per_request)?;
-                    context_window = pair_context_window(
-                        local_context_window(&model, context_length),
-                        remote.context_window,
-                    );
+                    context_window = pair_context_window(local_window, remote.context_window);
                     // The pair's ceiling is the hosted half's: a local
                     // backend caps no reply of its own.
                     max_output = remote.max_output;
@@ -222,7 +226,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     // A `--provider` model is served by someone else, so
                     // this is the only arm whose window is the local one
                     // alone.
-                    context_window = local_context_window(&model, context_length);
+                    context_window = local_window;
                     (model, integration_key())
                 }
             }
@@ -401,6 +405,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 /// daemon nobody else can reach (see `reachable_only_locally`).
 const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 
+/// Integrations that declare a context window, and so are worth
+/// loading the model to read the real one back for. Keep in step with
+/// [`launch`]'s own dispatch: an integration missing here is simply
+/// told no window, not told a wrong one.
+fn declares_context_window(integration: &str) -> bool {
+    matches!(integration.to_lowercase().as_str(), "opencode" | "codex")
+}
+
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
     if let Some((_, why)) = PROVIDER_UNSUPPORTED.iter().find(|(id, _)| *id == name) {
@@ -441,12 +453,6 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validates `--provider`/`--model` against the running daemon's catalog
-/// (see [`crate::daemon::provider`]), returning the reference the daemon
-/// routes on (see [`crate::providers::REMOTE_PREFIX`]), the key
-/// `integration` should authenticate with, and the model's catalog
-/// thinking levels (see [`Thinking::Listed`]).
-///
 /// What [`resolve_provider_model`] resolves. Named fields rather than a
 /// tuple: three of these are `Option`s, which a caller can drop by
 /// destructuring past them without the compiler saying so.
@@ -464,6 +470,11 @@ struct ResolvedProvider {
     max_output: Option<u32>,
 }
 
+/// Validates `--provider`/`--model` against the running daemon's catalog
+/// (see [`crate::daemon::provider`]), resolving the reference the daemon
+/// routes on, the key `integration` authenticates with, and what the
+/// catalog says about the model — see [`ResolvedProvider`].
+///
 /// `key_travels_per_request` is false for the integrations in
 /// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
 /// cannot carry a real key — so this shell having one is beside the
@@ -1746,23 +1757,6 @@ fn codex_context_window(window: Option<u64>) -> u64 {
     window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
 }
 
-/// The window the daemon serves, mirroring `initial_ctx_size`:
-///
-/// * `LLMMAN_CONTEXT_LENGTH` set and positive — forwarded as `--ctx-size`
-///   uncapped, so it is what gets served.
-/// * Set to `0` — `--ctx-size 0`, which llama.cpp reads as the model's
-///   own `trained` context, also uncapped.
-/// * Unset — the default, clamped *down* to `trained`, so a model
-///   trained past [`super::serve::DEFAULT_CTX_SIZE`] is still served
-///   only the default.
-///
-/// `None` when the window is unknown: every caller but codex passes that
-/// through as "say nothing", leaving the integration its own default.
-///
-/// Blind to the daemon's `LLMMAN_NUM_PARALLEL`: llama-server splits
-/// `--ctx-size 0`'s trained context across that many slots, so this
-/// overstates a request's window by that factor. One more reason
-/// [`local_context_window`] reads the live one first.
 /// The window the daemon serves for `model`, read back from the loaded
 /// runner rather than predicted: an OOM retry halves `--ctx-size` during
 /// the load, and a reused daemon keeps whatever it was started with.
@@ -1790,6 +1784,24 @@ fn pair_context_window(local: Option<u64>, hosted: Option<u64>) -> Option<u64> {
     }
 }
 
+/// The window the daemon would serve, predicted rather than read,
+/// mirroring `initial_ctx_size`:
+///
+/// * `LLMMAN_CONTEXT_LENGTH` set and positive — forwarded as `--ctx-size`
+///   uncapped, so it is what gets served.
+/// * Set to `0` — `--ctx-size 0`, which llama.cpp reads as the model's
+///   own `trained` context, also uncapped.
+/// * Unset — the default, clamped *down* to `trained`, so a model
+///   trained past [`super::serve::DEFAULT_CTX_SIZE`] is still served
+///   only the default.
+///
+/// `None` when the window is unknown: every caller but codex passes that
+/// through as "say nothing", leaving the integration its own default.
+///
+/// Blind to the daemon's `LLMMAN_NUM_PARALLEL`: llama-server splits
+/// `--ctx-size 0`'s trained context across that many slots, so this
+/// overstates a request's window by that factor. One more reason
+/// [`local_context_window`] reads the live one first.
 fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
     match env {
         Some(0) => trained,
@@ -4935,6 +4947,22 @@ model = \"gpt-5\"
         // No window: the key stays out and opencode keeps its defaults.
         let unknown = opencode_config("http://h", "m", "k", &[], false, None, None);
         assert!(!unknown.contains("limit"), "{unknown}");
+    }
+
+    /// Only the integrations that put a window somewhere pay for the
+    /// load that reads the live one back. Every launcher in [`launch`]
+    /// that takes `context_window` must be listed, or it silently gets
+    /// none.
+    #[test]
+    fn the_integrations_that_declare_a_window_are_the_ones_that_take_one() {
+        assert!(declares_context_window("opencode"));
+        assert!(declares_context_window("codex"));
+        assert!(declares_context_window("OpenCode"), "matched case-blind");
+        // pi declares a window too, but from the trained context
+        // (`context_length`), which needs no load to read.
+        assert!(!declares_context_window("pi"));
+        assert!(!declares_context_window("claude"));
+        assert!(!declares_context_window("aider"));
     }
 
     /// opencode sends `limit.output` as the request's max output, so a
