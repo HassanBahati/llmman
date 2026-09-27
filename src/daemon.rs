@@ -1249,9 +1249,11 @@ pub fn unload(reference: &str) -> anyhow::Result<bool> {
 /// during that load, which is exactly the value a caller needs to read
 /// back rather than predict.
 pub fn loaded_context_length(reference: &str) -> Option<u64> {
-    // Ollama's load sentinel: no prompt, a non-zero keep_alive. The
-    // daemon's own reaper decides how long it stays; this only asks for
-    // it now so `/api/ps` has something to report.
+    // Ollama's load sentinel: no prompt, and no `keep_alive` of its
+    // own, so the daemon's default decides how long the model stays
+    // (an absent field never reads as an unload — see
+    // `is_explicit_unload` in cmd::serve). This only asks for the load,
+    // so `/api/ps` has something to report.
     client()
         .ok()?
         .post(format!("{}/api/generate", server()))
@@ -1261,10 +1263,21 @@ pub fn loaded_context_length(reference: &str) -> Option<u64> {
         .error_for_status()
         .ok()?;
     let ps: PsWindows = get_json("/api/ps").ok()?;
-    let local = crate::hybrid::local_half(reference);
-    ps.models
+    ps_window(ps.models, reference)
+}
+
+/// `reference`'s window among the models `/api/ps` reports loaded.
+///
+/// The tag is defaulted on both sides: `/api/ps` answers under the
+/// reference `ensure_model` loaded the model as, which it ran through
+/// `default_tag` first, while a caller's own spelling is untagged
+/// (`resolve_ollama_api` leaves `gemma4` as `docker.io/ai/gemma4`). An
+/// exact match therefore finds nothing and reports no window at all.
+fn ps_window(models: Vec<PsWindow>, reference: &str) -> Option<u64> {
+    let local = crate::storage::default_tag(crate::hybrid::local_half(reference));
+    models
         .into_iter()
-        .find(|m| m.name == local)
+        .find(|m| crate::storage::default_tag(&m.name) == local)
         .and_then(|m| m.context_length)
 }
 
@@ -1279,6 +1292,16 @@ struct PsWindows {
 struct PsWindow {
     name: String,
     context_length: Option<u64>,
+}
+
+#[cfg(test)]
+impl PsWindow {
+    fn new(name: &str, context_length: Option<u64>) -> Self {
+        Self {
+            name: name.to_string(),
+            context_length,
+        }
+    }
 }
 
 /// The `{"error":"model '<name>' not found"}` this daemon sends for
@@ -1942,5 +1965,41 @@ mod tests {
             r#"{"message":"model 'docker.io/ai/m' not found"}"#,
             m
         ));
+    }
+
+    /// The window is found under the caller's own spelling, not only
+    /// the one the daemon loaded the model under. The untagged form
+    /// `resolve_ollama_api` hands `llmman launch` is the common case.
+    #[test]
+    fn a_loaded_window_is_found_however_its_reference_is_tagged() {
+        let loaded = || {
+            vec![
+                PsWindow::new("docker.io/ai/other:latest", Some(4096)),
+                PsWindow::new("docker.io/ai/gemma4:latest", Some(32_768)),
+            ]
+        };
+        assert_eq!(ps_window(loaded(), "docker.io/ai/gemma4"), Some(32_768));
+        assert_eq!(
+            ps_window(loaded(), "docker.io/ai/gemma4:latest"),
+            Some(32_768)
+        );
+        // A pair is read back on its local half, the only loaded one.
+        assert_eq!(
+            ps_window(
+                loaded(),
+                "llmman.hybrid/docker.io/ai/gemma4,anthropic/claude-sonnet-4-5"
+            ),
+            Some(32_768)
+        );
+        // Another tag is another model, and a backend that reports no
+        // window of its own reports none.
+        assert_eq!(ps_window(loaded(), "docker.io/ai/gemma4:8b"), None);
+        assert_eq!(
+            ps_window(
+                vec![PsWindow::new("docker.io/ai/gemma4:latest", None)],
+                "docker.io/ai/gemma4"
+            ),
+            None
+        );
     }
 }
