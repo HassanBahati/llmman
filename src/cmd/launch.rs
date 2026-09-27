@@ -155,6 +155,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let mut thinking = None;
     let mut vision = false;
     let mut context_length = None;
+    // The window the daemon serves, for the integrations that declare
+    // one: the local model's, the hosted model's, or a pair's larger
+    // half, set by whichever arm below resolves the model. `None` when
+    // no side of it is known. See `launch`.
+    let context_window: Option<u64>;
+    // The catalog's reply ceiling, for the arms that have a catalog.
+    let mut max_output = None;
     let (model, api_key) = match provider {
         Some(provider) => {
             check_provider_supported(name)?;
@@ -166,10 +173,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // is what forwards upstream.
             crate::daemon::ensure_server("")?;
             let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            let (model, api_key, levels) =
+            let hosted =
                 resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
-            thinking = levels.map(Thinking::Listed);
-            (model, api_key)
+            thinking = hosted.thinking.map(Thinking::Listed);
+            // Nothing local is loaded here, so the catalog's limits are
+            // the only ones, and the ones the provider enforces.
+            context_window = hosted.context_window;
+            max_output = hosted.max_output;
+            (hosted.reference, hosted.api_key)
         }
         None => {
             // resolve_ollama_api, not resolve: every integration this
@@ -205,6 +216,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                 vision = info.vision();
                 context_length = info.context_length();
             }
+            // Resolved once, and only for an integration that has
+            // somewhere to put it: reading the live window loads the
+            // model (see `local_context_window`), which every other
+            // launch would wait for and never use.
+            let local_window = (declares_context_window(name) && !model.is_empty())
+                .then(|| local_context_window(&model, context_length))
+                .flatten();
             match overflow {
                 // The hosted half is validated and keyed exactly as a
                 // bare --provider model would be, then paired with the
@@ -215,11 +233,23 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                         !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
                     // The local half, which serves by default, keeps
                     // its thinking choices.
-                    let (remote, api_key, _) =
-                        resolve_provider_model(provider, Some(hosted), name, per_request)?;
-                    (crate::hybrid::pair_with_local(&model, &remote)?, api_key)
+                    let remote = resolve_provider_model(provider, Some(hosted), name, per_request)?;
+                    context_window = pair_context_window(local_window, remote.context_window);
+                    // The pair's ceiling is the hosted half's: a local
+                    // backend caps no reply of its own.
+                    max_output = remote.max_output;
+                    (
+                        crate::hybrid::pair_with_local(&model, &remote.reference)?,
+                        remote.api_key,
+                    )
                 }
-                None => (model, integration_key()),
+                None => {
+                    // A `--provider` model is served by someone else, so
+                    // this is the only arm whose window is the local one
+                    // alone.
+                    context_window = local_window;
+                    (model, integration_key())
+                }
             }
         }
     };
@@ -232,6 +262,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         variant,
         vision,
         context_length,
+        context_window,
+        max_output,
         &args.extra_args,
     )
 }
@@ -395,6 +427,14 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
 /// daemon nobody else can reach (see `reachable_only_locally`).
 const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 
+/// Integrations that declare a context window, and so are worth
+/// loading the model to read the real one back for. Keep in step with
+/// [`launch`]'s own dispatch: an integration missing here is simply
+/// told no window, not told a wrong one.
+fn declares_context_window(integration: &str) -> bool {
+    matches!(integration.to_lowercase().as_str(), "opencode" | "codex")
+}
+
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
     if let Some((_, why)) = PROVIDER_UNSUPPORTED.iter().find(|(id, _)| *id == name) {
@@ -435,11 +475,27 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What [`resolve_provider_model`] resolves. Named fields rather than a
+/// tuple: three of these are `Option`s, which a caller can drop by
+/// destructuring past them without the compiler saying so.
+struct ResolvedProvider {
+    /// The hosted model's full reference, as the daemon routes on it.
+    reference: String,
+    /// The key the integration authenticates with.
+    api_key: String,
+    /// The thinking levels the catalog lists (see [`Thinking::Listed`]).
+    thinking: Option<Vec<String>>,
+    /// The window the catalog says this model holds.
+    context_window: Option<u64>,
+    /// The most the catalog says it will emit in one reply (see
+    /// [`crate::daemon::ProviderDetail::max_output`]).
+    max_output: Option<u32>,
+}
+
 /// Validates `--provider`/`--model` against the running daemon's catalog
-/// (see [`crate::daemon::provider`]), returning the reference the daemon
-/// routes on (see [`crate::providers::REMOTE_PREFIX`]), the key
-/// `integration` should authenticate with, and the model's catalog
-/// thinking levels (see [`Thinking::Listed`]).
+/// (see [`crate::daemon::provider`]), resolving the reference the daemon
+/// routes on, the key `integration` authenticates with, and what the
+/// catalog says about the model — see [`ResolvedProvider`].
 ///
 /// `key_travels_per_request` is false for the integrations in
 /// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
@@ -458,7 +514,7 @@ fn resolve_provider_model(
     model: Option<&str>,
     integration: &str,
     key_travels_per_request: bool,
-) -> anyhow::Result<(String, String, Option<Vec<String>>)> {
+) -> anyhow::Result<ResolvedProvider> {
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
     // *it* has the key, which this shell cannot see.
@@ -533,11 +589,13 @@ fn resolve_provider_model(
         (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
     };
 
-    Ok((
-        providers::format_remote_ref(provider, model),
-        key,
-        entry.thinking_levels(model),
-    ))
+    Ok(ResolvedProvider {
+        reference: providers::format_remote_ref(provider, model),
+        api_key: key,
+        thinking: entry.thinking_levels(model),
+        context_window: entry.context_window(model),
+        max_output: entry.max_output(model),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +958,19 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// the integration's environment can do this; the ones that go through a
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
+///
+/// The two context arguments are not one. `context_window` is the
+/// window a request may fill: a local model's loaded one (see
+/// [`local_context_window`]), a `--provider` model's catalog one, or a
+/// pair's larger half (see [`pair_context_window`]); `None` when none
+/// of them is known. An integration that declares a window is told
+/// this.
+///
+/// `context_length` is the raw trained context. codex resolves its own
+/// window from it unconditionally, falling back to
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`], because its catalog cannot omit
+/// the field; pi writes it straight into `contextWindow`. Merging the
+/// two would extend codex's guess to every other integration.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
@@ -909,6 +980,8 @@ fn launch(
     variant: Option<&str>,
     vision: bool,
     context_length: Option<u64>,
+    context_window: Option<u64>,
+    max_output: Option<u32>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let name = name.to_lowercase();
@@ -943,8 +1016,17 @@ fn launch(
             .is_some_and(|t| t.thinks);
     match name.as_str() {
         "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(model, api_key, thinking, variant, vision, extra_args),
-        "codex" => launch_codex(model, api_key, vision, context_length, extra_args),
+        "opencode" => launch_opencode(
+            model,
+            api_key,
+            thinking,
+            variant,
+            vision,
+            context_window,
+            max_output,
+            extra_args,
+        ),
+        "codex" => launch_codex(model, api_key, vision, context_window, extra_args),
         "pi" => launch_pi(model, reasons, vision, context_length, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_length, extra_args),
         "cline" => launch_cline(model, extra_args),
@@ -1066,14 +1148,18 @@ fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
 }
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants and, for a vision
-/// model, image input. `--variant` becomes the model's default options.
+/// /v1 endpoint, with the model's thinking variants, its window and, for
+/// a vision model, image input. `--variant` becomes the model's default
+/// options.
+#[allow(clippy::too_many_arguments)]
 fn launch_opencode(
     model: &str,
     api_key: &str,
     thinking: Option<&Thinking>,
     variant: Option<&str>,
     vision: bool,
+    context_window: Option<u64>,
+    max_output: Option<u32>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
@@ -1088,6 +1174,8 @@ fn launch_opencode(
         &variants,
         options.map(|(_, options)| options),
         vision,
+        context_window,
+        max_output,
     );
 
     exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
@@ -1197,9 +1285,28 @@ fn opencode_fallback_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// opencode's own `OUTPUT_TOKEN_MAX` (`provider/transform.ts`), the cap
+/// it applies to `limit.output` and the value it substitutes for a 0.
+const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
+
+/// `limit.output` for a window of `context` when the catalog names no
+/// real ceiling: a quarter, capped at [`OPENCODE_OUTPUT_TOKEN_MAX`],
+/// never 0.
+///
+/// opencode spends this field twice — the `maxOutputTokens` it sends
+/// and the headroom it keeps before compacting — capping both at its
+/// own [`OPENCODE_OUTPUT_TOKEN_MAX`], which is what makes a catalog
+/// ceiling of any size safe to pass. A quarter is the guess where
+/// there is none: longer than one turn produces, short enough to leave
+/// the window mostly usable.
+fn opencode_output_reserve(context: u64) -> u64 {
+    (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
+}
+
 /// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
 /// than `json!`, whose map sorts keys: opencode cycles variants in the
 /// order listed. No variants leaves the key out.
+#[allow(clippy::too_many_arguments)]
 fn opencode_config(
     server: &str,
     model: &str,
@@ -1207,6 +1314,8 @@ fn opencode_config(
     variants: &[(&str, serde_json::Value)],
     options: Option<&serde_json::Value>,
     vision: bool,
+    context_window: Option<u64>,
+    max_output: Option<u32>,
 ) -> String {
     use serde::ser::{SerializeMap, Serializer};
 
@@ -1259,11 +1368,19 @@ fn opencode_config(
         modalities: Option<Modalities>,
         #[serde(skip_serializing_if = "Option::is_none")]
         attachment: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<Limit>,
     }
     #[derive(serde::Serialize)]
     struct Modalities {
         input: &'static [&'static str],
         output: &'static [&'static str],
+    }
+    /// opencode's schema requires both fields once `limit` is present.
+    #[derive(serde::Serialize)]
+    struct Limit {
+        context: u64,
+        output: u64,
     }
 
     // Declare image input for a vision model so opencode will attach
@@ -1271,6 +1388,18 @@ fn opencode_config(
     let modalities = vision.then_some(Modalities {
         input: &["text", "image"],
         output: &["text"],
+    });
+
+    // Without `limit`, opencode normalizes a config-defined model to
+    // `{context: 0, output: 0}` and then skips overflow detection
+    // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
+    // a session never auto-compacts. Declared only when llmman knows the
+    // window; otherwise the key stays out rather than assert a guess.
+    let limit = context_window.map(|context| Limit {
+        context,
+        // The catalog's own ceiling wherever there is one; derived
+        // only for a local model, which has no catalog to name one.
+        output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
     });
 
     let config = Config {
@@ -1291,6 +1420,7 @@ fn opencode_config(
                         options,
                         modalities,
                         attachment: vision.then_some(true),
+                        limit,
                     },
                 )],
             },
@@ -1688,11 +1818,11 @@ fn launch_codex(
     model: &str,
     api_key: &str,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     // Write codex config
-    write_codex_config(model, vision, context_length)?;
+    write_codex_config(model, vision, context_window)?;
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -1734,7 +1864,7 @@ fn launch_codex(
 fn write_codex_config(
     model: &str,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     let config_dir = codex_dir()?;
     std::fs::create_dir_all(&config_dir)?;
@@ -1749,8 +1879,7 @@ fn write_codex_config(
     // Without a model there is nothing to describe; codex keeps its defaults.
     let catalog_path = config_dir.join("llmman-model.json");
     let catalog = (!model.is_empty()).then(|| {
-        let context_window =
-            codex_context_window(super::serve::context_length_from_env(), context_length);
+        let context_window = codex_context_window(context_window);
         write_codex_file(
             &catalog_path,
             &codex_model_catalog(model, vision, context_window),
@@ -1781,14 +1910,65 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// a trained context; ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-/// What codex compacts against: a positive `LLMMAN_CONTEXT_LENGTH`
-/// (`env`), the `--ctx-size` the daemon serves, else the model's
-/// `trained` context, else [`CODEX_FALLBACK_CONTEXT_WINDOW`].
-fn codex_context_window(env: Option<u32>, trained: Option<u64>) -> u64 {
-    env.filter(|n| *n > 0)
-        .map(u64::from)
-        .or(trained)
-        .unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+/// What codex compacts against: the window `launch` resolved — live from
+/// the loaded runner, and a hybrid pair's larger half — else
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`]. codex's catalog cannot omit the
+/// field, so it guesses where every other integration stays quiet.
+fn codex_context_window(window: Option<u64>) -> u64 {
+    window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+}
+
+/// The window the daemon serves for `model`, read back from the loaded
+/// runner rather than predicted: an OOM retry halves `--ctx-size` during
+/// the load, and a reused daemon keeps whatever it was started with.
+/// [`served_context_window`] is the fallback for a backend that reports
+/// none of its own, vLLM and MLX among them.
+fn local_context_window(model: &str, trained: Option<u64>) -> Option<u64> {
+    crate::daemon::loaded_context_length(model)
+        .or_else(|| served_context_window(super::serve::context_length_from_env(), trained))
+}
+
+/// A hybrid pair's window: whichever half holds more.
+///
+/// Requests above the local budget are routed to the hosted half, so the
+/// pair can hold the larger of the two whichever way round they are —
+/// declaring only the local window makes the agent compact before a
+/// request is ever big enough to route, and declaring only the hosted
+/// one understates a local half that is larger.
+///
+/// `hosted` is `None` for a provider defined in `llmman.conf`, which has
+/// no catalog entry; the local window then stands on its own.
+fn pair_context_window(local: Option<u64>, hosted: Option<u64>) -> Option<u64> {
+    match (local, hosted) {
+        (Some(local), Some(hosted)) => Some(local.max(hosted)),
+        (window, None) | (None, window) => window,
+    }
+}
+
+/// The window the daemon would serve, predicted rather than read,
+/// mirroring `initial_ctx_size`:
+///
+/// * `LLMMAN_CONTEXT_LENGTH` set and positive — forwarded as `--ctx-size`
+///   uncapped, so it is what gets served.
+/// * Set to `0` — `--ctx-size 0`, which llama.cpp reads as the model's
+///   own `trained` context, also uncapped.
+/// * Unset — the default, clamped *down* to `trained`, so a model
+///   trained past [`super::serve::DEFAULT_CTX_SIZE`] is still served
+///   only the default.
+///
+/// `None` when the window is unknown: every caller but codex passes that
+/// through as "say nothing", leaving the integration its own default.
+///
+/// Blind to the daemon's `LLMMAN_NUM_PARALLEL`: llama-server splits
+/// `--ctx-size 0`'s trained context across that many slots, so this
+/// overstates a request's window by that factor. One more reason
+/// [`local_context_window`] reads the live one first.
+fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> {
+    match env {
+        Some(0) => trained,
+        Some(explicit) => Some(u64::from(explicit)),
+        None => trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))),
+    }
 }
 
 /// The `model_catalog_json` for `model`, declaring its image input in
@@ -4915,6 +5095,8 @@ model = \"gpt-5\"
             &variants,
             None,
             false,
+            None,
+            None,
         );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
@@ -4939,7 +5121,7 @@ model = \"gpt-5\"
             .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
 
-        let bare = opencode_config("http://h", "m", "k", &[], None, false);
+        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None);
         assert!(!bare.contains("variants"), "{bare}");
     }
 
@@ -4949,7 +5131,16 @@ model = \"gpt-5\"
     fn opencode_config_starts_the_model_at_the_variant() {
         let variants = opencode_variants(None);
         let high = variants.iter().find(|(name, _)| *name == "high").unwrap();
-        let text = opencode_config("http://h", "m", "k", &variants, Some(&high.1), false);
+        let text = opencode_config(
+            "http://h",
+            "m",
+            "k",
+            &variants,
+            Some(&high.1),
+            false,
+            None,
+            None,
+        );
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -4957,14 +5148,14 @@ model = \"gpt-5\"
             serde_json::json!({ "reasoningEffort": "high" })
         );
 
-        let text = opencode_config("http://h", "m", "k", &variants, None, false);
+        let text = opencode_config("http://h", "m", "k", &variants, None, false, None, None);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
     }
 
     #[test]
     fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], None, true);
+        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None);
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let model = &config["provider"]["ollama"]["models"]["m"];
         assert_eq!(
@@ -4973,17 +5164,109 @@ model = \"gpt-5\"
         );
         assert_eq!(model["attachment"], true);
 
-        let text_only = opencode_config("http://h", "m", "k", &[], None, false);
+        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None);
         assert!(!text_only.contains("modalities"), "{text_only}");
         assert!(!text_only.contains("attachment"), "{text_only}");
+    }
+
+    /// The reserve scales with the window, so a small one keeps a
+    /// usable budget.
+    #[test]
+    fn opencode_output_reserve_scales_with_the_window_and_is_never_zero() {
+        let cases = [
+            (4096, 1024),
+            (32768, 8192),
+            (131072, 32000),
+            // Capped however large the window.
+            (1 << 20, OPENCODE_OUTPUT_TOKEN_MAX),
+            // Never 0, which opencode would replace with its own max.
+            (1, 1),
+            (3, 1),
+        ];
+        for (context, want) in cases {
+            assert_eq!(opencode_output_reserve(context), want, "context={context}");
+        }
+    }
+
+    /// Without `limit` opencode never auto-compacts, so the window has
+    /// to travel.
+    #[test]
+    fn opencode_config_declares_the_window_only_when_it_is_known() {
+        let text = opencode_config("http://h", "m", "k", &[], None, false, Some(8192), None);
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
+        assert_eq!(limit["context"], 8192);
+        // Both keys are required once `limit` is present.
+        assert_eq!(limit["output"], 2048);
+
+        // No window: the key stays out and opencode keeps its defaults.
+        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None);
+        assert!(!unknown.contains("limit"), "{unknown}");
+    }
+
+    /// Only the integrations that put a window somewhere pay for the
+    /// load that reads the live one back. Every launcher in [`launch`]
+    /// that takes `context_window` must be listed, or it silently gets
+    /// none.
+    #[test]
+    fn the_integrations_that_declare_a_window_are_the_ones_that_take_one() {
+        assert!(declares_context_window("opencode"));
+        assert!(declares_context_window("codex"));
+        assert!(declares_context_window("OpenCode"), "matched case-blind");
+        // pi declares a window too, but from the trained context
+        // (`context_length`), which needs no load to read.
+        assert!(!declares_context_window("pi"));
+        assert!(!declares_context_window("claude"));
+        assert!(!declares_context_window("aider"));
+    }
+
+    /// opencode sends `limit.output` as the request's max output, so a
+    /// hosted model's own ceiling has to travel: deriving one from the
+    /// window advertises more than the provider will accept.
+    #[test]
+    fn opencode_config_prefers_the_catalogs_output_ceiling_to_a_derived_one() {
+        let hosted = opencode_config(
+            "http://h",
+            "m",
+            "k",
+            &[],
+            None,
+            false,
+            Some(128_000),
+            Some(8_192),
+        );
+        let config: serde_json::Value = serde_json::from_str(&hosted).expect("valid JSON");
+        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
+        assert_eq!(limit["context"], 128_000);
+        assert_eq!(
+            limit["output"], 8_192,
+            "the catalog's ceiling, not a quarter of the window"
+        );
+
+        // A local model has no catalog and no ceiling of its own, so the
+        // derived reserve still stands.
+        let local = opencode_config("http://h", "m", "k", &[], None, false, Some(128_000), None);
+        let config: serde_json::Value = serde_json::from_str(&local).expect("valid JSON");
+        assert_eq!(
+            config["provider"]["ollama"]["models"]["m"]["limit"]["output"],
+            OPENCODE_OUTPUT_TOKEN_MAX
+        );
     }
 
     #[test]
     fn opencode_config_escapes_the_model_name() {
         let model = "we\"ird/mo\\del";
-        let config: serde_json::Value =
-            serde_json::from_str(&opencode_config("http://h", model, "k", &[], None, false))
-                .expect("valid JSON");
+        let config: serde_json::Value = serde_json::from_str(&opencode_config(
+            "http://h",
+            model,
+            "k",
+            &[],
+            None,
+            false,
+            None,
+            None,
+        ))
+        .expect("valid JSON");
         assert_eq!(config["model"], format!("ollama/{model}"));
         assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
     }
@@ -5129,23 +5412,74 @@ model = \"gpt-5\"
         );
     }
 
+    /// codex takes the window `launch` resolved, like every other
+    /// integration; it differs only in having to name one when there is
+    /// none. What that window is made of — live, env, trained, a pair's
+    /// larger half — is `served_context_window`'s and
+    /// `pair_context_window`'s own business, tested there.
     #[test]
-    fn codex_context_window_is_what_the_daemon_serves() {
+    fn codex_context_window_falls_back_only_when_there_is_no_window() {
+        assert_eq!(codex_context_window(Some(16384)), 16384);
+        assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
+        assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
+    }
+
+    /// Requests above the local budget route to the hosted half, so the
+    /// pair holds the larger window whichever way round the two are.
+    /// Declaring the local one alone has the agent compact before a
+    /// request is ever big enough to route — the bug this fixes.
+    #[test]
+    fn pair_context_window_takes_whichever_half_holds_more() {
+        // The usual pairing: a small local model overflowing to a large
+        // hosted one.
+        assert_eq!(
+            pair_context_window(Some(262_144), Some(1 << 20)),
+            Some(1 << 20)
+        );
+        // Reversed — paired for quality, not capacity. The hosted window
+        // must not shrink what the local half can already hold.
+        assert_eq!(
+            pair_context_window(Some(1 << 20), Some(200_000)),
+            Some(1 << 20)
+        );
+        // A provider from llmman.conf names no window, so the local one
+        // stands alone rather than being discarded.
+        assert_eq!(pair_context_window(Some(262_144), None), Some(262_144));
+        assert_eq!(pair_context_window(None, Some(200_000)), Some(200_000));
+        assert_eq!(pair_context_window(None, None), None);
+    }
+
+    /// The same precedence, minus codex's guess: the launchers that may
+    /// omit the key see `None` instead of a fallback, so an integration's
+    /// own default stands rather than a number llmman invented.
+    #[test]
+    fn served_context_window_prefers_the_environment_then_the_trained_context() {
         let cases = [
-            // A positive LLMMAN_CONTEXT_LENGTH is the served --ctx-size.
-            (Some(16384), Some(32768), 16384),
-            (Some(65536), Some(32768), 65536),
-            (Some(16384), None, 16384),
-            // Unset or 0: the trained context.
-            (None, Some(32768), 32768),
-            (Some(0), Some(32768), 32768),
-            (None, Some(1 << 20), 1 << 20),
-            (Some(0), None, CODEX_FALLBACK_CONTEXT_WINDOW),
-            (None, None, CODEX_FALLBACK_CONTEXT_WINDOW),
+            (Some(16384), Some(32768), Some(16384)),
+            (Some(65536), Some(32768), Some(65536)),
+            (Some(16384), None, Some(16384)),
+            (None, Some(32768), Some(32768)),
+            // `--ctx-size 0` is the model's own context, so it is served
+            // uncapped like any other explicit value — the one case the
+            // default-clamping branch below would get wrong.
+            (Some(0), Some(32768), Some(32768)),
+            (Some(0), Some(1 << 20), Some(1 << 20)),
+            // Clamped down to the trained context, never up to it.
+            (
+                None,
+                Some(1 << 20),
+                Some(u64::from(super::super::serve::DEFAULT_CTX_SIZE)),
+            ),
+            // An explicit value is forwarded uncapped, so it stands.
+            (Some(1 << 20), Some(1 << 20), Some(1 << 20)),
+            // Neither: say nothing, where codex would guess. A `0` with
+            // no trained context to name has nothing to forward either.
+            (Some(0), None, None),
+            (None, None, None),
         ];
         for (env, trained, want) in cases {
             assert_eq!(
-                codex_context_window(env, trained),
+                served_context_window(env, trained),
                 want,
                 "env={env:?} trained={trained:?}"
             );

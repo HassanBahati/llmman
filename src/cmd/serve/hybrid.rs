@@ -15,14 +15,17 @@ use axum::response::Response;
 use futures::StreamExt;
 
 use super::sched::ActivityGuard;
-use super::{context_overflow_message, ensure_model, AppError, AppState, ContextOverflow, Target};
+use super::{
+    context_overflow_message, ensure_model, running_key, AppError, AppState, ContextOverflow,
+    Target,
+};
 
 /// Picks which half of a hybrid pair serves this request and returns
 /// that half's own ordinary reference (see [`crate::hybrid`]).
 /// Substitution rather than a third [`Target`] variant, so the rest of
-/// [`ensure_model`] and every proxy past it serve a pair unchanged. Does
-/// no I/O.
-pub(super) fn resolve_hybrid_side(
+/// [`ensure_model`] and every proxy past it serve a pair unchanged.
+/// The only I/O is [`running_key`]'s store read.
+pub(super) async fn resolve_hybrid_side(
     state: &AppState,
     pair: &crate::hybrid::Pair<'_>,
     headers: Option<&HeaderMap>,
@@ -34,7 +37,14 @@ pub(super) fn resolve_hybrid_side(
         .and_then(|h| h.get(reqwest::header::CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let decision = crate::hybrid::route(pin, request_bytes, state.0.hybrid_local_bytes);
+    // Only when the size rule can decide: `route` ignores the budget
+    // for a pinned request and for one that declared no length, and
+    // resolving one reads the store and takes the manager lock.
+    let budget = match (pin, request_bytes) {
+        (None, Some(_)) => local_budget(state, pair.local).await,
+        _ => None,
+    };
+    let decision = crate::hybrid::route(pin, request_bytes, budget);
 
     let why = match decision.reason {
         crate::hybrid::Reason::Pinned => format!("pinned by {}", crate::hybrid::ROUTE_HEADER),
@@ -55,6 +65,43 @@ pub(super) fn resolve_hybrid_side(
         decision.side.as_str()
     );
     Ok(pair.side_ref(decision.side))
+}
+
+/// The largest request this pair's local half is routed with, in bytes.
+///
+/// Four bytes per token of the window its runner actually got — the
+/// same window `llmman launch` reads back and declares to the
+/// integration (see `local_context_window` in cmd::launch), so the two
+/// figures agree. Order of precedence:
+///
+/// 1. An explicit `LLMMAN_HYBRID_LOCAL_BYTES`, the budget the user
+///    stated rather than one llmman derived.
+/// 2. The loaded half's own window.
+/// 3. `hybrid_local_bytes`, the daemon-wide figure, while the half is
+///    unloaded, dead, or reports no window (`Engine::Mlx`, a vLLM left
+///    to its own length). Falling back, not disabling the rule: an
+///    unknown window is not a boundless one.
+async fn local_budget(state: &AppState, local: &str) -> Option<u64> {
+    if state.0.hybrid_local_bytes_explicit {
+        return state.0.hybrid_local_bytes;
+    }
+    let key = running_key(state, local);
+    // A crashed runner stays in `running` until the next `check_running`
+    // reaps it. Budget as if unloaded, so a large request still routes
+    // local and reloads it, rather than being sent away by a window the
+    // process took with it.
+    let loaded = state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .and_then(|m| m.process.is_alive().then_some(m.context_window))
+        .flatten();
+    loaded
+        .and_then(crate::hybrid::budget_bytes_for_ctx)
+        .or(state.0.hybrid_local_bytes)
 }
 
 /// The side a request pinned itself to, if any; a 400 when unreadable.

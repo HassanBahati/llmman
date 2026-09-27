@@ -238,8 +238,15 @@ struct Inner {
     // user's explicit choice isn't silently overridden.
     ctx_size_explicit: bool,
     // Largest request a hybrid pair serves locally (see
-    // crate::hybrid::local_budget_bytes). Resolved once at startup.
+    // crate::hybrid::local_budget_bytes). Resolved once at startup, so
+    // it is only the fallback for a pair whose local half is not loaded
+    // yet — see `local_budget` in the hybrid module.
     hybrid_local_bytes: Option<u64>,
+    // True if `hybrid_local_bytes` came from an explicit
+    // LLMMAN_HYBRID_LOCAL_BYTES rather than being derived from
+    // `ctx_size`. A stated budget is the user's, so no loaded model's
+    // own window replaces it (mirrors `ctx_size_explicit`).
+    hybrid_local_bytes_explicit: bool,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
@@ -338,6 +345,16 @@ struct RunningModel {
     /// `Some(sglang_served_model_name(..))` for `Engine::Sglang` (`:` is
     /// its LoRA separator), `None` otherwise.
     backend_model_path: Option<String>,
+    /// The per-request context window this load ended up with — see
+    /// [`loaded_context_window`], which resolves it per engine. `None`
+    /// only where the backend was left to pick its own (`Engine::Mlx`,
+    /// a vLLM with no explicit length, a GGUF whose header names no
+    /// trained context).
+    ///
+    /// Read by `hybrid::local_budget`, which would otherwise budget a
+    /// pair against the daemon-wide default — many times this window
+    /// for a model whose trained context clamped the load.
+    context_window: Option<u32>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -875,6 +892,19 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
         .cloned()
         .unwrap_or_else(|| model_ref.to_owned())
+}
+
+/// The key `running` holds `model_ref` under, resolved the way
+/// [`ensure_model`] resolves one before its own `running.insert`. For
+/// reading an already-loaded model's entry; starting one goes through
+/// [`ensure_model`] and its load lock.
+///
+/// Best-effort: a spelling that does not resolve is returned unchanged,
+/// so the lookup finds nothing rather than the wrong model.
+fn running_key(state: &AppState, model_ref: &str) -> String {
+    let resolved =
+        crate::shortnames::resolve_ollama_api(model_ref).unwrap_or_else(|_| model_ref.to_string());
+    canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
 }
 
 /// The load-lock key for `model`: one string for every spelling of the
@@ -1762,9 +1792,10 @@ async fn resolve_target(
 ) -> Result<(String, Target, ActivityGuard), AppError> {
     // First, so everything below sees one half rather than the pair. A
     // half is never itself a pair, so this cannot recurse.
-    let hybrid_side = crate::hybrid::split_ref(model_ref)
-        .map(|pair| resolve_hybrid_side(state, &pair, headers))
-        .transpose()?;
+    let hybrid_side = match crate::hybrid::split_ref(model_ref) {
+        Some(pair) => Some(resolve_hybrid_side(state, &pair, headers).await?),
+        None => None,
+    };
     let model_ref = hybrid_side.as_deref().unwrap_or(model_ref);
 
     // Before `resolve_ollama_api`, deliberately: a provider-routed
@@ -2193,6 +2224,14 @@ async fn resolve_target(
         Engine::Sglang => Some(sglang_served_model_name(model_ref)),
         Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
     };
+    // `ctx_size` carries any shrink the retry loop above applied.
+    let context_window = loaded_context_window(
+        process.engine(),
+        ctx_size,
+        trained_ctx,
+        num_parallel,
+        state.0.ctx_size_explicit,
+    );
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
@@ -2206,6 +2245,7 @@ async fn resolve_target(
             last_active: Instant::now(),
             last_active_wall: chrono::Utc::now(),
             backend_model_path,
+            context_window,
             keep_alive: default_keep_alive(),
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
@@ -2221,6 +2261,35 @@ async fn resolve_target(
         Target::Local(port),
         ActivityGuard::new(state, model_ref),
     ))
+}
+
+/// The per-request context window a finished load ended up serving, for
+/// [`RunningModel::context_window`]: whichever window this engine was
+/// actually given, `None` where it was left to pick its own.
+///
+/// `ctx_size` is the value the load settled on, after any clamp to
+/// `trained_ctx` and any OOM shrink. A zero is not "no window": it is
+/// `LLMMAN_CONTEXT_LENGTH=0` asking llama.cpp for the model's trained
+/// context, which `backend_ctx_size` cannot scale up, so llama-server
+/// splits that one across the `--parallel` slots.
+fn loaded_context_window(
+    engine: Engine,
+    ctx_size: Option<u32>,
+    trained_ctx: Option<u32>,
+    num_parallel: Option<u32>,
+    ctx_size_explicit: bool,
+) -> Option<u32> {
+    match engine {
+        Engine::LlamaServer if ctx_size == Some(0) => {
+            trained_ctx.map(|trained| trained / num_parallel.unwrap_or(1))
+        }
+        Engine::LlamaServer => ctx_size,
+        Engine::Vllm | Engine::Sglang => vllm_max_model_len(ctx_size, ctx_size_explicit),
+        // `vllm_omni_serve_args` passes no `--max-model-len` at all, so
+        // the Omni engine's window is its own, like MLX's.
+        Engine::VllmOmni | Engine::Mlx => None,
+    }
+    .filter(|n| *n > 0)
 }
 
 /// The `"model"` value to actually put in the JSON request body sent to
@@ -2890,6 +2959,14 @@ struct ProviderModelResponse {
     /// See [`crate::providers::Model::thinking`]; absent is not empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Vec<String>>,
+    /// See [`crate::providers::Model::max_context`]; absent where the
+    /// catalog names no window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
+    /// See [`crate::providers::Model::max_output`]; absent where the
+    /// catalog names no ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<u32>,
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -2930,6 +3007,8 @@ impl ProviderResponse {
                         reasoning: c.reasoning,
                     }),
                     thinking: m.thinking.clone(),
+                    context: m.max_context,
+                    output: m.max_output,
                 })
                 .collect(),
         }
@@ -2970,10 +3049,15 @@ async fn handle_llmman_provider(
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
+            // A provider defined in llmman.conf: its models come from
+            // the endpoint's own /v1/models, which names no window and
+            // no output ceiling.
             .map(|id| ProviderModelResponse {
                 id,
                 cost: None,
                 thinking: None,
+                context: None,
+                output: None,
             })
             .collect();
     }
@@ -3789,6 +3873,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         0
     };
     let ctx_size = ctx_size_explicit.or(Some(DEFAULT_CTX_SIZE));
+    // Read once so the budget and the flag below cannot disagree about
+    // what the environment said.
+    let hybrid_local_bytes_env = std::env::var("LLMMAN_HYBRID_LOCAL_BYTES").ok();
     let memory = crate::hostgpu::memory_bytes(vram);
     if !peers.is_empty() {
         eprintln!(
@@ -3873,7 +3960,14 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         sglang_version: _args.sglang_version.clone(),
         ctx_size,
         ctx_size_explicit: ctx_size_explicit.is_some(),
-        hybrid_local_bytes: crate::hybrid::local_budget_bytes_from_env(ctx_size),
+        hybrid_local_bytes: crate::hybrid::local_budget_bytes(
+            ctx_size,
+            hybrid_local_bytes_env.as_deref(),
+        ),
+        hybrid_local_bytes_explicit: crate::hybrid::local_budget_override(
+            hybrid_local_bytes_env.as_deref(),
+        )
+        .is_some(),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
