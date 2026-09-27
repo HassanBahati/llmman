@@ -61,7 +61,9 @@ impl GcFileAccount {
         if !meta.is_file() {
             return Ok(());
         }
-        if let Some(identity) = file_identity(path, &meta) {
+        if let Some(identity) =
+            file_identity(path, &meta).with_context(|| format!("identify {}", path.display()))?
+        {
             self.identities.insert(identity);
         }
         Ok(())
@@ -75,7 +77,7 @@ impl GcFileAccount {
             return 0;
         }
         let size = meta.len();
-        match file_identity(path, &meta) {
+        match file_identity(path, &meta).ok().flatten() {
             Some(identity) => {
                 if self.identities.insert(identity) {
                     size
@@ -99,15 +101,21 @@ fn ignore_not_found<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>>
 }
 
 #[cfg(unix)]
-fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Option<GcFileIdentity> {
+fn file_identity(
+    _path: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<Option<GcFileIdentity>> {
     use std::os::unix::fs::MetadataExt as _;
 
-    Some((meta.dev(), meta.ino()))
+    Ok(Some((meta.dev(), meta.ino())))
 }
 
 #[cfg(windows)]
-fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Option<GcFileIdentity> {
-    same_file::Handle::from_path(path).ok()
+fn file_identity(
+    path: &Path,
+    _meta: &std::fs::Metadata,
+) -> std::io::Result<Option<GcFileIdentity>> {
+    ignore_not_found(same_file::Handle::from_path(path))
 }
 
 /// Every blob digest ("sha256:<hex>") still reachable from a surviving
