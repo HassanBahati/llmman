@@ -150,8 +150,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     }
     // The model's thinking choices (see `opencode_variants`), from its
     // template or the catalog; whether it takes images (see
-    // `write_dsh_settings`) and its trained context (see
-    // `codex_context_window`) only a local model has.
+    // `write_dsh_settings`) and the trained context only a local model
+    // has, which `local_context_window` falls back on.
     let mut thinking = None;
     let mut vision = false;
     let mut context_length = None;
@@ -261,7 +261,6 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         thinking.as_ref(),
         variant,
         vision,
-        context_length,
         context_window,
         max_output,
         &args.extra_args,
@@ -432,7 +431,10 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 /// [`launch`]'s own dispatch: an integration missing here is simply
 /// told no window, not told a wrong one.
 fn declares_context_window(integration: &str) -> bool {
-    matches!(integration.to_lowercase().as_str(), "opencode" | "codex")
+    matches!(
+        integration.to_lowercase().as_str(),
+        "opencode" | "codex" | "pi" | "omp"
+    )
 }
 
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
@@ -959,18 +961,13 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// config file on disk keep the placeholder rather than persist a
 /// credential, and need the key in the daemon's own environment.
 ///
-/// The two context arguments are not one. `context_window` is the
-/// window a request may fill: a local model's loaded one (see
-/// [`local_context_window`]), a `--provider` model's catalog one, or a
-/// pair's larger half (see [`pair_context_window`]); `None` when none
-/// of them is known. An integration that declares a window is told
-/// this.
-///
-/// `context_length` is the raw trained context. codex resolves its own
-/// window from it unconditionally, falling back to
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`], because its catalog cannot omit
-/// the field; pi writes it straight into `contextWindow`. Merging the
-/// two would extend codex's guess to every other integration.
+/// `context_window` is the window a request may fill, and the only
+/// context figure an integration is told: a local model's loaded one
+/// (see [`local_context_window`]), a `--provider` model's catalog one,
+/// or a pair's larger half (see [`pair_context_window`]); `None` when
+/// none of them is known. codex alone substitutes
+/// [`CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
+/// cannot omit the field.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
@@ -979,7 +976,6 @@ fn launch(
     thinking: Option<&Thinking>,
     variant: Option<&str>,
     vision: bool,
-    context_length: Option<u64>,
     context_window: Option<u64>,
     max_output: Option<u32>,
     extra_args: &[String],
@@ -1027,8 +1023,8 @@ fn launch(
             extra_args,
         ),
         "codex" => launch_codex(model, api_key, vision, context_window, extra_args),
-        "pi" => launch_pi(model, reasons, vision, context_length, extra_args),
-        "omp" => launch_omp(model, reasons, vision, context_length, extra_args),
+        "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
+        "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
@@ -1444,11 +1440,11 @@ fn launch_pi(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
-    write_pi_config(model, reasons, vision, context_length)?;
+    write_pi_config(model, reasons, vision, context_window)?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -1463,12 +1459,12 @@ fn launch_omp(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_omp().ok_or_else(|| anyhow::anyhow!("omp is not installed"))?;
     let server = server();
-    write_omp_config(model, reasons, vision, context_length, &server)?;
+    write_omp_config(model, reasons, vision, context_window, &server)?;
     exec_with_env(
         &bin,
         &omp_args(model, extra_args),
@@ -1528,11 +1524,11 @@ fn write_omp_config(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
     let dir = omp_agent_dir()?;
-    write_omp_config_in_dir(&dir, model, reasons, vision, context_length, server)
+    write_omp_config_in_dir(&dir, model, reasons, vision, context_window, server)
 }
 
 fn write_omp_config_in_dir(
@@ -1540,7 +1536,7 @@ fn write_omp_config_in_dir(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
     write_omp_models_config_at(
@@ -1548,7 +1544,7 @@ fn write_omp_config_in_dir(
         model,
         reasons,
         vision,
-        context_length,
+        context_window,
         server,
     )?;
     write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
@@ -1572,10 +1568,10 @@ fn write_omp_models_config_at(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
-    let entry = pi_model_entry(model, reasons, vision, context_length);
+    let entry = pi_model_entry(model, reasons, vision, context_window);
     write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
@@ -1683,10 +1679,10 @@ fn write_pi_config(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
 ) -> anyhow::Result<()> {
     let dir = pi_agent_dir()?;
-    let entry = pi_model_entry(model, reasons, vision, context_length);
+    let entry = pi_model_entry(model, reasons, vision, context_window);
     write_json_merged(&dir.join("models.json"), "pi", |existing| {
         pi_models_merged(existing, &server(), &entry)
     })?;
@@ -1704,7 +1700,7 @@ fn pi_model_entry(
     model: &str,
     reasons: bool,
     vision: bool,
-    context_length: Option<u64>,
+    context_window: Option<u64>,
 ) -> serde_json::Value {
     let input: &[&str] = if vision {
         &["text", "image"]
@@ -1719,7 +1715,7 @@ fn pi_model_entry(
     if reasons {
         entry["reasoning"] = serde_json::json!(true);
     }
-    if let Some(context) = context_length {
+    if let Some(context) = context_window {
         entry["contextWindow"] = serde_json::json!(context);
     }
     entry
@@ -1906,8 +1902,8 @@ fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
-/// The catalog's `context_window` with neither `LLMMAN_CONTEXT_LENGTH` nor
-/// a trained context; ollama's fallback too.
+/// The catalog's `context_window` where `launch` resolved none at all;
+/// ollama's fallback too.
 const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
 /// What codex compacts against: the window `launch` resolved — live from
@@ -4872,12 +4868,35 @@ defaults:
         assert_eq!(entry["reasoning"], true);
         assert_eq!(entry["contextWindow"], 32768);
 
-        // A text-only model that does not think, and no trained context to
+        // A text-only model that does not think, and no window to
         // declare: pi keeps its own default rather than being told a guess.
         let plain = pi_model_entry("smol", false, false, None);
         assert_eq!(plain["input"], serde_json::json!(["text"]));
         assert_eq!(plain.get("reasoning"), None);
         assert_eq!(plain.get("contextWindow"), None);
+    }
+
+    /// The entry — pi's and omp's alike — carries the window `launch`
+    /// resolved, not the raw trained context. Which file it lands in is
+    /// covered by `write_omp_config_in_dir`'s own tests; this pins where
+    /// the number comes from.
+    #[test]
+    fn pi_model_entry_declares_the_resolved_window_not_the_trained_context() {
+        // A pair's larger half, as `pair_context_window` resolves it —
+        // a figure no trained context could have produced.
+        let pair = pair_context_window(Some(32_768), Some(200_000));
+        assert_eq!(pair, Some(200_000));
+        let entry = pi_model_entry("gemma4", false, false, pair);
+        assert_eq!(entry["contextWindow"], 200_000);
+
+        // And the daemon's clamp travels: a model trained past
+        // DEFAULT_CTX_SIZE is served only the default, so it declares
+        // only the default.
+        let default = u64::from(super::super::serve::DEFAULT_CTX_SIZE);
+        let served = served_context_window(None, Some(1 << 20));
+        assert_eq!(served, Some(default));
+        let entry = pi_model_entry("big", false, false, served);
+        assert_eq!(entry["contextWindow"], default);
     }
 
     #[test]
@@ -5213,9 +5232,11 @@ model = \"gpt-5\"
         assert!(declares_context_window("opencode"));
         assert!(declares_context_window("codex"));
         assert!(declares_context_window("OpenCode"), "matched case-blind");
-        // pi declares a window too, but from the trained context
-        // (`context_length`), which needs no load to read.
-        assert!(!declares_context_window("pi"));
+        // pi and omp write a window into their own model entries too,
+        // so they read the live one back rather than predict it from
+        // the trained context.
+        assert!(declares_context_window("pi"));
+        assert!(declares_context_window("omp"));
         assert!(!declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
     }
