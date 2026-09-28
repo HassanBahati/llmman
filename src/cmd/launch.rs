@@ -288,6 +288,9 @@ fn integration_key() -> String {
 /// which the first request then tries to resolve as a real model id.
 /// goose instead refuses with "Run 'goose configure' first", advice that
 /// does not apply to a launch llmman configures through the environment.
+/// goose-desktop keeps the same environment, so llmman still owns the
+/// provider and endpoint; only the model name would fall back to
+/// `goose configure`'s, and the daemon would be asked for that one.
 /// Grok Build and Cline have hosted defaults of their own; without an
 /// explicit local model they would send those ids to llmman's endpoint
 /// instead.
@@ -302,6 +305,7 @@ const MODEL_REQUIRED: &[&str] = &[
     "dsh",
     "agy",
     "goose",
+    "goose-desktop",
     "grok",
     "cline",
     "pi",
@@ -326,6 +330,10 @@ const MODEL_REQUIRED: &[&str] = &[
 /// `--model` flag at all (its model is the one `write_dsh_settings`
 /// records), so telling a dsh user theirs "wins" would be false, and dsh
 /// rejects the unknown flag on its own.
+/// Not goose-desktop: the `--model` goose documents is `goose run`/
+/// `goose session`'s, and the desktop app has no documented equivalent,
+/// so promising the caller's wins would be false. Move it here if it
+/// turns out to take one.
 const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
@@ -690,6 +698,11 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "goose",
     },
     Integration {
+        name: "goose-desktop",
+        description: "Block goose Desktop",
+        binary: "goose-desktop",
+    },
+    Integration {
         name: "grok",
         description: "Grok Build",
         binary: "grok",
@@ -711,7 +724,7 @@ fn print_integrations() {
             Some(_) => "",
             None => " (not installed)",
         };
-        println!("  {:<12} {}{}", i.name, i.description, how);
+        println!("  {:<14} {}{}", i.name, i.description, how);
     }
     println!(
         "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox <sandbox>]"
@@ -775,6 +788,7 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
         "qwen" => find_qwen(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
         "goose" => find_goose(),
+        "goose-desktop" => find_goose_desktop(),
         "grok" => find_grok(),
         "docker-agent" => find_docker_agent(),
         _ => find_on_path(i.binary),
@@ -857,6 +871,7 @@ const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
     ("gemini", "llmman's Gemini API ignores thinkingConfig"),
     ("agy", "llmman's Gemini API ignores thinkingConfig"),
     ("goose", "it sends effort only for OpenAI's models"),
+    ("goose-desktop", "it sends effort only for OpenAI's models"),
     ("docker-agent", "it ignores thinking_budget here"),
 ];
 
@@ -1040,6 +1055,7 @@ fn launch(
         "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
         "dsh" => launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
+        "goose-desktop" => launch_goose_desktop(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, listed.as_ref(), extra_args),
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
         other => Err(unknown_integration(other)),
@@ -1110,7 +1126,8 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
             .collect(),
         "qwen" => vec![Dir(qwen_home()?)],
         "dsh" => vec![Dir(dsh_config_dir()?)],
-        "goose" => vec![
+        // The desktop app reads the same tree the CLI does.
+        "goose" | "goose-desktop" => vec![
             Dir(config.join("goose")),
             Dir(data.join("goose")),
             Dir(state.join("goose")),
@@ -2873,6 +2890,59 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// goose-desktop: [`launch_goose`]'s environment, pointed at the desktop
+/// app. Configured through the environment alone, so nothing is written
+/// and a `goose configure` provider survives the launch. That the app
+/// reads these as the CLI does is assumed, not verified here.
+fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
+    let bin = find_goose_desktop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "goose-desktop is not installed\n\
+             Install Goose Desktop from https://github.com/aaif-goose/goose, \
+             or run 'llmman launch goose' for the CLI."
+        )
+    })?;
+    let host = server();
+    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+}
+
+fn find_goose_desktop() -> Option<PathBuf> {
+    find_on_path("goose-desktop")
+        .or_else(|| goose_desktop_fallback(&dirs::home_dir()?, env_dir("LOCALAPPDATA")))
+}
+
+/// Where Goose Desktop lands when it is not on `PATH` — which is the
+/// contract, since [`find_on_path`] already covers any install that puts
+/// `goose-desktop` there. A macOS `.app` bundle never is, and
+/// `~/.local/bin` is not always.
+///
+/// Unlike [`goose_fallback`], none of these is verified against a real
+/// install. `is_file` keeps a wrong guess harmless: it falls through to
+/// "not installed" rather than naming something that fails to spawn. The
+/// bundle's inner executable has no one documented name, so both
+/// spellings are tried.
+///
+/// `local_app_data` is `%LOCALAPPDATA%`, read by the caller so this stays
+/// pure — this file sets no environment in tests. `None` falls back to
+/// `home\AppData\Local`, as `find_qwen` and `hermes_home` do.
+fn goose_desktop_fallback(home: &Path, local_app_data: Option<PathBuf>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if cfg!(target_os = "macos") {
+        for root in [PathBuf::from("/Applications"), home.join("Applications")] {
+            let macos = root.join("Goose.app").join("Contents").join("MacOS");
+            candidates.push(macos.join("Goose"));
+            candidates.push(macos.join("goose-desktop"));
+        }
+    }
+    if cfg!(windows) {
+        let local = local_app_data.unwrap_or_else(|| home.join("AppData").join("Local"));
+        candidates.push(local.join("Programs").join("Goose").join("Goose.exe"));
+    } else {
+        candidates.push(home.join(".local").join("bin").join("goose-desktop"));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 // ---------------------------------------------------------------------------
 // cline
 // ---------------------------------------------------------------------------
@@ -4180,6 +4250,97 @@ defaults:
             assert_eq!(goose_fallback(&home.join("nowhere")), None);
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    /// The environment the desktop target hands over. Both launchers call
+    /// `goose_env`, so this pins that its result is still right for the
+    /// desktop app: a `/v1` on the host or a missing key breaks it there
+    /// exactly as it breaks the CLI.
+    #[test]
+    fn goose_desktop_shares_the_cli_environment() {
+        let host = "http://127.0.0.1:17434";
+        let env = goose_env("m", "k", host);
+        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+        assert_eq!(get("GOOSE_MODEL"), Some("m"));
+        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
+        // The bare origin: goose joins OPENAI_BASE_PATH onto it itself,
+        // so a `/v1` here would request /v1/v1/chat/completions.
+        assert_eq!(get("OPENAI_HOST"), Some(host));
+        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    }
+
+    /// Like the CLI, the desktop app carries the key per request and
+    /// writes nothing, so it must be absent from every list that would
+    /// say otherwise, and `--provider` must work.
+    #[test]
+    fn goose_desktop_carries_its_own_key_so_provider_works() {
+        assert!(INTEGRATIONS.iter().any(|i| i.name == "goose-desktop"));
+        assert!(check_provider_supported("goose-desktop").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose-desktop"));
+        assert!(!CONFIGURED_BY_FILE.contains(&"goose-desktop"));
+        // It has no --model of its own to yield to.
+        assert!(!MODEL_FLAG_FORWARDED.contains(&"goose-desktop"));
+        assert!(MODEL_REQUIRED.contains(&"goose-desktop"));
+    }
+
+    /// A GUI install is the one never on `PATH`, so the fallback is what
+    /// finds it. Only the home-relative candidates are exercised: the
+    /// macOS `/Applications` one belongs to the machine, so the test
+    /// stands down when the app is really there.
+    #[test]
+    fn goose_desktop_fallback_finds_the_installers_target() {
+        let system_installed = Path::new("/Applications/Goose.app/Contents/MacOS/Goose").is_file()
+            || Path::new("/Applications/Goose.app/Contents/MacOS/goose-desktop").is_file();
+        if system_installed {
+            eprintln!("skipping: Goose Desktop is really installed in /Applications");
+            return;
+        }
+        let (parts, name): (&[&str], &str) = if cfg!(target_os = "macos") {
+            (&["Applications", "Goose.app", "Contents", "MacOS"], "Goose")
+        } else if cfg!(windows) {
+            (&["AppData", "Local", "Programs", "Goose"], "Goose.exe")
+        } else {
+            (&[".local", "bin"], "goose-desktop")
+        };
+        let home = std::env::temp_dir().join(format!(
+            "llmman-goose-desktop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = parts.iter().fold(home.clone(), |p, part| p.join(part));
+        std::fs::create_dir_all(&dir).unwrap();
+        // None: the default that puts the Windows candidate under this
+        // fake home.
+        assert_eq!(goose_desktop_fallback(&home, None), None);
+        let bin = dir.join(name);
+        // A directory of that name is not the app: returning it would
+        // report Goose Desktop as installed and then fail to spawn.
+        std::fs::create_dir(&bin).unwrap();
+        assert_eq!(goose_desktop_fallback(&home, None), None);
+        std::fs::remove_dir(&bin).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        assert_eq!(goose_desktop_fallback(&home, None), Some(bin.clone()));
+        assert_eq!(goose_desktop_fallback(&home.join("nowhere"), None), None);
+
+        // %LOCALAPPDATA% outside the home, which the literal
+        // home\AppData\Local would miss. Only Windows reads it.
+        let redirected = home.join("redirected");
+        let moved = redirected.join("Programs").join("Goose");
+        std::fs::create_dir_all(&moved).unwrap();
+        let exe = moved.join("Goose.exe");
+        std::fs::write(&exe, "").unwrap();
+        let found = goose_desktop_fallback(&home, Some(redirected));
+        if cfg!(windows) {
+            assert_eq!(found, Some(exe));
+        } else {
+            assert_eq!(found, Some(bin));
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -5858,8 +6019,8 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
     fn every_integration_name_fits_the_listings_column() {
         let longest = INTEGRATIONS.iter().map(|i| i.name.len()).max().unwrap();
         assert!(
-            longest <= 12,
-            "{longest}-character name overflows the `{{:<12}}` column in print_integrations"
+            longest <= 14,
+            "{longest}-character name overflows the `{{:<14}}` column in print_integrations"
         );
     }
 

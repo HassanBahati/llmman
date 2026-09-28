@@ -7,7 +7,9 @@
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
 //! `hermes`,
-//! `openclaw`, `dsh`, `goose`) — not mocks.
+//! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
+//! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
+//! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
 //! three bugs this file's tests were written to catch (see below) only
 //! ever showed up against the real binaries, never in isolation.
@@ -1549,6 +1551,123 @@ fn launch_goose_with_model() {
 /// model can legitimately produce one.
 fn goose_request_failed(stdout: &str) -> bool {
     stdout.contains("Network error:") || stdout.contains("Ran into this error:")
+}
+
+/// `launch goose-desktop` hands the desktop app the same endpoint, model
+/// and key as the CLI, and leaves the user's goose config alone.
+///
+/// The one test here that stubs its binary: Goose Desktop is a GUI with
+/// no headless mode, so a real launch could only ever skip on a CI
+/// runner. The shim records the environment it was given, which is what
+/// the desktop path actually risks getting wrong.
+#[test]
+fn launch_goose_desktop_env() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    warm_model();
+
+    let home = fresh_home("goose-desktop");
+    let shim_dir = home.join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let dump = home.join("env.txt");
+
+    // Hardcoded into the script, so the shim needs nothing from the
+    // environment it is there to record.
+    let shim = if cfg!(windows) {
+        let path = shim_dir.join("goose-desktop.cmd");
+        std::fs::write(
+            &path,
+            format!("@echo off\r\nset > \"{}\"\r\n", dump.display()),
+        )
+        .expect("write shim");
+        path
+    } else {
+        let path = shim_dir.join("goose-desktop");
+        std::fs::write(&path, format!("#!/bin/sh\nenv > '{}'\n", dump.display()))
+            .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+        path
+    };
+    assert!(shim.is_file());
+
+    // Prepended, so `find_on_path("goose-desktop")` reaches the shim
+    // before any real install on this machine.
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![shim_dir.clone()];
+    dirs.extend(std::env::split_paths(&path_var));
+    let new_path = std::env::join_paths(dirs).expect("join PATH");
+
+    let mut cmd = Command::new(llmman_bin());
+    cmd.arg("launch")
+        .arg("goose-desktop")
+        .arg("--model")
+        .arg(MODEL)
+        .env("PATH", new_path)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
+    let output = try_spawn_with_timeout(
+        cmd,
+        TIMEOUT,
+        &format!("`llmman launch goose-desktop --model {MODEL}`"),
+    )
+    .unwrap_or_else(|timed_out| panic!("{}", timed_out.message));
+    assert!(
+        output.status.success(),
+        "launch goose-desktop failed (status: {:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let dumped = std::fs::read_to_string(&dump).expect("shim did not record its environment");
+    let get = |key: &str| {
+        dumped
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .map(str::trim)
+    };
+    assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
+    assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    assert!(
+        get("OPENAI_API_KEY").is_some_and(|k| !k.is_empty()),
+        "no OPENAI_API_KEY in:\n{dumped}"
+    );
+    // llmman resolves the short name before launching (see
+    // `shortnames::resolve_ollama_api`), so this is the resolved
+    // reference, not necessarily MODEL verbatim.
+    assert!(
+        get("GOOSE_MODEL").is_some_and(|m| m.contains(MODEL)),
+        "GOOSE_MODEL does not name {MODEL} in:\n{dumped}"
+    );
+    // The bare origin: a `/v1` here would have goose request
+    // `/v1/v1/chat/completions`.
+    let host = get("OPENAI_HOST").expect("no OPENAI_HOST");
+    assert!(host.starts_with("http"), "OPENAI_HOST is not a URL: {host}");
+    assert!(
+        !host.trim_end_matches('/').ends_with("/v1"),
+        "OPENAI_HOST is a base URL, not a bare origin: {host}"
+    );
+
+    // Nothing persisted: the user's goose provider config is what this
+    // target promises to leave alone.
+    let config = home.join(".config").join("goose");
+    assert!(
+        !config.join("config.yaml").exists(),
+        "launch goose-desktop wrote {}",
+        config.join("config.yaml").display()
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the

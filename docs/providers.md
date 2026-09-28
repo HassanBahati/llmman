@@ -189,6 +189,7 @@ installed:
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `goose` | Block goose | yes |
+| `goose-desktop` | Block goose Desktop (requires `--model`) | yes |
 | `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
 | `docker-agent` | Docker Agent (requires `--model`) | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
@@ -255,8 +256,9 @@ own form, still changeable from inside:
 | `dsh` | its route | all |
 
 `thinking` goes to all but opencode as `medium`, which llmman serves as
-thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose` and
-`docker-agent` cannot carry a variant here, so they refuse one.
+thinking on. `kimi`, `openclaw`, `gemini`, `agy`, `goose`,
+`goose-desktop` and `docker-agent` cannot carry a variant here, so they
+refuse one.
 
 ## Wire formats
 
