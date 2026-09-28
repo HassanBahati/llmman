@@ -1574,20 +1574,37 @@ fn launch_goose_desktop_env() {
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
     let dump = home.join("env.txt");
 
-    // Hardcoded into the script, so the shim needs nothing from the
-    // environment it is there to record.
+    // Only the variables under test are recorded, never the whole
+    // environment: this inherits the runner's, and a failing assertion
+    // below prints what it read. The dump path is hardcoded into the
+    // script, so the shim needs nothing from the environment it records.
     let shim = if cfg!(windows) {
         let path = shim_dir.join("goose-desktop.cmd");
+        let d = dump.display();
         std::fs::write(
             &path,
-            format!("@echo off\r\nset > \"{}\"\r\n", dump.display()),
+            format!(
+                "@echo off\r\n\
+                 set GOOSE_ > \"{d}\" 2>nul\r\n\
+                 set OPENAI_ >> \"{d}\" 2>nul\r\n\
+                 set OLLAMA_HOST >> \"{d}\" 2>nul\r\n\
+                 exit /b 0\r\n"
+            ),
         )
         .expect("write shim");
         path
     } else {
         let path = shim_dir.join("goose-desktop");
-        std::fs::write(&path, format!("#!/bin/sh\nenv > '{}'\n", dump.display()))
-            .expect("write shim");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 env | grep -E '^(GOOSE_|OPENAI_|OLLAMA_HOST=)' > '{}'\n\
+                 exit 0\n",
+                dump.display()
+            ),
+        )
+        .expect("write shim");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1597,6 +1614,14 @@ fn launch_goose_desktop_env() {
         path
     };
     assert!(shim.is_file());
+
+    // A configuration the user already has. Seeded rather than left
+    // absent: an empty home only proves nothing was created, not that an
+    // existing provider survives, which is what this target promises.
+    let goose_config = home.join(".config").join("goose");
+    std::fs::create_dir_all(&goose_config).expect("create goose config dir");
+    std::fs::write(goose_config.join("config.yaml"), GOOSE_CONFIG_SENTINEL)
+        .expect("seed goose config");
 
     // Prepended, so `find_on_path("goose-desktop")` reaches the shim
     // before any real install on this machine.
@@ -1630,45 +1655,84 @@ fn launch_goose_desktop_env() {
     );
 
     let dumped = std::fs::read_to_string(&dump).expect("shim did not record its environment");
+    // Read before the assertions, so a failing one cannot leave the
+    // recorded values on disk.
+    let config_after = std::fs::read_to_string(goose_config.join("config.yaml")).ok();
+    let mut left_in_config: Vec<String> = std::fs::read_dir(&goose_config)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    left_in_config.sort();
+    let _ = std::fs::remove_dir_all(&home);
+
     let get = |key: &str| {
         dumped
             .lines()
             .find_map(|l| l.strip_prefix(&format!("{key}=")))
             .map(str::trim)
     };
+    // What a failure is allowed to print: the key's value is llmman's to
+    // hand out, not this log's to carry.
+    let shown = dumped
+        .lines()
+        .map(|l| match l.split_once('=') {
+            Some((k, _)) if k.ends_with("API_KEY") => format!("{k}=<redacted>"),
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
     assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
     assert!(
         get("OPENAI_API_KEY").is_some_and(|k| !k.is_empty()),
-        "no OPENAI_API_KEY in:\n{dumped}"
+        "no OPENAI_API_KEY in:\n{shown}"
     );
     // llmman resolves the short name before launching (see
     // `shortnames::resolve_ollama_api`), so this is the resolved
     // reference, not necessarily MODEL verbatim.
     assert!(
         get("GOOSE_MODEL").is_some_and(|m| m.contains(MODEL)),
-        "GOOSE_MODEL does not name {MODEL} in:\n{dumped}"
+        "GOOSE_MODEL does not name {MODEL} in:\n{shown}"
     );
-    // The bare origin: a `/v1` here would have goose request
-    // `/v1/v1/chat/completions`.
+    // Scheme and authority only: goose appends OPENAI_BASE_PATH, so a
+    // `/v1` here would request `/v1/v1/chat/completions`, and any other
+    // path, query or fragment lands somewhere the daemon does not serve.
+    // Checked structurally — rejecting `/v1` alone lets the rest past.
     let host = get("OPENAI_HOST").expect("no OPENAI_HOST");
-    assert!(host.starts_with("http"), "OPENAI_HOST is not a URL: {host}");
+    let authority = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .unwrap_or_else(|| panic!("OPENAI_HOST is not an http(s) URL: {host}"));
     assert!(
-        !host.trim_end_matches('/').ends_with("/v1"),
-        "OPENAI_HOST is a base URL, not a bare origin: {host}"
+        // A lone trailing slash still names the origin; anything after
+        // it does not.
+        !authority.trim_end_matches('/').contains(['/', '?', '#']),
+        "OPENAI_HOST is not a bare origin: {host}"
     );
 
-    // Nothing persisted: the user's goose provider config is what this
-    // target promises to leave alone.
-    let config = home.join(".config").join("goose");
-    assert!(
-        !config.join("config.yaml").exists(),
-        "launch goose-desktop wrote {}",
-        config.join("config.yaml").display()
+    // Byte-identical, and alone: a launch that rewrote, replaced or
+    // deleted the provider the user configured — or left a `.bak` beside
+    // it, as the file-configured targets do — fails here.
+    assert_eq!(
+        config_after.as_deref(),
+        Some(GOOSE_CONFIG_SENTINEL),
+        "launch goose-desktop changed the user's config.yaml"
     );
-
-    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(
+        left_in_config,
+        ["config.yaml"],
+        "launch goose-desktop left files in ~/.config/goose"
+    );
 }
+
+/// Seeded into the test's `~/.config/goose/config.yaml`: a provider that
+/// is not llmman, so a launch that honored the file instead of the
+/// environment would also be visible in `GOOSE_PROVIDER`.
+const GOOSE_CONFIG_SENTINEL: &str = "GOOSE_PROVIDER: anthropic\nGOOSE_MODEL: claude-sonnet-4\n";
 
 /// Verifies `daemon::ensure_server`'s fast-fail path end to end: when the
 /// auto-spawned `llmman serve` dies during startup, the client command

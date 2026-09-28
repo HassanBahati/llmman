@@ -1126,12 +1126,31 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
             .collect(),
         "qwen" => vec![Dir(qwen_home()?)],
         "dsh" => vec![Dir(dsh_config_dir()?)],
-        // The desktop app reads the same tree the CLI does.
-        "goose" | "goose-desktop" => vec![
-            Dir(config.join("goose")),
-            Dir(data.join("goose")),
-            Dir(state.join("goose")),
-        ],
+        // The desktop app drives the same goose, so it reads the same
+        // tree, and keeps Electron `userData` beside it under the
+        // bundle's name — a separate directory wherever the filesystem
+        // tells `Goose` and `goose` apart.
+        "goose" | "goose-desktop" => {
+            let mut dirs = vec![
+                Dir(config.join("goose")),
+                Dir(data.join("goose")),
+                Dir(state.join("goose")),
+            ];
+            if name == "goose-desktop" {
+                dirs.push(Dir(if cfg!(target_os = "macos") {
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("Goose")
+                } else if cfg!(windows) {
+                    env_dir("APPDATA")
+                        .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+                        .join("Goose")
+                } else {
+                    config.join("Goose")
+                }));
+            }
+            dirs
+        }
         "grok" => vec![Dir(grok_home()?)],
         "docker-agent" => vec![Dir(docker_agent_config_dir()?), Dir(home.join(".cagent"))],
         other => return Err(unknown_integration(other)),
@@ -2892,8 +2911,17 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
 
 /// goose-desktop: [`launch_goose`]'s environment, pointed at the desktop
 /// app. Configured through the environment alone, so nothing is written
-/// and a `goose configure` provider survives the launch. That the app
-/// reads these as the CLI does is assumed, not verified here.
+/// and a `goose configure` provider survives the launch.
+///
+/// Verified against Goose Desktop 1.52.0: the launched process carries
+/// these variables, a prompt typed into it reaches the daemon, and
+/// neither the launch nor the conversation touches `~/.config/goose`.
+///
+/// 1.52.0 holds no single-instance lock on macOS — two launches make two
+/// processes, each with the environment it was given. Untested on
+/// Windows and Linux, where an app that did hold one would hand this
+/// launch to the running copy and exit, leaving that copy on its own
+/// environment while this returns success.
 fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_goose_desktop().ok_or_else(|| {
         anyhow::anyhow!(
@@ -2906,39 +2934,48 @@ fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> an
     exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
 }
 
+/// `goose-desktop` is the name this integration is specified against;
+/// `goose-gui` is the symlink `BUILDING_LINUX.md` installs. Never a bare
+/// `Goose`: on a case-insensitive filesystem it resolves to the `goose`
+/// CLI — as it does on macOS — and launching the CLI in place of the app
+/// is the mistake upstream's own desktop entry made (block/goose#4079).
 fn find_goose_desktop() -> Option<PathBuf> {
     find_on_path("goose-desktop")
-        .or_else(|| goose_desktop_fallback(&dirs::home_dir()?, env_dir("LOCALAPPDATA")))
+        .or_else(|| find_on_path("goose-gui"))
+        .or_else(|| goose_desktop_fallback(&dirs::home_dir()?))
 }
 
-/// Where Goose Desktop lands when it is not on `PATH` — which is the
-/// contract, since [`find_on_path`] already covers any install that puts
-/// `goose-desktop` there. A macOS `.app` bundle never is, and
-/// `~/.local/bin` is not always.
+/// Where Goose Desktop lands when it is not on `PATH`: a macOS `.app`
+/// bundle never is, and `~/.local/bin` is not always.
 ///
-/// Unlike [`goose_fallback`], none of these is verified against a real
-/// install. `is_file` keeps a wrong guess harmless: it falls through to
-/// "not installed" rather than naming something that fails to spawn. The
-/// bundle's inner executable has no one documented name, so both
-/// spellings are tried.
+/// The bundle is verified against 1.52.0, whose `CFBundleExecutable` is
+/// `Goose`; the Linux path is the `.deb`'s. `is_file` keeps a wrong one
+/// harmless, falling through to "not installed" rather than naming
+/// something that fails to spawn.
 ///
-/// `local_app_data` is `%LOCALAPPDATA%`, read by the caller so this stays
-/// pure — this file sets no environment in tests. `None` falls back to
-/// `home\AppData\Local`, as `find_qwen` and `hermes_home` do.
-fn goose_desktop_fallback(home: &Path, local_app_data: Option<PathBuf>) -> Option<PathBuf> {
+/// Windows is not probed at all: upstream ships a zip with no installer,
+/// so an install is wherever it was unpacked — `PATH` or nothing.
+fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if cfg!(target_os = "macos") {
         for root in [PathBuf::from("/Applications"), home.join("Applications")] {
-            let macos = root.join("Goose.app").join("Contents").join("MacOS");
-            candidates.push(macos.join("Goose"));
-            candidates.push(macos.join("goose-desktop"));
+            candidates.push(
+                root.join("Goose.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join("Goose"),
+            );
         }
     }
-    if cfg!(windows) {
-        let local = local_app_data.unwrap_or_else(|| home.join("AppData").join("Local"));
-        candidates.push(local.join("Programs").join("Goose").join("Goose.exe"));
-    } else {
+    if !cfg!(windows) {
         candidates.push(home.join(".local").join("bin").join("goose-desktop"));
+    }
+    if cfg!(target_os = "linux") {
+        // The .deb's GUI binary, capital G beside the lowercase CLI.
+        // Not the manual `/opt/goose` unpack: its executable is spelled
+        // `goose`, so a CLI left there would be launched in place of the
+        // app, and that install's own `goose-gui` symlink is on `PATH`.
+        candidates.push(PathBuf::from("/usr/lib/goose/Goose"));
     }
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -4270,6 +4307,24 @@ defaults:
         assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
     }
 
+    /// The desktop app keeps Electron state the CLI has none of, and
+    /// `--sandbox` has to let it write there: `userData`, named for the
+    /// bundle (`Goose`) rather than the CLI. Without it a sandboxed run
+    /// starts blank every time.
+    #[test]
+    fn goose_desktop_sandbox_state_covers_the_electron_user_data() {
+        let desktop = sandbox_state("goose-desktop").unwrap();
+        let cli = sandbox_state("goose").unwrap();
+        assert_eq!(desktop.len(), cli.len() + 1);
+        assert!(
+            desktop.iter().any(|s| matches!(
+                s,
+                sandbox::State::Dir(d) if d.file_name() == Some(std::ffi::OsStr::new("Goose"))
+            )),
+            "no userData directory in {desktop:?}"
+        );
+    }
+
     /// Like the CLI, the desktop app carries the key per request and
     /// writes nothing, so it must be absent from every list that would
     /// say otherwise, and `--provider` must work.
@@ -4285,21 +4340,36 @@ defaults:
     }
 
     /// A GUI install is the one never on `PATH`, so the fallback is what
-    /// finds it. Only the home-relative candidates are exercised: the
-    /// macOS `/Applications` one belongs to the machine, so the test
-    /// stands down when the app is really there.
+    /// finds it: the real app when this machine has one, a fake home
+    /// otherwise — never both, since a machine-absolute candidate
+    /// outranks anything under a home.
     #[test]
     fn goose_desktop_fallback_finds_the_installers_target() {
-        let system_installed = Path::new("/Applications/Goose.app/Contents/MacOS/Goose").is_file()
-            || Path::new("/Applications/Goose.app/Contents/MacOS/goose-desktop").is_file();
-        if system_installed {
-            eprintln!("skipping: Goose Desktop is really installed in /Applications");
+        // A real install is the better test: assert the fallback finds
+        // it rather than skip. Every machine-absolute candidate counts,
+        // not just the macOS one.
+        let installed = [
+            "/Applications/Goose.app/Contents/MacOS/Goose",
+            "/usr/lib/goose/Goose",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.is_file());
+        if let Some(installed) = installed {
+            assert_eq!(
+                goose_desktop_fallback(Path::new("/nonexistent")),
+                Some(installed.to_path_buf())
+            );
+            return;
+        }
+        // Windows has no installer and so no candidate to exercise: an
+        // unpacked zip is found on `PATH` or not at all.
+        if cfg!(windows) {
+            assert_eq!(goose_desktop_fallback(Path::new("/nonexistent")), None);
             return;
         }
         let (parts, name): (&[&str], &str) = if cfg!(target_os = "macos") {
             (&["Applications", "Goose.app", "Contents", "MacOS"], "Goose")
-        } else if cfg!(windows) {
-            (&["AppData", "Local", "Programs", "Goose"], "Goose.exe")
         } else {
             (&[".local", "bin"], "goose-desktop")
         };
@@ -4313,32 +4383,16 @@ defaults:
         ));
         let dir = parts.iter().fold(home.clone(), |p, part| p.join(part));
         std::fs::create_dir_all(&dir).unwrap();
-        // None: the default that puts the Windows candidate under this
-        // fake home.
-        assert_eq!(goose_desktop_fallback(&home, None), None);
+        assert_eq!(goose_desktop_fallback(&home), None);
         let bin = dir.join(name);
         // A directory of that name is not the app: returning it would
         // report Goose Desktop as installed and then fail to spawn.
         std::fs::create_dir(&bin).unwrap();
-        assert_eq!(goose_desktop_fallback(&home, None), None);
+        assert_eq!(goose_desktop_fallback(&home), None);
         std::fs::remove_dir(&bin).unwrap();
         std::fs::write(&bin, "").unwrap();
-        assert_eq!(goose_desktop_fallback(&home, None), Some(bin.clone()));
-        assert_eq!(goose_desktop_fallback(&home.join("nowhere"), None), None);
-
-        // %LOCALAPPDATA% outside the home, which the literal
-        // home\AppData\Local would miss. Only Windows reads it.
-        let redirected = home.join("redirected");
-        let moved = redirected.join("Programs").join("Goose");
-        std::fs::create_dir_all(&moved).unwrap();
-        let exe = moved.join("Goose.exe");
-        std::fs::write(&exe, "").unwrap();
-        let found = goose_desktop_fallback(&home, Some(redirected));
-        if cfg!(windows) {
-            assert_eq!(found, Some(exe));
-        } else {
-            assert_eq!(found, Some(bin));
-        }
+        assert_eq!(goose_desktop_fallback(&home), Some(bin));
+        assert_eq!(goose_desktop_fallback(&home.join("nowhere")), None);
 
         let _ = std::fs::remove_dir_all(&home);
     }

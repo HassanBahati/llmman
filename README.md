@@ -305,8 +305,10 @@ and `globalState.json`, honouring `CLINE_DIR` like Cline does.
 with the same endpoint, model and key. Each is configured entirely through
 the environment goose reads in preference to its own config, so neither
 writes to `~/.config/goose` and your `goose configure` provider survives
-the launch. `goose-desktop` is found on `PATH`, and otherwise where the
-platform's installer puts it.
+the launch. `goose-desktop` is found on `PATH` as `goose-desktop` or
+`goose-gui`, otherwise in `/Applications` on macOS and `/usr/lib/goose` on
+Linux. Windows ships as a zip with no installer, so put the unpacked app on
+`PATH`.
 
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own
