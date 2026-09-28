@@ -749,6 +749,15 @@ const WINDOWS_PATH_EXTS: &[&str] = &["exe", "cmd", "bat"];
 /// Under an image-based `--sandbox` the image's copy runs, found on the
 /// image's `PATH`, so this machine need not have one.
 fn find_on_path(binary: &str) -> Option<PathBuf> {
+    find_on_path_unless(binary, |_| false)
+}
+
+/// [`find_on_path`], skipping matches `reject` returns true for and
+/// carrying on down `PATH` rather than stopping at the first. No
+/// platform tells goose's two binaries apart by name — the desktop zip's
+/// is `Goose.exe` on Windows, `goose` elsewhere — so each has to refuse
+/// the other, and the one wanted may sit in a later directory.
+fn find_on_path_unless(binary: &str, reject: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     if sandbox::runs_from_image() {
         return Some(PathBuf::from(binary));
     }
@@ -757,13 +766,13 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
         if cfg!(windows) {
             for ext in WINDOWS_PATH_EXTS {
                 let candidate = dir.join(format!("{binary}.{ext}"));
-                if candidate.is_file() {
+                if candidate.is_file() && !reject(&candidate) {
                     return Some(candidate);
                 }
             }
         } else {
             let candidate = dir.join(binary);
-            if candidate.is_file() {
+            if candidate.is_file() && !reject(&candidate) {
                 return Some(candidate);
             }
         }
@@ -2888,8 +2897,12 @@ fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a st
     env
 }
 
+/// The CLI, never the desktop app standing in for it: the unpacked zip's
+/// executable answers to this name too — exactly on Linux, by case
+/// elsewhere — and handing the GUI `goose run`'s arguments is
+/// block/goose#4079 the other way round.
 fn find_goose() -> Option<PathBuf> {
-    find_on_path("goose").or_else(|| goose_fallback(&dirs::home_dir()?))
+    find_on_path_unless("goose", is_electron_bundle).or_else(|| goose_fallback(&dirs::home_dir()?))
 }
 
 /// goose's own installer target: `download_cli.sh` writes to
@@ -2942,7 +2955,26 @@ fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> an
 fn find_goose_desktop() -> Option<PathBuf> {
     find_on_path("goose-desktop")
         .or_else(|| find_on_path("goose-gui"))
+        .or_else(goose_exe_on_path)
         .or_else(|| goose_desktop_fallback(&dirs::home_dir()?))
+}
+
+/// The Windows zip unpacks to `Goose.exe` and upstream ships no
+/// installer, so a directory on `PATH` is the only way to reach it.
+/// Windows reads that name and the CLI's `goose.exe` as one, so a match
+/// counts only where the Electron bundle sits beside it.
+fn goose_exe_on_path() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    find_on_path_unless("Goose", |exe| !is_electron_bundle(exe))
+}
+
+/// Whether `exe` is the unpacked Electron app rather than a same-named
+/// binary: the packager writes `resources/app.asar` beside it.
+fn is_electron_bundle(exe: &Path) -> bool {
+    exe.parent()
+        .is_some_and(|dir| dir.join("resources").join("app.asar").is_file())
 }
 
 /// Where Goose Desktop lands when it is not on `PATH`: a macOS `.app`
@@ -2953,8 +2985,9 @@ fn find_goose_desktop() -> Option<PathBuf> {
 /// harmless, falling through to "not installed" rather than naming
 /// something that fails to spawn.
 ///
-/// Windows is not probed at all: upstream ships a zip with no installer,
-/// so an install is wherever it was unpacked — `PATH` or nothing.
+/// Windows has no path to probe: upstream ships a zip with no
+/// installer, so an install is wherever it was unpacked, and
+/// [`goose_exe_on_path`] is what finds it there.
 fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if cfg!(target_os = "macos") {
@@ -4305,6 +4338,71 @@ defaults:
         // so a `/v1` here would request /v1/v1/chat/completions.
         assert_eq!(get("OPENAI_HOST"), Some(host));
         assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    }
+
+    /// `Goose.exe` and the CLI's `goose.exe` are one name to Windows, so
+    /// the bundle beside it is what tells them apart. Get this wrong and
+    /// `launch goose-desktop` starts the CLI — block/goose#4079 again.
+    #[test]
+    fn only_an_electron_bundle_counts_as_the_desktop_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-goose-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("Goose.exe");
+        std::fs::write(&exe, "").unwrap();
+        // A bare executable is the CLI as far as this can tell.
+        assert!(!is_electron_bundle(&exe));
+        let resources = dir.join("resources");
+        std::fs::create_dir(&resources).unwrap();
+        // The directory alone is not the bundle either.
+        assert!(!is_electron_bundle(&exe));
+        std::fs::write(resources.join("app.asar"), "").unwrap();
+        assert!(is_electron_bundle(&exe));
+        // Never consulted off Windows, where the CLI owns the name.
+        if !cfg!(windows) {
+            assert_eq!(goose_exe_on_path(), None);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The predicate has to be able to veto, or `find_goose`'s refusal of
+    /// the desktop app is decoration. A rejected match must also leave
+    /// `find_on_path` as it was: it passes `|_| false`, so every other
+    /// integration still resolves exactly as before this predicate
+    /// existed.
+    #[test]
+    fn find_on_path_unless_consults_its_predicate() {
+        // Any binary this machine really has, so there is a match for
+        // the predicate to veto.
+        let present = ["cargo", "sh", "cmd"]
+            .into_iter()
+            .find(|b| find_on_path(b).is_some());
+        let Some(present) = present else {
+            eprintln!("skipping: no known binary on PATH to test against");
+            return;
+        };
+        let found = find_on_path(present).unwrap();
+        assert!(found.is_file());
+        // Vetoing everything finds nothing, whatever is on PATH.
+        assert_eq!(find_on_path_unless(present, |_| true), None);
+        // Vetoing only what was not found leaves that result standing.
+        assert_eq!(
+            find_on_path_unless(present, |p| p != found),
+            Some(found.clone())
+        );
+        // A name nothing answers to stays unfound, predicate or not.
+        assert_eq!(find_on_path("llmman-no-such-binary-xyz"), None);
+        assert_eq!(
+            find_on_path_unless("llmman-no-such-binary-xyz", |_| false),
+            None
+        );
     }
 
     /// The desktop app keeps Electron state the CLI has none of, and
@@ -6065,10 +6163,10 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"docker-agent"));
     }
 
-    /// `print_integrations` pads each name into a 12-wide column and
+    /// `print_integrations` pads each name into a 14-wide column and
     /// prints a space after it, so every description starts at the same
-    /// place — including "docker-agent", which fills the column exactly.
-    /// A longer name would push its own description right instead.
+    /// place — including "goose-desktop", the longest at 13. A longer
+    /// name would push its own description right instead.
     #[test]
     fn every_integration_name_fits_the_listings_column() {
         let longest = INTEGRATIONS.iter().map(|i| i.name.len()).max().unwrap();
