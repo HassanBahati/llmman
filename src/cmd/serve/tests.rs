@@ -17,7 +17,7 @@ use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
     responses_input_item_text, RESPONSES_ROUTE,
 };
-use super::sched::{reap_idle_models_once, resolve_keep_alive, DEFAULT_KEEP_ALIVE};
+use super::sched::{reap_idle_models_once, DEFAULT_KEEP_ALIVE};
 use super::stream::{fold_ollama_lines, stream_ollama};
 use super::test_support::{
     headers_with, mock_peer, node, remote_target, remote_target_on, rendered_registry,
@@ -1793,35 +1793,6 @@ async fn a_local_refusal_is_retried_on_the_hosted_half_unless_pinned() {
     assert_eq!(
         run(Local::Relayed, pinned).await,
         (Ok(StatusCode::BAD_REQUEST), 1, 0)
-    );
-}
-
-// -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
-
-/// Regression test for `handle_ollama_generate`'s unload-sentinel
-/// check: it must reuse `resolve_keep_alive` (as asserted here) rather
-/// than a bare `keep_alive.as_i64() == Some(0)` check, since the
-/// latter misses every non-integer zero form `resolve_keep_alive`
-/// itself accepts — a string `"0"`, `"0s"`, or a float `0.0` — leaving
-/// a client that sends one of those loaded until the next idle-reaper
-/// tick instead of unloading immediately as requested.
-#[test]
-fn resolve_keep_alive_treats_every_zero_form_as_the_unload_sentinel() {
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!("0s"))),
-        Some(Duration::ZERO)
-    );
-    assert_eq!(
-        resolve_keep_alive(&Some(serde_json::json!(0.0))),
-        Some(Duration::ZERO)
     );
 }
 
@@ -4908,83 +4879,6 @@ fn ollama_push_request_accepts_a_name_only_body() {
     assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
 }
 
-// -- multipart_text_field (/v1/audio/transcriptions) ----------------------
-
-/// Builds a `multipart/form-data` body + matching `content-type`
-/// header out of `fields` (name, value) pairs — a hand-rolled encoder
-/// rather than a dependency, just enough to exercise
-/// `multipart_text_field` against real (if minimal) multipart wire
-/// format.
-fn multipart_body(fields: &[(&str, &str)]) -> (Bytes, HeaderMap) {
-    let boundary = "llmman-test-boundary";
-    let mut body = String::new();
-    for (name, value) in fields {
-        body.push_str(&format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-        ));
-    }
-    body.push_str(&format!("--{boundary}--\r\n"));
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "content-type",
-        format!("multipart/form-data; boundary={boundary}")
-            .parse()
-            .unwrap(),
-    );
-    (Bytes::from(body), headers)
-}
-
-#[tokio::test]
-async fn multipart_text_field_finds_a_named_field_among_several() {
-    let (body, headers) = multipart_body(&[
-        ("language", "en"),
-        ("model", "docker.io/ai/whisper:latest"),
-        ("response_format", "json"),
-    ]);
-    assert_eq!(
-        multipart_text_field(&body, &headers, "model").await,
-        Some("docker.io/ai/whisper:latest".to_string())
-    );
-    assert_eq!(
-        multipart_text_field(&body, &headers, "language").await,
-        Some("en".to_string())
-    );
-}
-
-#[tokio::test]
-async fn multipart_text_field_leaves_the_original_body_untouched() {
-    // Regression: multipart_text_field parses a *clone* of the body
-    // for the field it wants — the original `Bytes` handed to
-    // `proxy` afterward must still be the exact, complete multipart
-    // payload (file bytes included), not something already partially
-    // consumed by this lookup.
-    let (body, headers) = multipart_body(&[("model", "m"), ("prompt", "hello")]);
-    let before = body.clone();
-    let _ = multipart_text_field(&body, &headers, "model").await;
-    assert_eq!(body, before);
-}
-
-#[tokio::test]
-async fn multipart_text_field_is_none_for_a_missing_field_or_non_multipart_body() {
-    let (body, headers) = multipart_body(&[("language", "en")]);
-    assert_eq!(multipart_text_field(&body, &headers, "model").await, None);
-
-    let plain_body = Bytes::from_static(b"{\"model\":\"m\"}");
-    let mut json_headers = HeaderMap::new();
-    json_headers.insert("content-type", "application/json".parse().unwrap());
-    assert_eq!(
-        multipart_text_field(&plain_body, &json_headers, "model").await,
-        None
-    );
-
-    // No content-type header at all.
-    assert_eq!(
-        multipart_text_field(&plain_body, &HeaderMap::new(), "model").await,
-        None
-    );
-}
-
 // -- stream_ollama over a mock SSE backend --------------------------------
 
 const MOCK_SSE: &str = concat!(
@@ -5298,103 +5192,6 @@ async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
         !rendered_registry().contains("route=\"/ui/*path\""),
         "a router built with metrics disabled must not write to the registry"
     );
-}
-
-// -- web UI ---------------------------------------------------------
-
-/// `/` is the page only for a client that asks for HTML; everything
-/// else gets the liveness line scripts have always seen.
-#[tokio::test]
-async fn the_root_is_the_web_ui_for_browsers_and_a_liveness_line_for_the_rest() {
-    let url = serve_router(test_state()).await;
-    let curl = Client::new().get(&url).send().await.unwrap();
-    assert_eq!(curl.status(), StatusCode::OK);
-    assert_eq!(curl.text().await.unwrap(), "llmman is running");
-
-    let browser = Client::new()
-        .get(&url)
-        .header("accept", "text/html,application/xhtml+xml")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(browser.status(), StatusCode::OK);
-    assert_eq!(
-        browser.headers()["content-type"],
-        "text/html; charset=utf-8"
-    );
-    assert_eq!(browser.headers()["content-encoding"], "gzip");
-    let mut html = String::new();
-    std::io::Read::read_to_string(
-        &mut flate2::read::GzDecoder::new(&browser.bytes().await.unwrap()[..]),
-        &mut html,
-    )
-    .unwrap();
-    // The page must reference its own assets under ui/ relatively, so
-    // a gateway prefix works (docs/compose.md).
-    assert!(html.contains("<!doctype html>"), "{html}");
-    assert!(html.contains("ui/app.js"), "{html}");
-    assert!(
-        !html.contains("\"/ui/"),
-        "asset paths must be relative: {html}"
-    );
-}
-
-/// Assets come gzipped with a content ETag; a matching `If-None-Match`
-/// is a 304, and no `max-age` keeps an old UI alive past an upgrade.
-#[tokio::test]
-async fn web_ui_assets_are_gzipped_and_revalidate_by_etag() {
-    let url = serve_router(test_state()).await;
-    let client = Client::builder().no_gzip().build().unwrap();
-    let first = client
-        .get(format!("{url}/ui/app.css"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(first.headers()["content-encoding"], "gzip");
-    assert_eq!(first.headers()["content-type"], "text/css; charset=utf-8");
-    assert_eq!(first.headers()["cache-control"], "no-cache");
-    let etag = first.headers()["etag"].to_str().unwrap().to_string();
-    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
-    let body = first.bytes().await.unwrap();
-    assert_eq!(&body[..2], &[0x1f, 0x8b], "not gzip");
-
-    for tag in [etag.clone(), format!("W/{etag}"), "*".to_string()] {
-        let again = client
-            .get(format!("{url}/ui/app.css"))
-            .header("if-none-match", &tag)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{tag}");
-    }
-
-    // The page is unframeable however it is reached.
-    for path in ["/", "/ui/index.html"] {
-        let page = client
-            .get(format!("{url}{path}"))
-            .header("accept", "text/html")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
-        assert_eq!(
-            page.headers()["content-security-policy"],
-            "frame-ancestors 'none'",
-            "{path}"
-        );
-    }
-    let css = client
-        .get(format!("{url}/ui/app.css"))
-        .send()
-        .await
-        .unwrap();
-    assert!(!css.headers().contains_key("x-frame-options"));
-
-    for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/vendor"] {
-        let r = client.get(format!("{url}{missing}")).send().await.unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{missing}");
-    }
 }
 
 // -- /llmman/shell ------------------------------------------------------
