@@ -1157,6 +1157,15 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
                 } else {
                     config.join("Goose")
                 }));
+                // macOS keeps the app's preferences outside `userData`,
+                // under the bundle id `Goose.app` 1.52.0 declares.
+                if cfg!(target_os = "macos") {
+                    dirs.push(Files(
+                        home.join("Library")
+                            .join("Preferences")
+                            .join("com.electron.goose.plist"),
+                    ));
+                }
             }
             dirs
         }
@@ -2983,6 +2992,10 @@ fn goose_exe_on_path() -> Option<PathBuf> {
 /// by symlinking it into a `bin` directory, where nothing sits beside
 /// the link. A path that will not resolve falls back to its literal
 /// parent, which is where a bundle reached directly keeps these anyway.
+///
+/// Keyed on `app.asar`, which every packaging so far produces. A build
+/// with asar off keeps `resources/app/` instead, and would read as the
+/// CLI here — check for both if upstream ever ships one.
 fn is_electron_bundle(exe: &Path) -> bool {
     let resolved = std::fs::canonicalize(exe);
     let Some(dir) = resolved.as_deref().unwrap_or(exe).parent() else {
@@ -3024,7 +3037,11 @@ fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
         }
     }
     if !cfg!(windows) {
-        candidates.push(home.join(".local").join("bin").join("goose-desktop"));
+        // `goose-gui` as well: that is the name `BUILDING_LINUX.md`
+        // symlinks, and a `PATH` without `~/.local/bin` never sees it.
+        for name in ["goose-desktop", "goose-gui"] {
+            candidates.push(home.join(".local").join("bin").join(name));
+        }
     }
     if cfg!(target_os = "linux") {
         // The .deb's GUI binary, capital G beside the lowercase CLI.
@@ -4483,7 +4500,8 @@ defaults:
     fn goose_desktop_sandbox_state_covers_the_electron_user_data() {
         let desktop = sandbox_state("goose-desktop").unwrap();
         let cli = sandbox_state("goose").unwrap();
-        assert_eq!(desktop.len(), cli.len() + 1);
+        // Everything the CLI gets, and then what only the app keeps.
+        assert!(desktop.len() > cli.len(), "{desktop:?}");
         assert!(
             desktop.iter().any(|s| matches!(
                 s,
@@ -4491,6 +4509,16 @@ defaults:
             )),
             "no userData directory in {desktop:?}"
         );
+        // macOS keeps preferences outside `userData`, as a file.
+        if cfg!(target_os = "macos") {
+            assert!(
+                desktop.iter().any(|s| matches!(
+                    s,
+                    sandbox::State::Files(f) if f.extension() == Some(std::ffi::OsStr::new("plist"))
+                )),
+                "no preferences file in {desktop:?}"
+            );
+        }
     }
 
     /// Like the CLI, the desktop app carries the key per request and
@@ -4509,8 +4537,8 @@ defaults:
 
     /// A GUI install is the one never on `PATH`, so the fallback is what
     /// finds it: the real app when this machine has one, a fake home
-    /// otherwise — never both, since a machine-absolute candidate
-    /// outranks anything under a home.
+    /// otherwise, since a fake home cannot outrank an install the
+    /// machine really has at an absolute path.
     #[test]
     fn goose_desktop_fallback_finds_the_installers_target() {
         // A real install is the better test: assert the fallback finds

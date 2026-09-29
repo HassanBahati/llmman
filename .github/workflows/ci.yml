@@ -709,7 +709,11 @@ jobs:
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 14*30 + 10 = 430 min. Exhausting
+    # tests (guarded by WARM's own Once). 14*30 + 10 = 430 min.
+    # `launch_goose_desktop_env` runs serialized with them but multiplies
+    # by nothing: its shim exits at once, so it carries a single TIMEOUT
+    # budget like the safetensors tests below rather than a retry one.
+    # Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
