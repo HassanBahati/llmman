@@ -306,10 +306,12 @@ with the same endpoint, model and key. Each is configured entirely through
 the environment goose reads in preference to its own config, so neither
 writes to `~/.config/goose` and your `goose configure` provider survives
 the launch. `goose-desktop` is found on `PATH` as `goose-desktop` or
-`goose-gui`, otherwise in `/Applications` on macOS and `/usr/lib/goose` on
-Linux. Windows ships as a zip with no installer: add the unpacked folder to
-`PATH` and its `Goose.exe` is found there, told apart from the `goose` CLI —
-the same name to Windows — by the Electron files beside it.
+`goose-gui`, otherwise in `/Applications` on macOS and, on Linux,
+`/usr/lib/goose` from the .deb or `/usr/lib/Goose` from the .rpm — the two
+packages differ in that capital alone. Windows ships as a zip with no
+installer: add the unpacked folder to `PATH` and its `Goose.exe` is found
+there, told apart from the `goose` CLI — the same name to Windows — by the
+Electron files beside it.
 
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own

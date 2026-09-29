@@ -3170,14 +3170,19 @@ fn goose_desktop_running_windows(bin: &Path) -> GooseInstance {
         .ok()
         .filter(|o| o.status.success());
     match out {
-        Some(out) => goose_exe_pid(&String::from_utf8_lossy(&out.stdout), bin),
+        Some(out) => goose_exe_pid(
+            &String::from_utf8_lossy(&out.stdout),
+            bin,
+            is_electron_bundle,
+        ),
         None => GooseInstance::Unknown,
     }
 }
 
-/// Reads `Get-CimInstance`'s `<pid>|<path>|<command>` lines. Split out
-/// from the shell-out, which cannot run off Windows, so the parsing can be
-/// tested anywhere.
+/// Reads `Get-CimInstance`'s `<pid>|<path>|<command>` lines. Split from the
+/// shell-out, and given `is_bundle` rather than calling
+/// [`is_electron_bundle`] itself, so it can be tested off Windows where
+/// neither would work.
 ///
 /// [`GooseInstance::Confirmed`] needs the main process — matched on the
 /// path, so an unrelated `Goose.exe` is not taken for the app this launch
@@ -3185,18 +3190,28 @@ fn goose_desktop_running_windows(bin: &Path) -> GooseInstance {
 /// spawns off the main one carries. A renderer holds no lock, and
 /// `taskkill` without `/F` would not close one anyway.
 ///
-/// Any other `Goose.exe` is [`GooseInstance::Held`] — one whose
-/// `ExecutablePath` is blank because this user cannot open it, or a build
-/// installed elsewhere. Windows exposes nothing profile-scoped to read, so
-/// a running process is all there is to go on: one sharing this profile
-/// takes the launch, and one with a profile of its own would not, which is
-/// the cost of refusing on it. A child counts, since it implies a main
-/// process that holds the lock even when that row is not listed.
+/// Another Electron `Goose.exe` is [`GooseInstance::Held`] — a build
+/// installed elsewhere, or a child, which implies a main process holding
+/// the lock even when that row is not listed. Windows exposes nothing
+/// profile-scoped to read, so a running process is all there is to go on:
+/// one sharing this profile takes the launch, one with a profile of its own
+/// would not, and refusing on it is the cost of not being able to tell.
 ///
-/// Only an empty listing means nothing is running.
+/// `is_bundle` is what keeps the `goose` CLI out of that: Windows reads its
+/// `goose.exe` and the app's `Goose.exe` as one name, and `Name=` in WQL is
+/// case-insensitive, so a CLI session would otherwise refuse every desktop
+/// launch.
+///
+/// A blank `ExecutablePath` — a process this user cannot open — is
+/// [`GooseInstance::Unknown`]: it cannot be told from the CLI either, and a
+/// refusal on it would block the launch on nothing. An app whose directory
+/// cannot be read also fails the bundle check, so it is missed rather than
+/// refused — though such a process rarely lists an `ExecutablePath` at all,
+/// and lands here instead.
 #[cfg(any(windows, test))]
-fn goose_exe_pid(listing: &str, bin: &Path) -> GooseInstance {
+fn goose_exe_pid(listing: &str, bin: &Path, is_bundle: impl Fn(&Path) -> bool) -> GooseInstance {
     let mut held = false;
+    let mut unreadable = false;
     for line in listing.lines() {
         let mut fields = line.trim().splitn(3, '|');
         let Some(pid) = fields.next() else { continue };
@@ -3204,6 +3219,14 @@ fn goose_exe_pid(listing: &str, bin: &Path) -> GooseInstance {
         // The command line keeps any `|` of its own: it is last, and
         // `splitn` leaves the remainder whole.
         let command = fields.next().unwrap_or_default();
+        if path.trim().is_empty() {
+            unreadable = true;
+            continue;
+        }
+        if !is_bundle(Path::new(path.trim())) {
+            // The CLI under its other name, which holds no lock.
+            continue;
+        }
         held = true;
         if command.contains("--type=") || !same_windows_path(path, bin) {
             continue;
@@ -3212,8 +3235,11 @@ fn goose_exe_pid(listing: &str, bin: &Path) -> GooseInstance {
             return GooseInstance::Confirmed(pid);
         }
     }
+    // A holder outranks not knowing: one is evidence, the other is its absence.
     if held {
         GooseInstance::Held
+    } else if unreadable {
+        GooseInstance::Unknown
     } else {
         GooseInstance::Free
     }
@@ -3322,6 +3348,31 @@ fn goose_desktop_unknown_warning() -> String {
         .to_string()
 }
 
+/// What to do about a quit the user approved, given what the lock says by
+/// the time they answered.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitDecision {
+    /// Still the same confirmed instance: signal it.
+    Signal,
+    /// It quit while the prompt waited, so the launch can proceed.
+    AlreadyGone,
+    /// Something else holds the lock now, or it can no longer be read.
+    /// Signal nothing.
+    Changed,
+}
+
+/// Only an unchanged, still-confirmed pid may be signalled. Split from
+/// [`offer_to_quit_goose_desktop`], which blocks on a prompt, so that rule
+/// can be tested.
+fn quit_decision(probe: &GooseInstance, approved: u32) -> QuitDecision {
+    match probe {
+        GooseInstance::Confirmed(pid) if *pid == approved => QuitDecision::Signal,
+        GooseInstance::Free => QuitDecision::AlreadyGone,
+        // A different pid, an unconfirmable holder, or no answer at all.
+        _ => QuitDecision::Changed,
+    }
+}
+
 /// Refuses a launch the running instance would take, or quits that
 /// instance when there is a terminal to answer for it.
 ///
@@ -3348,8 +3399,24 @@ fn offer_to_quit_goose_desktop(
     std::io::stdin().lock().read_line(&mut answer)?;
     anyhow::ensure!(accepts_prompt(&answer), "{refusal}");
 
-    eprintln!("[llmman] asking Goose Desktop to quit...");
-    quit_goose_desktop(pid);
+    // Re-probed after the prompt, which waits as long as the user does: by
+    // then `pid` may name something else entirely — the app quit and the
+    // number was reused — and this is the call that would SIGTERM it.
+    match quit_decision(&goose_desktop_instance(bin, home, config), pid) {
+        QuitDecision::Signal => {
+            eprintln!("[llmman] asking Goose Desktop to quit...");
+            quit_goose_desktop(pid);
+        }
+        // It quit while the prompt waited, so the launch can go ahead.
+        QuitDecision::AlreadyGone => {
+            eprintln!("[llmman] Goose Desktop already quit; nothing to signal.");
+            return Ok(());
+        }
+        QuitDecision::Changed => anyhow::bail!(
+            "Goose Desktop (pid {pid}) is no longer the instance llmman \
+             confirmed, so nothing was signalled. Run this again."
+        ),
+    }
     anyhow::ensure!(
         wait_for_goose_desktop_to_quit(bin, home, config),
         "Goose Desktop (pid {pid}) did not quit, so this launch would still go \
@@ -3442,11 +3509,19 @@ fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
         }
     }
     if cfg!(target_os = "linux") {
-        // The .deb's GUI binary, capital G beside the lowercase CLI.
+        // The packaged GUI binary, capital G beside the lowercase CLI. Both
+        // spellings, because 1.52.0's Electron Forge makers give the deb and
+        // the rpm their own desktop templates, and those differ in the case
+        // of the directory alone: `Exec=/usr/lib/goose/Goose` in
+        // `forge.deb.desktop`, `Exec=/usr/lib/Goose/Goose` in
+        // `forge.rpm.desktop`. Linux tells the two apart; neither is on
+        // `PATH`.
+        //
         // Not the manual `/opt/goose` unpack: its executable is spelled
         // `goose`, so a CLI left there would be launched in place of the
         // app, and that install's own `goose-gui` symlink is on `PATH`.
         candidates.push(PathBuf::from("/usr/lib/goose/Goose"));
+        candidates.push(PathBuf::from("/usr/lib/Goose/Goose"));
     }
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -4901,6 +4976,22 @@ defaults:
         assert!(refusal.contains("not llmman's"), "{refusal}");
     }
 
+    /// The pid reused while the prompt waited is the one this must never
+    /// SIGTERM, so every outcome but an unchanged match refuses to signal.
+    #[test]
+    fn only_the_same_confirmed_instance_is_signalled_after_the_prompt() {
+        use GooseInstance::{Confirmed, Free, Held, Unknown};
+        assert_eq!(quit_decision(&Confirmed(4242), 4242), QuitDecision::Signal);
+        // Reused while the prompt waited: a stranger wearing that number.
+        assert_eq!(quit_decision(&Confirmed(99), 4242), QuitDecision::Changed);
+        // Quit while the prompt waited, so there is nothing to signal.
+        assert_eq!(quit_decision(&Free, 4242), QuitDecision::AlreadyGone);
+        // A holder llmman cannot identify is not one it may signal, and a
+        // probe that stopped answering is no licence either.
+        assert_eq!(quit_decision(&Held, 4242), QuitDecision::Changed);
+        assert_eq!(quit_decision(&Unknown, 4242), QuitDecision::Changed);
+    }
+
     /// An unconfirmable holder is refused without a pid to offer, so off
     /// Windows the message names the lock file instead — the only way out
     /// when the lock is stale and its pid has been reused. Windows has no
@@ -4975,13 +5066,17 @@ defaults:
     /// The `<pid>|<path>|<command>` lines `Get-CimInstance` prints. Only
     /// the main process is `Confirmed` — matched on the path, and on the
     /// absence of `--type=`, so an Electron renderer is not signalled as
-    /// the lock holder. Any other `Goose.exe` is still `Held`: it owns the
-    /// mutex and takes the launch whatever its path.
+    /// the lock holder. Another Electron `Goose.exe` is still `Held`: it
+    /// takes the launch whatever its path.
+    ///
+    /// Every path here is an Electron bundle unless a case says otherwise;
+    /// the real probe asks the filesystem, which these paths are not on.
     #[test]
     fn goose_exe_pid_finds_the_main_process_only() {
-        use GooseInstance::{Confirmed, Free, Held};
+        use GooseInstance::{Confirmed, Free, Held, Unknown};
         let bin = Path::new(r"C:\Users\me\Goose\Goose.exe");
         let exe = r"C:\Users\me\Goose\Goose.exe";
+        let bundle = |_: &Path| true;
         // As Windows really lists it: the children come first, and they
         // share their parent's executable.
         let listing = format!(
@@ -4989,34 +5084,59 @@ defaults:
              1002|{exe}|\"{exe}\" --type=renderer --lang=en-GB\r\n\
              1003|{exe}|\"{exe}\"\r\n"
         );
-        assert_eq!(goose_exe_pid(&listing, bin), Confirmed(1003));
+        assert_eq!(goose_exe_pid(&listing, bin, bundle), Confirmed(1003));
 
         // A child with no main process listed is not ours to signal, but
         // the app it belongs to still holds the lock.
         assert_eq!(
-            goose_exe_pid(&format!("1002|{exe}|\"{exe}\" --type=renderer"), bin),
+            goose_exe_pid(
+                &format!("1002|{exe}|\"{exe}\" --type=renderer"),
+                bin,
+                bundle
+            ),
             Held
         );
         // Neither case nor separator tells two Windows paths apart.
         assert_eq!(
-            goose_exe_pid("9|c:/users/me/goose/GOOSE.EXE|x", bin),
+            goose_exe_pid("9|c:/users/me/goose/GOOSE.EXE|x", bin, bundle),
             Confirmed(9)
         );
         // A command line of its own may hold `|`; it is last and stays whole.
         assert_eq!(
-            goose_exe_pid(&format!("9|{exe}|\"{exe}\" --logfile a|b"), bin),
+            goose_exe_pid(&format!("9|{exe}|\"{exe}\" --logfile a|b"), bin, bundle),
             Confirmed(9)
         );
-        // A blank ExecutablePath — a process this user cannot open. Still
-        // a running Goose.exe, so still a holder.
-        assert_eq!(goose_exe_pid("9||x", bin), Held);
-        assert_eq!(goose_exe_pid("9|   |x", bin), Held);
+        // A blank ExecutablePath cannot be told from the CLI, so it is not
+        // grounds to refuse — only to say so.
+        assert_eq!(goose_exe_pid("9||x", bin, bundle), Unknown);
+        assert_eq!(goose_exe_pid("9|   |x", bin, bundle), Unknown);
         // A build installed elsewhere shares the profile and the mutex.
-        assert_eq!(goose_exe_pid("9|C:\\elsewhere\\Goose.exe|x", bin), Held);
+        assert_eq!(
+            goose_exe_pid("9|C:\\elsewhere\\Goose.exe|x", bin, bundle),
+            Held
+        );
         // Only an empty listing means nothing is running.
-        assert_eq!(goose_exe_pid("", bin), Free);
+        assert_eq!(goose_exe_pid("", bin, bundle), Free);
         // One field is not a row `Get-CimInstance` can produce.
-        assert_eq!(goose_exe_pid("nonsense", bin), Free);
+        assert_eq!(goose_exe_pid("nonsense", bin, bundle), Free);
+
+        // The `goose` CLI, which this listing picks up under the app's name
+        // and which holds no lock.
+        let cli = r"C:\Users\me\.local\bin\goose.exe";
+        let not_a_bundle = |p: &Path| p != Path::new(cli);
+        assert_eq!(
+            goose_exe_pid(&format!("2001|{cli}|\"{cli}\" session"), bin, not_a_bundle),
+            Free
+        );
+        // Nor does it mask a real instance listed beside it.
+        assert_eq!(
+            goose_exe_pid(
+                &format!("2001|{cli}|\"{cli}\" session\r\n1003|{exe}|\"{exe}\"\r\n"),
+                bin,
+                not_a_bundle
+            ),
+            Confirmed(1003)
+        );
     }
 
     /// A lock counts only while the pid in it is *this app*. Liveness
@@ -5203,6 +5323,7 @@ defaults:
         let installed = [
             "/Applications/Goose.app/Contents/MacOS/Goose",
             "/usr/lib/goose/Goose",
+            "/usr/lib/Goose/Goose",
         ]
         .into_iter()
         .map(Path::new)
