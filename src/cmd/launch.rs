@@ -2918,8 +2918,12 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
     }
     candidates.push(home.join(".local").join("bin").join(bin));
     // is_file, not exists: a directory of that name would be reported as
-    // installed and then fail to spawn.
-    candidates.into_iter().find(|p| p.is_file())
+    // installed and then fail to spawn. Not the desktop app either: a
+    // zip can be unpacked into the installer's own directory, and these
+    // names match its executable — exactly on Linux, by case elsewhere.
+    candidates
+        .into_iter()
+        .find(|p| p.is_file() && !is_electron_bundle(p))
 }
 
 /// goose-desktop: [`launch_goose`]'s environment, pointed at the desktop
@@ -2971,10 +2975,29 @@ fn goose_exe_on_path() -> Option<PathBuf> {
 }
 
 /// Whether `exe` is the unpacked Electron app rather than a same-named
-/// binary: the packager writes `resources/app.asar` beside it.
+/// binary, in either layout the packager produces: `resources/app.asar`
+/// beside the executable on Windows and Linux, `Contents/Resources` a
+/// level up from `Contents/MacOS` in a macOS `.app`.
+///
+/// Beside the target, not the link: `BUILDING_LINUX.md` installs the app
+/// by symlinking it into a `bin` directory, where nothing sits beside
+/// the link. A path that will not resolve falls back to its literal
+/// parent, which is where a bundle reached directly keeps these anyway.
 fn is_electron_bundle(exe: &Path) -> bool {
-    exe.parent()
-        .is_some_and(|dir| dir.join("resources").join("app.asar").is_file())
+    let resolved = std::fs::canonicalize(exe);
+    let Some(dir) = resolved.as_deref().unwrap_or(exe).parent() else {
+        return false;
+    };
+    if dir.join("resources").join("app.asar").is_file() {
+        return true;
+    }
+    // Only where the layout really is a `.app`: otherwise any executable
+    // two levels below a `Resources` counts, and a case-insensitive
+    // filesystem matches the flat `resources` above as one.
+    dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+        && dir
+            .parent()
+            .is_some_and(|contents| contents.join("Resources").join("app.asar").is_file())
 }
 
 /// Where Goose Desktop lands when it is not on `PATH`: a macOS `.app`
@@ -4364,6 +4387,52 @@ defaults:
         assert!(!is_electron_bundle(&exe));
         std::fs::write(resources.join("app.asar"), "").unwrap();
         assert!(is_electron_bundle(&exe));
+        // Through a symlink too: the documented Linux install is a link
+        // into a bin directory, and nothing sits beside the link.
+        let link_dir = dir.join("bin");
+        std::fs::create_dir(&link_dir).unwrap();
+        let link = link_dir.join("goose");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&exe, &link).unwrap();
+            assert!(is_electron_bundle(&link));
+        }
+        // A link to an ordinary file is still not the app.
+        let plain = link_dir.join("plain");
+        std::fs::write(link_dir.join("target"), "").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(link_dir.join("target"), &plain).unwrap();
+            assert!(!is_electron_bundle(&plain));
+        }
+
+        // The macOS `.app`, whose `app.asar` is a level up from the
+        // executable rather than beside it.
+        let macos = dir.join("Goose.app").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let app = macos.join("Goose");
+        std::fs::write(&app, "").unwrap();
+        assert!(!is_electron_bundle(&app));
+        let res = dir.join("Goose.app").join("Contents").join("Resources");
+        std::fs::create_dir(&res).unwrap();
+        std::fs::write(res.join("app.asar"), "").unwrap();
+        assert!(is_electron_bundle(&app));
+
+        // `goose_fallback` refuses it too, or the installer's own
+        // directory becomes a way past the guard.
+        let fallback_home = dir.join("home");
+        let unpacked = if cfg!(windows) {
+            fallback_home.join("goose")
+        } else {
+            fallback_home.join(".local").join("bin")
+        };
+        std::fs::create_dir_all(unpacked.join("resources")).unwrap();
+        let bin = unpacked.join(if cfg!(windows) { "goose.exe" } else { "goose" });
+        std::fs::write(&bin, "").unwrap();
+        assert_eq!(goose_fallback(&fallback_home), Some(bin));
+        std::fs::write(unpacked.join("resources").join("app.asar"), "").unwrap();
+        assert_eq!(goose_fallback(&fallback_home), None);
+
         // Never consulted off Windows, where the CLI owns the name.
         if !cfg!(windows) {
             assert_eq!(goose_exe_on_path(), None);
