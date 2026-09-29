@@ -839,7 +839,7 @@ fn ensure_cline_installed() -> anyhow::Result<()> {
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
-    anyhow::ensure!(accepts_install(&answer), CLINE_INSTALL_CANCELLED);
+    anyhow::ensure!(accepts_prompt(&answer), CLINE_INSTALL_CANCELLED);
 
     eprintln!("\nInstalling Cline...");
     let status = Command::new(&npm)
@@ -865,7 +865,9 @@ fn ensure_cline_installed() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn accepts_install(answer: &str) -> bool {
+/// A yes to an interactive `[y/N]`. Shared by the Cline install
+/// prompt and goose-desktop's offer to quit.
+fn accepts_prompt(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
@@ -1146,17 +1148,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
                 Dir(state.join("goose")),
             ];
             if name == "goose-desktop" {
-                dirs.push(Dir(if cfg!(target_os = "macos") {
-                    home.join("Library")
-                        .join("Application Support")
-                        .join("Goose")
-                } else if cfg!(windows) {
-                    env_dir("APPDATA")
-                        .unwrap_or_else(|| home.join("AppData").join("Roaming"))
-                        .join("Goose")
-                } else {
-                    config.join("Goose")
-                }));
+                dirs.push(Dir(goose_desktop_user_data(&home, &config)));
                 // macOS keeps the app's preferences outside `userData`,
                 // under the bundle id `Goose.app` 1.52.0 declares.
                 if cfg!(target_os = "macos") {
@@ -2943,11 +2935,17 @@ fn goose_fallback(home: &Path) -> Option<PathBuf> {
 /// these variables, a prompt typed into it reaches the daemon, and
 /// neither the launch nor the conversation touches `~/.config/goose`.
 ///
-/// 1.52.0 holds no single-instance lock on macOS — two launches make two
-/// processes, each with the environment it was given. Untested on
-/// Windows and Linux, where an app that did hold one would hand this
-/// launch to the running copy and exit, leaving that copy on its own
-/// environment while this returns success.
+/// On macOS that is all of it: 1.52.0 takes no single-instance lock
+/// there, so two launches make two processes, each with the environment
+/// it was given. Elsewhere it does take one, and hands this launch to the
+/// copy already running, which keeps its own provider — read out of
+/// 1.52.0's `app.asar`, not run.
+///
+/// So the launch is refused when [`goose_desktop_instance`] finds a
+/// holder, and warned about when it cannot tell. Nothing is inferred
+/// afterwards from the exit code or from how long the app ran: a second
+/// instance quitting and a user quitting look identical from here, and
+/// guessing between them cried wolf on every quick exit.
 fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_goose_desktop().ok_or_else(|| {
         anyhow::anyhow!(
@@ -2956,8 +2954,408 @@ fn launch_goose_desktop(model: &str, api_key: &str, extra_args: &[String]) -> an
              or run 'llmman launch goose' for the CLI."
         )
     })?;
+    // Before the launch, because afterwards there is nothing to tell a
+    // handover from an ordinary quick exit: both are an exit 0.
+    //
+    // Not on macOS, which takes no lock, so there is no handover to find.
+    // Not under a sandbox either: that launch has its own profile and
+    // process table, so no window on this machine can be handed it.
+    if !cfg!(target_os = "macos") && !sandbox::active() {
+        match dirs::home_dir() {
+            Some(home) => {
+                let config = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+                match goose_desktop_instance(&bin, &home, &config) {
+                    GooseInstance::Confirmed(pid) => {
+                        offer_to_quit_goose_desktop(pid, &bin, &home, &config)?
+                    }
+                    GooseInstance::Held => anyhow::bail!(goose_desktop_lock_held(
+                        &goose_desktop_user_data(&home, &config)
+                    )),
+                    GooseInstance::Unknown => eprintln!("{}", goose_desktop_unknown_warning()),
+                    GooseInstance::Free => {}
+                }
+            }
+            // Without a home directory there is no profile to read the
+            // lock from, which is the same not-knowing.
+            None => eprintln!("{}", goose_desktop_unknown_warning()),
+        }
+    }
     let host = server();
     exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
+}
+
+/// What a probe for a running Goose Desktop found.
+///
+/// Two questions, and they take different evidence. Whether this launch
+/// will be handed over: anything alive holding the single-instance lock
+/// does that, whatever binary it is, because that is what Chromium keys
+/// on. Whether the holder may be signalled: only a pid confirmed to be
+/// `bin`, or a `SIGTERM` lands on a stranger whose pid was reused. One
+/// bar for both would either miss handovers or signal blind.
+#[derive(Debug, PartialEq, Eq)]
+enum GooseInstance {
+    /// A live instance of the binary this launch resolved: this launch
+    /// would be handed to it, and its pid is ours to signal.
+    Confirmed(u32),
+    /// Something live holds the lock, but not confirmably that binary —
+    /// another build, a process this user cannot read, or a pid reused
+    /// after a crash. The launch is refused, since a holder is what causes
+    /// the handover, and nothing is signalled on this much.
+    Held,
+    /// The probe reached no answer — it could not run, or could not read
+    /// what it needed. Nothing is known either way.
+    Unknown,
+    /// Nothing holds the lock.
+    Free,
+}
+
+/// Electron's `userData`, named for the bundle rather than the CLI.
+/// Shared with [`sandbox_state`] so the directory a sandbox mounts and
+/// the one the lock is read from cannot drift apart.
+fn goose_desktop_user_data(home: &Path, config: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Goose")
+    } else if cfg!(windows) {
+        env_dir("APPDATA")
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join("Goose")
+    } else {
+        config.join("Goose")
+    }
+}
+
+/// Who holds Chromium's single-instance lock in `user_data`.
+///
+/// `SingletonLock` is Chromium's own lock, which Electron takes through
+/// it: a symlink whose target is `<hostname>-<pid>`. Chromium breaks a
+/// lock whose holder is gone and becomes the primary itself, so a stale
+/// one is [`GooseInstance::Free`] here too — it must not stand in the way
+/// of a launch that would have worked.
+///
+/// Not on Windows, which keeps this lock in a named mutex with nothing on
+/// disk to read — see [`goose_desktop_running_windows`].
+#[cfg(not(windows))]
+fn single_instance_lock_holder(user_data: &Path, bin: &Path) -> GooseInstance {
+    let target = match std::fs::read_link(user_data.join("SingletonLock")) {
+        Ok(target) => target,
+        // Conclusively no holder: no lock (`NotFound`), or something
+        // there that Chromium did not write, since it always writes a
+        // symlink and reading any other file type gives `EINVAL`.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return GooseInstance::Free;
+        }
+        // Anything else — an unreadable profile directory, most likely —
+        // is not evidence that nothing is running.
+        Err(_) => return GooseInstance::Unknown,
+    };
+    // A target that does not end in a number names no holder.
+    let Some(pid) = target
+        .to_str()
+        .and_then(|t| t.rsplit_once('-'))
+        .and_then(|(_, pid)| pid.parse::<u32>().ok())
+    else {
+        return GooseInstance::Free;
+    };
+    // `kill` and `/proc` take a signed pid. A number too large to be one
+    // is not a pid Chromium wrote, and `pid_alive` rejects zero.
+    let Ok(signed) = i32::try_from(pid) else {
+        return GooseInstance::Free;
+    };
+    if !pid_alive(signed) {
+        return GooseInstance::Free;
+    }
+    if process_is(signed, bin) {
+        GooseInstance::Confirmed(pid)
+    } else {
+        GooseInstance::Held
+    }
+}
+
+/// Whether `pid` exists, without signalling it: `kill(pid, 0)` performs
+/// the permission and existence checks and delivers nothing. `EPERM` is a
+/// live process this user may not signal, which counts as alive — the
+/// caller only needs to know the lock has a holder.
+///
+/// Zero and negatives are rejected first, because to `kill` they address
+/// process *groups*, this process's own among them.
+#[cfg(not(windows))]
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill(2) with signal 0 sends nothing; it only reports
+    // whether the process exists and could be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether `pid` is running `bin`, by the executable `/proc/<pid>/exe`
+/// resolves to — what the Windows side matches as `ExecutablePath`.
+///
+/// This is the bar for *signalling*, not for refusing. `SingletonLock`
+/// outlives an app that was hard-killed, and its pid may since have been
+/// reused by something unrelated, which [`quit_goose_desktop`] would
+/// otherwise SIGTERM after a prompt naming Goose Desktop. The same goes
+/// for a lock written on another machine over a shared home directory,
+/// whose pid means nothing here.
+///
+/// Only Linux has `/proc/<pid>/exe`; an unreadable one — another user's
+/// process, or any other unix — counts as not it. The launch is still
+/// refused in that case, as [`GooseInstance::Held`]; it is only the
+/// SIGTERM that is withheld. That costs macOS nothing, since
+/// [`goose_desktop_instance`] never reads a lock there.
+#[cfg(not(windows))]
+fn process_is(pid: i32, bin: &Path) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canonical(&exe) == canonical(bin)
+}
+
+/// Whether a Goose Desktop already holds the single-instance lock. `bin`
+/// is the executable this launch resolved. Windows has no lock file, so
+/// the process is what is looked for — see
+/// [`goose_desktop_running_windows`].
+#[cfg(windows)]
+fn goose_desktop_instance(bin: &Path, _home: &Path, _config: &Path) -> GooseInstance {
+    goose_desktop_running_windows(bin)
+}
+
+/// Whether a Goose Desktop already holds the single-instance lock.
+///
+/// macOS never takes it — `app.asar` guards the whole branch with
+/// `process.platform !== 'darwin'` — so this is always
+/// [`GooseInstance::Free`] there, and a `SingletonLock` left behind by
+/// something else cannot refuse a launch that would have worked.
+#[cfg(not(windows))]
+fn goose_desktop_instance(bin: &Path, home: &Path, config: &Path) -> GooseInstance {
+    if cfg!(target_os = "macos") {
+        return GooseInstance::Free;
+    }
+    single_instance_lock_holder(&goose_desktop_user_data(home, config), bin)
+}
+
+/// A running Goose Desktop on Windows, where Chromium keeps the lock in a
+/// named mutex with nothing on disk to read, so the process is what there
+/// is to find. `Get-CimInstance` the way [`crate::daemon`]'s own stop path
+/// finds a process by name.
+///
+/// A probe that cannot run reports [`GooseInstance::Unknown`] rather than
+/// guessing either way: a machine without `powershell` is not a machine
+/// without Goose Desktop, and the caller warns instead of refusing.
+#[cfg(windows)]
+fn goose_desktop_running_windows(bin: &Path) -> GooseInstance {
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='Goose.exe'\" | \
+             ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)|$($_.CommandLine)\" }",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    match out {
+        Some(out) => goose_exe_pid(&String::from_utf8_lossy(&out.stdout), bin),
+        None => GooseInstance::Unknown,
+    }
+}
+
+/// Reads `Get-CimInstance`'s `<pid>|<path>|<command>` lines. Split out
+/// from the shell-out, which cannot run off Windows, so the parsing can be
+/// tested anywhere.
+///
+/// [`GooseInstance::Confirmed`] needs the main process — matched on the
+/// path, so an unrelated `Goose.exe` is not taken for the app this launch
+/// resolved, and on the absence of `--type=`, which every process Electron
+/// spawns off the main one carries. A renderer holds no lock, and
+/// `taskkill` without `/F` would not close one anyway.
+///
+/// Any other `Goose.exe` is [`GooseInstance::Held`] — one whose
+/// `ExecutablePath` is blank because this user cannot open it, or a build
+/// installed elsewhere. Windows exposes nothing profile-scoped to read, so
+/// a running process is all there is to go on: one sharing this profile
+/// takes the launch, and one with a profile of its own would not, which is
+/// the cost of refusing on it. A child counts, since it implies a main
+/// process that holds the lock even when that row is not listed.
+///
+/// Only an empty listing means nothing is running.
+#[cfg(any(windows, test))]
+fn goose_exe_pid(listing: &str, bin: &Path) -> GooseInstance {
+    let mut held = false;
+    for line in listing.lines() {
+        let mut fields = line.trim().splitn(3, '|');
+        let Some(pid) = fields.next() else { continue };
+        let Some(path) = fields.next() else { continue };
+        // The command line keeps any `|` of its own: it is last, and
+        // `splitn` leaves the remainder whole.
+        let command = fields.next().unwrap_or_default();
+        held = true;
+        if command.contains("--type=") || !same_windows_path(path, bin) {
+            continue;
+        }
+        if let Ok(pid) = pid.trim().parse() {
+            return GooseInstance::Confirmed(pid);
+        }
+    }
+    if held {
+        GooseInstance::Held
+    } else {
+        GooseInstance::Free
+    }
+}
+
+/// Whether two Windows paths name one file, comparing case-insensitively
+/// and treating `/` as `\`. An empty path never matches:
+/// `ExecutablePath` is blank for a process this user cannot open.
+#[cfg(any(windows, test))]
+fn same_windows_path(a: &str, b: &Path) -> bool {
+    let normalize = |s: &str| s.trim().replace('/', "\\").to_ascii_lowercase();
+    let a = normalize(a);
+    !a.is_empty() && a == normalize(&b.to_string_lossy())
+}
+
+/// Asks the app to quit, the way [`crate::daemon`]'s own stop path does:
+/// `SIGTERM` rather than `SIGKILL`, `taskkill` without `/F`, so it closes
+/// its session rather than losing it. Best-effort — whether it went is
+/// [`wait_for_goose_desktop_to_quit`]'s to say.
+fn quit_goose_desktop(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: kill(2) with SIGTERM only asks that process to exit.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    #[cfg(windows)]
+    {
+        // Nulled like `daemon`'s: taskkill reports a missing pid loudly,
+        // and the poll below is what decides either way.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Polls until nothing holds the lock, for as long as
+/// [`QUIT_TIMEOUT`]. Bounded by the clock rather than by a count of
+/// tries, unlike `daemon`'s `wait_for_port_free`: on Windows each probe
+/// shells out to `powershell`, so a fixed number of tries would wait for
+/// however long that costs on top of the sleeps.
+fn wait_for_goose_desktop_to_quit(bin: &Path, home: &Path, config: &Path) -> bool {
+    let deadline = std::time::Instant::now() + QUIT_TIMEOUT;
+    loop {
+        // `Free` only: `Held` is still a holder, and `Unknown` is a probe
+        // that stopped working, which is no evidence that it quit.
+        if goose_desktop_instance(bin, home, config) == GooseInstance::Free {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// How long a quitting Goose Desktop is given to release the lock.
+const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a launch is told when the running instance would take it. A
+/// function rather than a literal so a test can assert on it without
+/// going through the prompt, which would block on stdin.
+fn goose_desktop_refusal(pid: u32) -> String {
+    format!(
+        "Goose Desktop is already running (pid {pid}), and holds the lock that \
+         makes a second launch hand over to it — with the provider and model it \
+         already had, not llmman's.\n\
+         Quit it and run this again."
+    )
+}
+
+/// The refusal for a holder that could not be confirmed to be the binary
+/// this launch resolved, so there is no pid llmman will offer to signal.
+///
+/// Off Windows this is also how a lock left by a crash whose pid has since
+/// been reused presents itself, and deleting the file clears it — so the
+/// path is named. Windows holds the lock in a kernel mutex with no file to
+/// remove, hence nothing to point at there.
+fn goose_desktop_lock_held(user_data: &Path) -> String {
+    let mut message = "Something is already holding Goose Desktop's single-instance lock, so \
+         this launch would be handed to it and keep that instance's provider \
+         and model, not llmman's.\n\
+         Quit Goose Desktop and run this again."
+        .to_string();
+    if !cfg!(windows) {
+        message.push_str(&format!(
+            " If it is not running, the lock is stale and can be removed:\n  {}",
+            user_data.join("SingletonLock").display()
+        ));
+    }
+    message
+}
+
+/// What a launch is told when llmman could not determine whether an
+/// instance is running. Printed, not refused: the launch may well be the
+/// only instance, and refusing on no evidence would block a working setup.
+fn goose_desktop_unknown_warning() -> String {
+    "[llmman] could not determine whether Goose Desktop is already running. \
+     If it is, this launch is handed to it and keeps that instance's provider \
+     and model instead of the ones llmman resolved."
+        .to_string()
+}
+
+/// Refuses a launch the running instance would take, or quits that
+/// instance when there is a terminal to answer for it.
+///
+/// Follows [`ensure_cline_installed`]: a pipe or a CI job is told, never
+/// asked, so nothing here can hang waiting on a stdin that will not
+/// answer.
+fn offer_to_quit_goose_desktop(
+    pid: u32,
+    bin: &Path,
+    home: &Path,
+    config: &Path,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let refusal = goose_desktop_refusal(pid);
+    anyhow::ensure!(
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        "{refusal}"
+    );
+
+    eprint!("Goose Desktop is already running (pid {pid}) and would take this launch with its own provider and model. Quit it? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    anyhow::ensure!(accepts_prompt(&answer), "{refusal}");
+
+    eprintln!("[llmman] asking Goose Desktop to quit...");
+    quit_goose_desktop(pid);
+    anyhow::ensure!(
+        wait_for_goose_desktop_to_quit(bin, home, config),
+        "Goose Desktop (pid {pid}) did not quit, so this launch would still go \
+         to it. Quit it and run this again."
+    );
+    Ok(())
 }
 
 /// `goose-desktop` is the name this integration is specified against;
@@ -4492,6 +4890,264 @@ defaults:
         );
     }
 
+    /// The refusal has to name the pid and say what to do about it —
+    /// without that, all the user sees is a launch that did not happen.
+    #[test]
+    fn the_refusal_names_the_instance_and_what_to_do() {
+        let refusal = goose_desktop_refusal(4242);
+        assert!(refusal.contains("4242"), "{refusal}");
+        assert!(refusal.contains("Quit it and run this again"), "{refusal}");
+        // Says whose provider wins, which is the part a user acts on.
+        assert!(refusal.contains("not llmman's"), "{refusal}");
+    }
+
+    /// An unconfirmable holder is refused without a pid to offer, so off
+    /// Windows the message names the lock file instead — the only way out
+    /// when the lock is stale and its pid has been reused. Windows has no
+    /// such file, and must not be told to delete one.
+    #[test]
+    fn the_held_refusal_names_the_lock_to_remove() {
+        let user_data = Path::new("/home/me/.config/Goose");
+        let held = goose_desktop_lock_held(user_data);
+        assert!(held.contains("not llmman's"), "{held}");
+        assert!(held.contains("Quit Goose Desktop"), "{held}");
+        // No pid is claimed: none was confirmed.
+        assert!(!held.contains("pid"), "{held}");
+        if cfg!(windows) {
+            assert!(!held.contains("SingletonLock"), "{held}");
+            assert!(!held.contains("stale"), "{held}");
+        } else {
+            assert!(
+                held.contains("/home/me/.config/Goose/SingletonLock"),
+                "{held}"
+            );
+        }
+    }
+
+    /// Not knowing is said out loud rather than refused — a launch that
+    /// would have worked must not be blocked on absent evidence.
+    #[test]
+    fn the_unknown_warning_says_what_it_could_not_determine() {
+        let warning = goose_desktop_unknown_warning();
+        assert!(warning.starts_with("[llmman]"), "{warning}");
+        assert!(warning.contains("could not determine"), "{warning}");
+        assert!(warning.contains("provider"), "{warning}");
+    }
+
+    /// macOS takes no single-instance lock, so a `SingletonLock` sitting
+    /// in its profile must not refuse a launch that would have worked
+    /// there. Everywhere else the same file is the lock, and does.
+    #[test]
+    #[cfg(unix)]
+    fn goose_desktop_instance_reads_the_lock_only_where_it_is_taken() {
+        let home = std::env::temp_dir().join(format!(
+            "llmman-goose-instance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = home.join(".config");
+        let user_data = goose_desktop_user_data(&home, &config);
+        std::fs::create_dir_all(&user_data).unwrap();
+        // A path nothing resolves to: only the lock is under test, so a
+        // holder can never be `Confirmed` here.
+        let bin = Path::new("/nonexistent/Goose");
+        assert_eq!(
+            goose_desktop_instance(bin, &home, &config),
+            GooseInstance::Free
+        );
+
+        let me = std::process::id();
+        std::os::unix::fs::symlink(format!("host-{me}"), user_data.join("SingletonLock")).unwrap();
+        let found = goose_desktop_instance(bin, &home, &config);
+        if cfg!(target_os = "macos") {
+            assert_eq!(found, GooseInstance::Free, "macOS never takes the lock");
+        } else {
+            // This test's own pid is alive, so the lock has a holder —
+            // `Held`, not `Confirmed`, because it is not running `bin`.
+            assert_eq!(found, GooseInstance::Held);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The `<pid>|<path>|<command>` lines `Get-CimInstance` prints. Only
+    /// the main process is `Confirmed` — matched on the path, and on the
+    /// absence of `--type=`, so an Electron renderer is not signalled as
+    /// the lock holder. Any other `Goose.exe` is still `Held`: it owns the
+    /// mutex and takes the launch whatever its path.
+    #[test]
+    fn goose_exe_pid_finds_the_main_process_only() {
+        use GooseInstance::{Confirmed, Free, Held};
+        let bin = Path::new(r"C:\Users\me\Goose\Goose.exe");
+        let exe = r"C:\Users\me\Goose\Goose.exe";
+        // As Windows really lists it: the children come first, and they
+        // share their parent's executable.
+        let listing = format!(
+            "1001|{exe}|\"{exe}\" --type=gpu-process --field-trial-handle=1\r\n\
+             1002|{exe}|\"{exe}\" --type=renderer --lang=en-GB\r\n\
+             1003|{exe}|\"{exe}\"\r\n"
+        );
+        assert_eq!(goose_exe_pid(&listing, bin), Confirmed(1003));
+
+        // A child with no main process listed is not ours to signal, but
+        // the app it belongs to still holds the lock.
+        assert_eq!(
+            goose_exe_pid(&format!("1002|{exe}|\"{exe}\" --type=renderer"), bin),
+            Held
+        );
+        // Neither case nor separator tells two Windows paths apart.
+        assert_eq!(
+            goose_exe_pid("9|c:/users/me/goose/GOOSE.EXE|x", bin),
+            Confirmed(9)
+        );
+        // A command line of its own may hold `|`; it is last and stays whole.
+        assert_eq!(
+            goose_exe_pid(&format!("9|{exe}|\"{exe}\" --logfile a|b"), bin),
+            Confirmed(9)
+        );
+        // A blank ExecutablePath — a process this user cannot open. Still
+        // a running Goose.exe, so still a holder.
+        assert_eq!(goose_exe_pid("9||x", bin), Held);
+        assert_eq!(goose_exe_pid("9|   |x", bin), Held);
+        // A build installed elsewhere shares the profile and the mutex.
+        assert_eq!(goose_exe_pid("9|C:\\elsewhere\\Goose.exe|x", bin), Held);
+        // Only an empty listing means nothing is running.
+        assert_eq!(goose_exe_pid("", bin), Free);
+        // One field is not a row `Get-CimInstance` can produce.
+        assert_eq!(goose_exe_pid("nonsense", bin), Free);
+    }
+
+    /// A lock counts only while the pid in it is *this app*. Liveness
+    /// alone would let a stale lock whose number has been reused name an
+    /// unrelated process — which the prompt would call Goose Desktop and
+    /// `quit_goose_desktop` would then SIGTERM.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_single_instance_lock_counts_only_for_the_app_that_holds_it() {
+        let user_data = std::env::temp_dir().join(format!(
+            "llmman-goose-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&user_data).unwrap();
+        let lock = user_data.join("SingletonLock");
+        // This test is a live process running a real executable, so it
+        // stands in for the app; anything else stands in for a pid that
+        // was reused after the app died.
+        let me = std::process::id() as i32;
+        let this_exe = std::env::current_exe().unwrap();
+        let elsewhere = Path::new("/nonexistent/Goose");
+
+        // No lock at all: nothing to hand a launch to.
+        assert_eq!(
+            single_instance_lock_holder(&user_data, &this_exe),
+            GooseInstance::Free
+        );
+
+        std::os::unix::fs::symlink(format!("somehost-{me}"), &lock).unwrap();
+        // A live pid running something else still holds the lock, so the
+        // launch is refused — but as `Held`, which is never signalled.
+        // This is the reused-pid case that used to SIGTERM a stranger.
+        assert_eq!(
+            single_instance_lock_holder(&user_data, elsewhere),
+            GooseInstance::Held
+        );
+        // `/proc/<pid>/exe` is what confirms the binary, and only Linux
+        // has it. Elsewhere the holder is real but unconfirmable, which
+        // costs macOS nothing since it never takes the lock.
+        let confirmed = single_instance_lock_holder(&user_data, &this_exe);
+        if cfg!(target_os = "linux") {
+            assert_eq!(confirmed, GooseInstance::Confirmed(me as u32));
+        } else {
+            assert_eq!(confirmed, GooseInstance::Held);
+        }
+
+        // A pid nothing answers to is a lock Chromium would break itself,
+        // so it must not stand in the way of a launch. Malformed targets
+        // and a plain file name no holder at all.
+        for target in ["somehost-2147483646", "somehost-notapid", "nodash"] {
+            std::fs::remove_file(&lock).unwrap();
+            std::os::unix::fs::symlink(target, &lock).unwrap();
+            assert_eq!(
+                single_instance_lock_holder(&user_data, &this_exe),
+                GooseInstance::Free,
+                "{target}"
+            );
+        }
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, "").unwrap();
+        assert_eq!(
+            single_instance_lock_holder(&user_data, &this_exe),
+            GooseInstance::Free
+        );
+
+        let _ = std::fs::remove_dir_all(&user_data);
+    }
+
+    /// A profile llmman cannot read is not a profile with nothing in it.
+    /// Reporting `Free` there would launch into a silent handover, which
+    /// is the whole failure this guard exists to prevent, so it reports
+    /// `Unknown` and the caller warns instead.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_profile_is_unknown_rather_than_free() {
+        use std::os::unix::fs::PermissionsExt;
+        let user_data = std::env::temp_dir().join(format!(
+            "llmman-goose-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&user_data).unwrap();
+        let me = std::process::id();
+        std::os::unix::fs::symlink(format!("somehost-{me}"), user_data.join("SingletonLock"))
+            .unwrap();
+        std::fs::set_permissions(&user_data, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let bin = std::env::current_exe().unwrap();
+        let found = single_instance_lock_holder(&user_data, &bin);
+        // Restored before asserting: a failing assertion would otherwise
+        // leave a directory nothing can delete.
+        std::fs::set_permissions(&user_data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&user_data);
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads it regardless of the mode, so a holder is found —
+            // `Confirmed` only where `/proc` can back that up.
+            assert!(
+                matches!(found, GooseInstance::Confirmed(p) if p == me)
+                    || found == GooseInstance::Held,
+                "{found:?}"
+            );
+        } else {
+            assert_eq!(found, GooseInstance::Unknown);
+        }
+    }
+
+    /// `kill(pid, 0)` asks without signalling. This process is alive; pid
+    /// 0 and negatives address process *groups*, which must never be
+    /// mistaken for a holder, and a freshly reaped child is gone.
+    #[test]
+    #[cfg(not(windows))]
+    fn pid_alive_sees_this_process_and_not_a_group_or_a_corpse() {
+        assert!(pid_alive(std::process::id() as i32));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(!pid_alive(-(std::process::id() as i32)));
+
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id() as i32;
+        child.wait().expect("wait");
+        // Reaped, so the pid is free rather than a zombie still answering.
+        assert!(!pid_alive(pid));
+    }
+
     /// The desktop app keeps Electron state the CLI has none of, and
     /// `--sandbox` has to let it write there: `userData`, named for the
     /// bundle (`Goose`) rather than the CLI. Without it a sandboxed run
@@ -4744,10 +5400,10 @@ defaults:
         );
         assert_eq!(CLINE_INSTALL_CANCELLED, "cline installation cancelled");
         for answer in ["y", "Y", "yes", "YES", " yes\n"] {
-            assert!(accepts_install(answer));
+            assert!(accepts_prompt(answer));
         }
         for answer in ["", "\n", "n", "no", "yep"] {
-            assert!(!accepts_install(answer));
+            assert!(!accepts_prompt(answer));
         }
     }
 
