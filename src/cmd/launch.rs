@@ -4388,21 +4388,22 @@ defaults:
         std::fs::write(resources.join("app.asar"), "").unwrap();
         assert!(is_electron_bundle(&exe));
         // Through a symlink too: the documented Linux install is a link
-        // into a bin directory, and nothing sits beside the link.
-        let link_dir = dir.join("bin");
-        std::fs::create_dir(&link_dir).unwrap();
-        let link = link_dir.join("goose");
+        // into a bin directory, and nothing sits beside the link. Unix
+        // only — `std::os::unix` is what makes one without a privilege
+        // Windows asks for.
         #[cfg(unix)]
         {
+            let link_dir = dir.join("bin");
+            std::fs::create_dir(&link_dir).unwrap();
+            let link = link_dir.join("goose");
             std::os::unix::fs::symlink(&exe, &link).unwrap();
             assert!(is_electron_bundle(&link));
-        }
-        // A link to an ordinary file is still not the app.
-        let plain = link_dir.join("plain");
-        std::fs::write(link_dir.join("target"), "").unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(link_dir.join("target"), &plain).unwrap();
+
+            // A link to an ordinary file is still not the app.
+            let target = link_dir.join("target");
+            let plain = link_dir.join("plain");
+            std::fs::write(&target, "").unwrap();
+            std::os::unix::fs::symlink(&target, &plain).unwrap();
             assert!(!is_electron_bundle(&plain));
         }
 
