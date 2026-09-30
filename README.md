@@ -285,7 +285,8 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
-Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, ...) and whether
+Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, goose,
+goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
@@ -299,6 +300,18 @@ support. llmman writes Gemini mode to its own stable settings directory at
 
 Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
 and `globalState.json`, honouring `CLINE_DIR` like Cline does.
+
+`goose` launches the goose CLI and `goose-desktop` the desktop app, both
+with the same endpoint, model and key. Each is configured entirely through
+the environment goose reads in preference to its own config, so neither
+writes to `~/.config/goose` and your `goose configure` provider survives
+the launch. `goose-desktop` is found on `PATH` as `goose-desktop` or
+`goose-gui`, otherwise in `/Applications` on macOS and, on Linux,
+`/usr/lib/goose` from the .deb or `/usr/lib/Goose` from the .rpm — the two
+packages differ in that capital alone. Windows ships as a zip with no
+installer: add the unpacked folder to `PATH` and its `Goose.exe` is found
+there, told apart from the `goose` CLI — the same name to Windows — by the
+Electron files beside it.
 
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own

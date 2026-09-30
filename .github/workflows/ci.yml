@@ -661,10 +661,12 @@ jobs:
   # --------------------------------------------------------------------------
   # E2E: `llmman launch
   # <claude|agy|opencode|pi|omp|codex|cline|grok|qwen|hermes|openclaw|dsh|
-  # goose|docker-agent> --model
+  # goose|goose-desktop|docker-agent> --model
   # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
-  # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
+  # — not mocks, except goose-desktop, a GUI whose test supplies its own
+  # stub binary (see `launch_goose_desktop_env`) and so installs nothing
+  # here. Mirrors the `build` job's own 5-target matrix exactly
   # (same runners, same msvc-arch/rustflags choices), so the launch/env/
   # config plumbing this actually exercises gets checked on every
   # platform/architecture llmman ships a binary for, not just a subset.
@@ -692,7 +694,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/agy/opencode/pi/omp/codex/cline/grok/qwen/hermes/openclaw/dsh/goose/goose-desktop/docker-agent, vllm-plugin, vllm, sglang, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -707,7 +709,11 @@ jobs:
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 14*30 + 10 = 430 min. Exhausting
+    # tests (guarded by WARM's own Once). 14*30 + 10 = 430 min.
+    # `launch_goose_desktop_env` runs serialized with them but multiplies
+    # by nothing: its shim exits at once, so it carries a single TIMEOUT
+    # budget like the safetensors tests below rather than a retry one.
+    # Exhausting
     # every attempt doesn't fail this job either way (see
     # launch_and_assert's own doc comment) — a run can still legitimately
     # take this long in wall-clock time before giving up.
