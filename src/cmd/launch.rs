@@ -27,6 +27,7 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod claude;
 mod goose_desktop;
 mod sandbox;
 
@@ -1038,7 +1039,7 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => launch_claude(model, api_key, extra_args),
+        "claude" => claude::launch_claude(model, api_key, extra_args),
         "opencode" => launch_opencode(
             model,
             api_key,
@@ -1180,28 +1181,6 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
 // ---------------------------------------------------------------------------
 // Per-integration launchers
 // ---------------------------------------------------------------------------
-
-/// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
-/// our server's Anthropic-compatible API.
-fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    let server = server();
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("ANTHROPIC_BASE_URL", server.as_str()),
-            ("ANTHROPIC_API_KEY", api_key),
-        ],
-    )
-}
 
 /// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
 /// /v1 endpoint, with the model's thinking variants, its window and, for
