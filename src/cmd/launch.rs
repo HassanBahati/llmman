@@ -27,9 +27,9 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
-mod sandbox;
-mod goose_desktop;
 mod goose;
+mod goose_desktop;
+mod sandbox;
 
 pub use sandbox::Sandbox;
 
