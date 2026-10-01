@@ -27,9 +27,9 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
-mod copilot;
 mod claude;
 mod common;
+mod copilot;
 mod goose;
 mod goose_desktop;
 mod opencode;
