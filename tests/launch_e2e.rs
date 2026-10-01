@@ -1047,7 +1047,7 @@ fn launch_opencode_with_model() {
 
     // `run <message>`: opencode's non-interactive one-shot mode.
     // --print-logs --log-level DEBUG: opencode's provider (configured via
-    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode_config)
+    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode::opencode_config)
     // is installed on demand into ~/.config/opencode/node_modules the
     // first time a fresh HOME uses it, which showed up as a slow/hanging
     // step in one environment during development; keep this on so a CI
