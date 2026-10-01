@@ -28,6 +28,7 @@ use crate::daemon;
 use crate::providers;
 
 mod goose_desktop;
+mod openclaw;
 mod sandbox;
 
 pub use sandbox::Sandbox;
@@ -404,10 +405,10 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
         "gemini",
         "llmman cannot confirm it would send the key here rather than to Google",
     ),
-    // launch_openclaw passes --custom-model-id only through onboarding,
-    // which runs once. Every later launch reuses whatever openclaw.json
-    // already names, so the provider reference would never reach the
-    // daemon and the session would quietly run on the old model.
+    // openclaw::launch_openclaw passes --custom-model-id only through
+    // onboarding, which runs once. Every later launch reuses whatever
+    // openclaw.json already names, so the provider reference would never
+    // reach the daemon and the session would quietly run on the old model.
     (
         "openclaw",
         "it only takes a model during first-run onboarding",
@@ -1059,7 +1060,7 @@ fn launch(
         "gemini" => launch_gemini(model, api_key, extra_args),
         "agy" => launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, vision, extra_args),
-        "openclaw" => launch_openclaw(model, extra_args),
+        "openclaw" => openclaw::launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
         "dsh" => launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
         "goose" => launch_goose(model, api_key, extra_args),
@@ -1140,7 +1141,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "gemini" => vec![Dir(home.join(".gemini"))],
         "agy" => vec![Dir(agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes_home()?)],
-        // `launch_openclaw` takes the legacy config as onboarded too.
+        // `openclaw::launch_openclaw` takes the legacy config as onboarded too.
         "openclaw" => std::iter::once(home.join(".openclaw"))
             .chain(Some(home.join(".clawdbot")).filter(|d| d.is_dir()))
             .map(Dir)
@@ -2382,64 +2383,6 @@ fn strip_yaml_top_level_key(existing: &str, key: &str) -> String {
         out.push('\n');
     }
     out
-}
-
-/// openclaw's own onboarding independently re-verifies/pulls whatever
-/// `--custom-model-id` names against its configured endpoint, and
-/// mishandles llmman's own `docker.io/ai/<name>` form: it treats
-/// "docker.io/ai/" as a container registry path (real observed failure:
-/// "pull failed: copy image: docker.io/ai/0.8b ... requested access to
-/// the resource is denied", mangling "qwen3.5:0.8b" down to "0.8b" in
-/// the process). Stripping that prefix back to the bare short name —
-/// what a real user would actually type — matches what its pull
-/// verification expects. `"default"` when there's nothing left to strip
-/// to (no `--model` given at all).
-fn openclaw_model_id(model: &str) -> &str {
-    let bare = model.strip_prefix("docker.io/ai/").unwrap_or(model);
-    if bare.is_empty() {
-        "default"
-    } else {
-        bare
-    }
-}
-
-/// openclaw: runs its non-interactive onboarding (once) against our
-/// /v1 endpoint, then hands off to it directly. The real gateway/TUI/
-/// channel-setup lifecycle a full setup wizard also manages is left to
-/// openclaw's own defaults.
-fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin =
-        find_on_path("openclaw").ok_or_else(|| anyhow::anyhow!("openclaw is not installed"))?;
-
-    // Matches openclaw.go's own onboarded() check: current config path,
-    // or the legacy pre-rename one.
-    let onboarded = dirs::home_dir().is_some_and(|h| {
-        h.join(".openclaw").join("openclaw.json").exists()
-            || h.join(".clawdbot").join("clawdbot.json").exists()
-    });
-    if !onboarded {
-        let effective_model = openclaw_model_id(model);
-        // Through run_with_env so a --sandbox onboards the copy it runs.
-        let onboard = [
-            "onboard",
-            "--non-interactive",
-            "--accept-risk",
-            "--auth-choice",
-            "ollama",
-            "--custom-base-url",
-            &format!("{}/v1", server()),
-            "--custom-model-id",
-            effective_model,
-            "--skip-health",
-            "--skip-channels",
-            "--skip-skills",
-        ]
-        .map(String::from);
-        let code = run_with_env(&bin, &onboard, &[])?;
-        anyhow::ensure!(code == 0, "openclaw onboarding failed");
-    }
-
-    exec_with_env(&bin, extra_args, &[])
 }
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -3965,23 +3908,6 @@ mod tests {
                 "{local} resolved to a provider-routed reference: {resolved}"
             );
         }
-    }
-
-    /// Regression test for the real openclaw onboarding failure
-    /// described on `openclaw_model_id`'s own doc comment.
-    #[test]
-    fn openclaw_model_id_strips_the_docker_ai_prefix() {
-        assert_eq!(
-            openclaw_model_id("docker.io/ai/qwen3.5:0.8b"),
-            "qwen3.5:0.8b"
-        );
-        assert_eq!(openclaw_model_id("qwen3.5:0.8b"), "qwen3.5:0.8b");
-        assert_eq!(
-            openclaw_model_id("hf.co/unsloth/Qwen3.5-0.8B-GGUF"),
-            "hf.co/unsloth/Qwen3.5-0.8B-GGUF"
-        );
-        assert_eq!(openclaw_model_id(""), "default");
-        assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
     }
 
     /// Every integration `check_model_flag` holds to a model must be one
