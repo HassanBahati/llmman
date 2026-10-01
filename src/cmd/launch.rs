@@ -27,6 +27,7 @@ use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod copilot;
 mod goose_desktop;
 mod sandbox;
 
@@ -1054,7 +1055,7 @@ fn launch(
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
         "agy" => launch_agy(model, api_key, extra_args),
@@ -2174,21 +2175,6 @@ fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Re
             ("OPENAI_BASE_URL", base_url.as_str()),
         ],
     )
-}
-
-/// copilot: passes COPILOT_PROVIDER_BASE_URL via env.
-fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin =
-        find_on_path("gh").ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed"))?;
-
-    let base_url = format!("{}/v1", server());
-    let mut args = vec!["copilot".to_string()];
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(&bin, &args, &[("COPILOT_PROVIDER_BASE_URL", &base_url)])
 }
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
