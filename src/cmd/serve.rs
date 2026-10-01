@@ -1363,7 +1363,7 @@ impl Drop for QueueGuard {
 /// consumer goroutine rather than rejecting every single one outright
 /// — a one-in-flight-at-a-time cap is the closest llmman gets to that
 /// same direct handoff, having no consumer-goroutine equivalent of its
-/// own. Not "unbounded" either way. `fetch_update` (not a plain
+/// own. Not "unbounded" either way. `try_update` (not a plain
 /// increment-then-check) so rejected callers never inflate the counter.
 fn try_admit_against(
     counter: &'static std::sync::atomic::AtomicUsize,
@@ -1371,7 +1371,7 @@ fn try_admit_against(
 ) -> Result<QueueGuard, AppError> {
     let cap = max_queue.max(1);
     let admitted = counter
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |n| (n < cap).then_some(n + 1),
@@ -4102,8 +4102,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!(
-        "llmman serve listening on {addr}{}",
-        if tls.is_some() { " (TLS)" } else { "" }
+        "llmman serve listening on http{}://{addr}",
+        if tls.is_some() { "s" } else { "" }
     );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.

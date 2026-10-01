@@ -1047,7 +1047,7 @@ fn launch_opencode_with_model() {
 
     // `run <message>`: opencode's non-interactive one-shot mode.
     // --print-logs --log-level DEBUG: opencode's provider (configured via
-    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode_config)
+    // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode::opencode_config)
     // is installed on demand into ~/.config/opencode/node_modules the
     // first time a fresh HOME uses it, which showed up as a slow/hanging
     // step in one environment during development; keep this on so a CI
@@ -1378,7 +1378,14 @@ fn launch_omp_with_model() {
     // `-p <prompt>` is OMP's print-and-exit mode. The launcher selects
     // `ollama/<model>` while run_launch's fresh HOME ensures the test does
     // not succeed because of a developer's pre-existing OMP configuration.
-    launch_and_assert_strict("omp", &["-p", PROMPT]);
+    // The 0.8B model can say any word ("Rust" x3 in run 36833820219): any reply counts.
+    launch_and_assert_strict_inspecting(
+        "omp",
+        &["-p", PROMPT],
+        |_stdout, _stderr| false,
+        |stdout| !stdout.trim().is_empty(),
+        |_home| {},
+    );
 }
 
 #[test]
