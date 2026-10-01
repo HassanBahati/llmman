@@ -9,12 +9,11 @@ use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
 use std::process::Command;
 
+use super::goose::goose_env;
 use super::sandbox;
-use super::{
-    accepts_prompt, env_dir, exec_with_env, find_on_path, find_on_path_unless, goose_env, server,
-};
+use super::{accepts_prompt, env_dir, exec_with_env, find_on_path, find_on_path_unless, server};
 
-/// goose-desktop: [`super::launch_goose`]'s environment, pointed at the desktop
+/// goose-desktop: [`super::goose::launch_goose`]'s environment, pointed at the desktop
 /// app. Configured through the environment alone, so nothing is written
 /// and a `goose configure` provider survives the launch.
 ///
@@ -619,7 +618,7 @@ fn goose_desktop_fallback(home: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::goose_fallback;
+    use super::super::goose::goose_fallback;
     use super::*;
 
     /// The environment the desktop target hands over. Both launchers call
