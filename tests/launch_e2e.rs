@@ -74,7 +74,7 @@
 //!     request 500'd and Claude Code retried in a loop until giving up —
 //!     fixed in `cmd::serve::anthropic::handle_anthropic_messages` by
 //!     folding every system-role turn into one leading message.
-//!   - `codex`: the config `write_codex_config` wrote (a `[profiles.llmman]`
+//!   - `codex`: the config `codex::write_codex_config` wrote (a `[profiles.llmman]`
 //!     table in `config.toml`) is a format current codex (0.134+) refuses
 //!     to load at all — fixed by writing the sibling
 //!     `~/.codex/llmman.config.toml` overlay codex now expects instead.
