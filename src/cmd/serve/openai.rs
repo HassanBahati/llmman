@@ -220,7 +220,7 @@ impl MergedInstructions {
 /// llama-server reads `reasoning_effort` itself; older builds and vLLM
 /// read only the kwargs. The caller's own kwargs win key by key.
 /// [`provider_compat`] is the reverse, for a provider.
-pub(super) fn apply_reasoning_effort(req: &mut serde_json::Value) {
+fn apply_reasoning_effort(req: &mut serde_json::Value) {
     let Some(effort) = req.get("reasoning_effort").and_then(|v| v.as_str()) else {
         return;
     };
@@ -525,7 +525,7 @@ pub(super) async fn proxy_openai_passthrough(
 
 /// [`proxy_openai_passthrough`] after the model is loaded: wire checks,
 /// then the proxy. Split out for [`handle_openai_media`].
-pub(super) async fn forward_openai_request(
+async fn forward_openai_request(
     state: &AppState,
     headers: &HeaderMap,
     mut req: serde_json::Value,
@@ -588,7 +588,7 @@ pub(super) async fn forward_openai_request(
 /// instead of forwarding a `/v1/embeddings` request on to an
 /// `Engine::Mlx` backend — see that function's own doc comment on why
 /// that request could never succeed there anyway.
-pub(super) fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
+fn mlx_embeddings_unsupported_response(canonical_model: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": format!(
@@ -693,9 +693,7 @@ async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
 /// returned (vLLM-Omni's text-to-image does not stream). `Err` names a
 /// request that cannot be expressed: one dimension without the other
 /// (llama-server fills in a default; vLLM-Omni's `size` needs both).
-pub(super) fn omni_image_request(
-    mut req: serde_json::Value,
-) -> Result<(serde_json::Value, bool), String> {
+fn omni_image_request(mut req: serde_json::Value) -> Result<(serde_json::Value, bool), String> {
     let stream = req["stream"].as_bool().unwrap_or(false);
     let Some(obj) = req.as_object_mut() else {
         return Ok((req, stream));
@@ -785,7 +783,7 @@ async fn omni_images(
 /// names renamed (`steps`, `cfg_scale`, `frames`, `audio`), fractional
 /// `seconds` rounded to the whole seconds it takes, everything else by
 /// name (objects as JSON text, which is how it reads `extra_params`).
-pub(super) fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
+fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)> {
     let Some(obj) = req.as_object() else {
         return Vec::new();
     };
@@ -839,7 +837,7 @@ pub(super) fn omni_video_fields(req: &serde_json::Value) -> Vec<(String, String)
 /// Both come from the caller: a name that is not a plain identifier is
 /// dropped (it would be written into a header), and the boundary is
 /// re-salted until no value contains it.
-pub(super) fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
+fn multipart_form(fields: &[(String, String)]) -> (Vec<u8>, String) {
     let fields: Vec<&(String, String)> = fields
         .iter()
         .filter(|(name, _)| {
@@ -1012,7 +1010,7 @@ pub(super) const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 /// Extracts a top-level form field's text value from a
 /// `multipart/form-data` body, or `None` if not multipart / no boundary /
 /// field not found.
-pub(super) async fn multipart_text_field(
+async fn multipart_text_field(
     body: &Bytes,
     headers: &HeaderMap,
     field_name: &str,
@@ -1171,5 +1169,478 @@ mod tests {
             multipart_text_field(&plain_body, &HeaderMap::new(), "model").await,
             None
         );
+    }
+
+    /// Regression test for the second CodeRabbit finding in review:
+    /// `/v1/embeddings` against an `Engine::Mlx` backend must
+    /// fail fast with a clear reason (not a bare, unexplained 404 from
+    /// forwarding to `mlx_lm.server`, which never gets a
+    /// `--embedding-model` from `spawn_mlx_server` — see
+    /// `proxy_openai_passthrough`'s own doc comment).
+    #[tokio::test]
+    async fn mlx_embeddings_unsupported_response_explains_why_and_names_the_model() {
+        let resp = mlx_embeddings_unsupported_response("gemma4:latest");
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("gemma4:latest"));
+        assert!(message.contains("mlx_lm.server"));
+        assert!(message.contains("/v1/embeddings"));
+    }
+
+    #[test]
+    fn omni_image_request_translates_llama_server_fields() {
+        // what `llmman run` (crate::imagegen) sends
+        let req = serde_json::json!({
+            "model": "nvidia/Cosmos3-Edge",
+            "prompt": "a manatee",
+            "stream": true,
+            "response_format": "b64_json",
+            "width": 640,
+            "height": 480,
+            "steps": 8,
+            "seed": 42,
+            "cfg_scale": 5.0,
+            "negative_prompt": "blurry"
+        });
+        let (out, stream) = omni_image_request(req).unwrap();
+        assert!(stream);
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "model": "nvidia/Cosmos3-Edge",
+                "prompt": "a manatee",
+                "response_format": "b64_json",
+                "size": "640x480",
+                "num_inference_steps": 8,
+                "seed": 42,
+                "guidance_scale": 5.0,
+                "negative_prompt": "blurry"
+            })
+        );
+    }
+
+    #[test]
+    fn omni_image_request_leaves_a_native_request_alone_and_invents_nothing() {
+        // A vLLM-Omni-dialect client: nothing renamed, nothing added but
+        // the response format, and no size when none was asked for (the
+        // model's own default is the one that works for Cosmos3-Edge).
+        let req = serde_json::json!({
+            "model": "m", "prompt": "p", "size": "1024x1024",
+            "num_inference_steps": 50, "guidance_scale": 7.0
+        });
+        let (out, stream) = omni_image_request(req.clone()).unwrap();
+        assert!(!stream);
+        let mut expected = req;
+        expected["response_format"] = "b64_json".into();
+        assert_eq!(out, expected);
+        let (out, _) =
+            omni_image_request(serde_json::json!({"model": "m", "prompt": "p"})).unwrap();
+        assert!(out.get("size").is_none());
+        assert!(out.get("num_inference_steps").is_none());
+        // zero means "model default", as it does for llama-server
+        let (out, _) = omni_image_request(
+            serde_json::json!({"prompt": "p", "width": 0, "height": 0, "steps": 0}),
+        )
+        .unwrap();
+        assert!(out.get("size").is_none());
+        assert!(out.get("num_inference_steps").is_none());
+        // an explicit native field wins over a translated one
+        let (out, _) = omni_image_request(
+            serde_json::json!({"prompt": "p", "steps": 8, "num_inference_steps": 30}),
+        )
+        .unwrap();
+        assert_eq!(out["num_inference_steps"], 30);
+        // one dimension without the other cannot be expressed as a `size`
+        let err = omni_image_request(serde_json::json!({"prompt": "p", "width": 768})).unwrap_err();
+        assert!(err.contains("both width and height"), "{err}");
+    }
+
+    #[test]
+    fn omni_video_fields_translate_and_round_seconds() {
+        let req = serde_json::json!({
+            "model": "nvidia/Cosmos3-Edge",
+            "prompt": "waves",
+            "stream": false,
+            "seconds": 2.4,
+            "fps": 24,
+            "steps": 20,
+            "cfg_scale": 5.0,
+            "audio": false,
+            "seed": 7,
+            "extra_params": {"guardrails": false}
+        });
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&req).into_iter().collect();
+        assert_eq!(fields["model"], "nvidia/Cosmos3-Edge");
+        assert_eq!(fields["prompt"], "waves");
+        assert_eq!(fields["seconds"], "2", "SecondStr is a whole number");
+        assert_eq!(fields["fps"], "24");
+        assert_eq!(fields["num_inference_steps"], "20");
+        assert_eq!(fields["guidance_scale"], "5.0");
+        assert_eq!(fields["generate_sound"], "false");
+        assert_eq!(fields["seed"], "7");
+        assert_eq!(fields["extra_params"], r#"{"guardrails":false}"#);
+        assert!(!fields.contains_key("stream"));
+        assert!(!fields.contains_key("steps"));
+        // sub-second clips round up to one second, not zero
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&serde_json::json!({"prompt": "p", "seconds": 0.3}))
+                .into_iter()
+                .collect();
+        assert_eq!(fields["seconds"], "1");
+        // `frames` is llama-server's name for num_frames; a native one wins
+        let fields: std::collections::HashMap<String, String> =
+            omni_video_fields(&serde_json::json!({"prompt": "p", "frames": 33, "num_frames": 49}))
+                .into_iter()
+                .collect();
+        assert_eq!(fields["num_frames"], "49");
+    }
+
+    #[test]
+    fn multipart_form_is_well_formed_and_readable_back() {
+        let fields = vec![
+            ("model".to_string(), "m".to_string()),
+            ("prompt".to_string(), "a b\r\nc".to_string()),
+        ];
+        let (body, content_type) = multipart_form(&fields);
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap();
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(text.starts_with(&format!("--{boundary}\r\n")));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+        // a name that is not an identifier would land in a header: dropped
+        let (filtered, _) = multipart_form(&[
+            ("ok_1".to_string(), "v".to_string()),
+            ("bad\"\r\nX: y".to_string(), "v".to_string()),
+        ]);
+        let filtered = String::from_utf8(filtered).unwrap();
+        assert!(filtered.contains("name=\"ok_1\""));
+        // Look for the field, not the bare word: the boundary is hex from
+        // the clock and does spell "bad" now and then.
+        assert!(!filtered.contains("name=\"bad\""), "{filtered}");
+        assert!(!filtered.contains("X: y"), "{filtered}");
+        // a value containing the would-be boundary forces a different one
+        let (_, ct2) = multipart_form(&[("prompt".to_string(), format!("x{boundary}y"))]);
+        assert_ne!(ct2, content_type);
+        // and the same parser the daemon uses for uploads agrees
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", content_type.parse().unwrap());
+        let body = Bytes::from(body);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            rt.block_on(multipart_text_field(&body, &headers, "prompt")),
+            Some("a b\r\nc".to_string())
+        );
+        assert_eq!(
+            rt.block_on(multipart_text_field(&body, &headers, "model")),
+            Some("m".to_string())
+        );
+    }
+
+    /// An agent runner sends one `system` message per toolset, which a
+    /// strict template refuses past the first.
+    #[test]
+    fn consolidate_chat_system_messages_merges_them_into_one_leading_message() {
+        let mut req = serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "messages": [
+                {"role": "system", "content": "you are a helpful assistant"},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "## Shell Tools"},
+                {"role": "developer", "content": [{"type": "text", "text": "## Filesystem Tools"}]}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content":
+                    "you are a helpful assistant\n\n## Shell Tools\n\n## Filesystem Tools"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// The common shape, and the one every ordinary request pays for:
+    /// already-leading system message, returned byte for byte.
+    #[test]
+    fn consolidate_chat_system_messages_leaves_a_single_leading_one_alone() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "you are a helpful assistant"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+    }
+
+    /// Rebuilding a conforming request would flatten its content to text
+    /// and drop every block that isn't.
+    #[test]
+    fn consolidate_chat_system_messages_keeps_block_content_when_conforming() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+    }
+
+    /// Folding content to text drops every block that isn't text, which
+    /// forwards a truncated prompt with no error.
+    #[test]
+    fn consolidate_chat_system_messages_keeps_non_text_blocks_while_merging() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "and cite sources"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "be terse"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    {"type": "text", "text": "and cite sources"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// The blank line separates messages, so one message's own parts must
+    /// not use it too — two parts would read as two instructions.
+    #[test]
+    fn consolidate_chat_system_messages_keep_a_messages_own_parts_off_the_blank_line() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"}
+                ]},
+                {"role": "user", "content": "hi"},
+                // Without this the request conforms and is returned as written.
+                {"role": "developer", "content": "developer instruction"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"][0]["content"],
+            "part one\npart two\n\ndeveloper instruction"
+        );
+    }
+
+    /// A non-text block ends the run it interrupts: parts before it stay one
+    /// instruction, parts after it start another. The image is the object
+    /// shape an OpenAI client sends, asserted back whole — `push` clones a
+    /// non-text block rather than reading it, so its shape does not matter.
+    #[test]
+    fn consolidate_chat_system_messages_let_a_non_text_block_end_the_run() {
+        let image = serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}
+        });
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "before one"},
+                    {"type": "text", "text": "before two"},
+                    image,
+                    {"type": "text", "text": "after"}
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "and cite sources"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "before one\nbefore two"},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+                {"type": "text", "text": "after\n\nand cite sources"}
+            ])
+        );
+        // Non-instruction turns are left alone.
+        assert_eq!(
+            req["messages"][1],
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
+        assert_eq!(req["messages"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// An empty part is dropped, not joined: it would otherwise leave a
+    /// stray newline at either end of the run, or a blank line mid-message.
+    #[test]
+    fn consolidate_chat_system_messages_drop_empty_parts_from_the_run() {
+        let cases = [
+            // Leading, trailing and lone empties leave no trace.
+            (
+                serde_json::json!([{"type": "text", "text": "a"},
+                                {"type": "text", "text": ""}]),
+                "a\n\ndev",
+            ),
+            (
+                serde_json::json!([{"type": "text", "text": ""},
+                                {"type": "text", "text": "b"}]),
+                "b\n\ndev",
+            ),
+            (
+                serde_json::json!([{"type": "text", "text": ""},
+                                {"type": "text", "text": ""}]),
+                "dev",
+            ),
+            // One between two real parts does not split them.
+            (
+                serde_json::json!([{"type": "text", "text": "a"},
+                                {"type": "text", "text": ""},
+                                {"type": "text", "text": "b"}]),
+                "a\nb\n\ndev",
+            ),
+        ];
+        for (content, want) in cases {
+            let mut req = serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "hi"},
+                    {"role": "developer", "content": "dev"}
+                ]
+            });
+            consolidate_chat_system_messages(&mut req);
+            assert_eq!(req["messages"][0]["content"], want);
+        }
+    }
+
+    /// A late system turn is the shape templates reject, so it moves — and
+    /// reorders relative to the user turn before it, as `/v1/messages` does.
+    #[test]
+    fn consolidate_chat_system_messages_moves_a_late_lone_system_turn_to_the_front() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "a mid-conversation reminder"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "a mid-conversation reminder"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// A request with no system message must not gain one.
+    #[test]
+    fn consolidate_chat_system_messages_is_a_no_op_without_any() {
+        let mut req = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let before = req.clone();
+        consolidate_chat_system_messages(&mut req);
+        assert_eq!(req, before);
+
+        // An embeddings-shaped body has no `messages` at all.
+        let mut input_only = serde_json::json!({"input": "hi"});
+        let before = input_only.clone();
+        consolidate_chat_system_messages(&mut input_only);
+        assert_eq!(input_only, before);
+    }
+
+    /// An empty system message must not join a blank line into the merge.
+    #[test]
+    fn consolidate_chat_system_messages_drops_empty_ones() {
+        let mut req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "the only real instruction"}
+            ]
+        });
+
+        consolidate_chat_system_messages(&mut req);
+
+        assert_eq!(
+            req["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "the only real instruction"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+    }
+
+    /// A local `reasoning_effort` becomes the `chat_template_kwargs` Ollama's
+    /// `think` would; the caller's kwargs win; an unknown level changes nothing.
+    #[test]
+    fn apply_reasoning_effort_mirrors_it_into_template_kwargs() {
+        let with = |req: serde_json::Value| {
+            let mut req = req;
+            apply_reasoning_effort(&mut req);
+            req
+        };
+        assert_eq!(
+            with(serde_json::json!({ "model": "m", "reasoning_effort": "none" })),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "none",
+                "chat_template_kwargs": { "enable_thinking": false }
+            })
+        );
+        for level in crate::chat_template::EFFORT_LEVELS {
+            assert_eq!(
+                with(serde_json::json!({ "model": "m", "reasoning_effort": level })),
+                serde_json::json!({
+                    "model": "m", "reasoning_effort": level,
+                    "chat_template_kwargs": { "enable_thinking": true, "reasoning_effort": level }
+                }),
+                "{level}"
+            );
+        }
+        assert_eq!(
+            with(serde_json::json!({
+                "model": "m", "reasoning_effort": "high",
+                "chat_template_kwargs": { "enable_thinking": false }
+            })),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "high",
+                "chat_template_kwargs": { "enable_thinking": false, "reasoning_effort": "high" }
+            })
+        );
+        let unknown = serde_json::json!({ "model": "m", "reasoning_effort": "verbose" });
+        assert_eq!(with(unknown.clone()), unknown);
+        let absent = serde_json::json!({ "model": "m", "chat_template_kwargs": { "a": 1 } });
+        assert_eq!(with(absent.clone()), absent);
+        let not_a_string = serde_json::json!({ "model": "m", "reasoning_effort": 3 });
+        assert_eq!(with(not_a_string.clone()), not_a_string);
     }
 }
