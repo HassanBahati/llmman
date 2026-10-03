@@ -20,13 +20,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use base64::Engine as _;
 use clap::Args;
 
 use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod agy;
 mod claude;
 mod codex;
 mod common;
@@ -1064,7 +1064,7 @@ fn launch(
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
-        "agy" => launch_agy(model, api_key, extra_args),
+        "agy" => agy::launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, vision, extra_args),
         "openclaw" => openclaw::launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
@@ -1145,7 +1145,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         ],
         "kimi" => vec![Dir(home.join(".kimi"))],
         "gemini" => vec![Dir(home.join(".gemini"))],
-        "agy" => vec![Dir(agy_settings_dir()?)],
+        "agy" => vec![Dir(agy::agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes_home()?)],
         // `openclaw::launch_openclaw` takes the legacy config as onboarded too.
         "openclaw" => std::iter::once(home.join(".openclaw"))
@@ -1696,54 +1696,6 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
             ("GEMINI_API_KEY", api_key),
         ],
     )
-}
-
-/// AGY speaks Gemini's native generation protocol. The encoded model in the
-/// base URL is llmman's routing instruction; AGY also makes auxiliary calls
-/// with its own hard-coded model names, so the server deliberately ignores
-/// the model segment AGY appends and sends every call to the model selected
-/// here.
-fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("agy").ok_or_else(|| anyhow::anyhow!("agy is not installed"))?;
-    anyhow::ensure!(
-        !extra_args
-            .iter()
-            .any(|arg| matches!(arg.split('=').next(), Some("--gemini_dir" | "-gemini_dir"))),
-        "llmman manages AGY’s --gemini_dir"
-    );
-    let gemini_dir = agy_settings_dir()?;
-    write_agy_settings_at(&gemini_dir)?;
-    let mut args = vec![format!("--gemini_dir={}", gemini_dir.display())];
-    args.extend_from_slice(extra_args);
-
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
-    let base_url = format!("{}/gemini/{encoded}", server());
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("GOOGLE_GEMINI_BASE_URL", base_url.as_str()),
-            ("GEMINI_API_KEY", api_key),
-            // AGY prefers GOOGLE_API_KEY when both names exist. Override it
-            // too so an unrelated key inherited from the shell cannot bypass
-            // the credential llmman selected for this request.
-            ("GOOGLE_API_KEY", api_key),
-        ],
-    )
-}
-
-fn agy_settings_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home directory")?
-        .join(".gemini")
-        .join("llmman"))
-}
-
-fn write_agy_settings_at(gemini_dir: &Path) -> anyhow::Result<()> {
-    let settings_path = gemini_dir.join("antigravity-cli").join("settings.json");
-    std::fs::create_dir_all(settings_path.parent().expect("settings file has a parent"))?;
-    crate::fsutil::write_atomic(&settings_path, b"{\n  \"modelProvider\": \"gemini\"\n}\n")
-        .with_context(|| format!("write {}", settings_path.display()))
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
@@ -3006,25 +2958,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agy_settings_are_written_to_the_llmman_owned_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-agy-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        write_agy_settings_at(&dir).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dir.join("antigravity-cli/settings.json")).unwrap(),
-            "{\n  \"modelProvider\": \"gemini\"\n}\n"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn agy_is_listed_as_an_integration() {
         let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
         assert_eq!(agy.binary, "agy");
@@ -3100,7 +3033,7 @@ mod tests {
         covers("pi", pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
         covers("cline", cline_data_dir().unwrap());
-        covers("agy", agy_settings_dir().unwrap());
+        covers("agy", agy::agy_settings_dir().unwrap());
         covers("hermes", hermes_home().unwrap());
         covers("qwen", qwen_home().unwrap());
         covers("dsh", dsh_config_dir().unwrap());
