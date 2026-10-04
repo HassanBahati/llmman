@@ -20,15 +20,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use base64::Engine as _;
 use clap::Args;
 
 use crate::chat_template::{ThinkingControls, EFFORT_LEVELS};
 use crate::daemon;
 use crate::providers;
 
+mod agy;
 mod aider;
+mod claude;
+mod codex;
+mod common;
+mod copilot;
+mod goose;
 mod goose_desktop;
+mod openclaw;
+mod opencode;
 mod sandbox;
 
 pub use sandbox::Sandbox;
@@ -405,10 +412,10 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
         "gemini",
         "llmman cannot confirm it would send the key here rather than to Google",
     ),
-    // launch_openclaw passes --custom-model-id only through onboarding,
-    // which runs once. Every later launch reuses whatever openclaw.json
-    // already names, so the provider reference would never reach the
-    // daemon and the session would quietly run on the old model.
+    // openclaw::launch_openclaw passes --custom-model-id only through
+    // onboarding, which runs once. Every later launch reuses whatever
+    // openclaw.json already names, so the provider reference would never
+    // reach the daemon and the session would quietly run on the old model.
     (
         "openclaw",
         "it only takes a model during first-run onboarding",
@@ -798,11 +805,11 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 /// launcher knows.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
-        "opencode" => find_opencode(),
+        "opencode" => opencode::find_opencode(),
         "omp" => find_omp(),
         "qwen" => find_qwen(),
         "dsh" => find_dsh().map(|(bin, _)| bin),
-        "goose" => find_goose(),
+        "goose" => goose::find_goose(),
         "goose-desktop" => goose_desktop::find_goose_desktop(),
         "grok" => find_grok(),
         "docker-agent" => find_docker_agent(),
@@ -996,7 +1003,7 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// (see [`local_context_window`]), a `--provider` model's catalog one,
 /// or a pair's larger half (see [`pair_context_window`]); `None` when
 /// none of them is known. codex alone substitutes
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
+/// [`codex::CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
 /// cannot omit the field.
 #[allow(clippy::too_many_arguments)]
 fn launch(
@@ -1039,8 +1046,8 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => launch_claude(model, api_key, extra_args),
-        "opencode" => launch_opencode(
+        "claude" => claude::launch_claude(model, api_key, extra_args),
+        "opencode" => opencode::launch_opencode(
             model,
             api_key,
             thinking,
@@ -1050,20 +1057,20 @@ fn launch(
             max_output,
             extra_args,
         ),
-        "codex" => launch_codex(model, api_key, vision, context_window, extra_args),
+        "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
         "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
         "aider" => aider::launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => launch_copilot(model, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
-        "agy" => launch_agy(model, api_key, extra_args),
+        "agy" => agy::launch_agy(model, api_key, extra_args),
         "hermes" => launch_hermes(model, vision, extra_args),
-        "openclaw" => launch_openclaw(model, extra_args),
+        "openclaw" => openclaw::launch_openclaw(model, extra_args),
         "qwen" => launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
         "dsh" => launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
-        "goose" => launch_goose(model, api_key, extra_args),
+        "goose" => goose::launch_goose(model, api_key, extra_args),
         "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, extra_args),
         "grok" => launch_grok(model, api_key, listed.as_ref(), extra_args),
         "docker-agent" => launch_docker_agent(model, api_key, extra_args),
@@ -1125,10 +1132,10 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "opencode" => vec![
             Dir(config.join("opencode")),
             Dir(data.join("opencode")),
-            Dir(opencode_state_dir()?),
+            Dir(opencode::opencode_state_dir()?),
             Dir(xdg("XDG_CACHE_HOME", ".cache").join("opencode")),
         ],
-        "codex" => vec![Dir(codex_dir()?)],
+        "codex" => vec![Dir(codex::codex_dir()?)],
         "pi" => vec![Dir(pi_agent_dir()?)],
         "omp" => vec![Dir(omp_agent_dir()?)],
         "cline" => vec![Dir(cline_dir()?)],
@@ -1139,9 +1146,9 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         ],
         "kimi" => vec![Dir(home.join(".kimi"))],
         "gemini" => vec![Dir(home.join(".gemini"))],
-        "agy" => vec![Dir(agy_settings_dir()?)],
+        "agy" => vec![Dir(agy::agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes_home()?)],
-        // `launch_openclaw` takes the legacy config as onboarded too.
+        // `openclaw::launch_openclaw` takes the legacy config as onboarded too.
         "openclaw" => std::iter::once(home.join(".openclaw"))
             .chain(Some(home.join(".clawdbot")).filter(|d| d.is_dir()))
             .map(Dir)
@@ -1182,93 +1189,9 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
 // Per-integration launchers
 // ---------------------------------------------------------------------------
 
-/// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
-/// our server's Anthropic-compatible API.
-fn launch_claude(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    let server = server();
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("ANTHROPIC_BASE_URL", server.as_str()),
-            ("ANTHROPIC_API_KEY", api_key),
-        ],
-    )
-}
-
-/// opencode: a JSON config via OPENCODE_CONFIG_CONTENT pointing at our
-/// /v1 endpoint, with the model's thinking variants, its window and, for
-/// a vision model, image input. `--variant` becomes the model's default
-/// options and its selection in opencode's state.
-#[allow(clippy::too_many_arguments)]
-fn launch_opencode(
-    model: &str,
-    api_key: &str,
-    thinking: Option<&Thinking>,
-    variant: Option<&str>,
-    vision: bool,
-    context_window: Option<u64>,
-    max_output: Option<u32>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    let bin = find_opencode().ok_or_else(|| anyhow::anyhow!("opencode is not installed"))?;
-
-    let effective_model = if model.is_empty() { "default" } else { model };
-    let variants = opencode_variants(thinking);
-    let options = variant.and_then(|v| variants.iter().find(|(name, _)| *name == v));
-    let config = opencode_config(
-        &server(),
-        effective_model,
-        api_key,
-        &variants,
-        options.map(|(_, options)| options),
-        vision,
-        context_window,
-        max_output,
-    );
-    if let Some(variant) = variant {
-        write_opencode_variant(&opencode_state_dir()?, effective_model, variant)?;
-    }
-
-    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
-}
-
-/// opencode's state directory, where its `xdg-basedir` puts it.
-fn opencode_state_dir() -> anyhow::Result<PathBuf> {
-    let home = crate::config::home_dir().context("no home directory")?;
-    Ok(xdg_dir(&home, "XDG_STATE_HOME", ".local/state").join("opencode"))
-}
-
 /// `$var`, else `default` under `home`.
 fn xdg_dir(home: &Path, var: &str, default: &str) -> PathBuf {
     env_dir(var).unwrap_or_else(|| home.join(default))
-}
-
-/// How opencode names `model` on llmman's provider.
-fn opencode_model_ref(model: &str) -> String {
-    format!("ollama/{model}")
-}
-
-/// Selects `variant` for `model` in opencode's `model.json`, as ctrl+t
-/// does. Its UI sends that selection, which outranks the model's
-/// `options`; only `opencode run` sends those alone.
-fn write_opencode_variant(state_dir: &Path, model: &str, variant: &str) -> anyhow::Result<()> {
-    write_json_merged(&state_dir.join("model.json"), "opencode", |existing| {
-        let mut merged = existing.clone();
-        if !merged["variant"].is_object() {
-            merged["variant"] = serde_json::json!({});
-        }
-        merged["variant"][opencode_model_ref(model)] = variant.into();
-        merged
-    })
 }
 
 /// The thinking choices a model offers an integration, in cycle order.
@@ -1321,216 +1244,6 @@ fn unknown_levels_with(variant: &str) -> Thinking {
         .map(String::from)
         .collect();
     Thinking::Listed(levels)
-}
-
-/// opencode's `variants` for the model, in cycle order (`variant_cycle`,
-/// ctrl+t by default): [`thinking_choices`]. Each variant is the request
-/// options `@ai-sdk/openai-compatible` sends: `reasoningEffort` as
-/// `reasoning_effort`, other keys verbatim. opencode derives variants
-/// only for models it knows from models.dev, so without these a model
-/// has nothing to cycle.
-/// A switch-only model's two variants set both keys, so either overrides
-/// the other when `--variant` put it in the model's options.
-fn opencode_variants(thinking: Option<&Thinking>) -> Vec<(&str, serde_json::Value)> {
-    let choices = thinking_choices(thinking);
-    let switch = choices.contains(&"thinking");
-    choices
-        .into_iter()
-        .map(|choice| {
-            let options = match choice {
-                "none" if switch => serde_json::json!({
-                    "reasoningEffort": "none",
-                    "chat_template_kwargs": { "enable_thinking": false },
-                }),
-                "thinking" => serde_json::json!({
-                    "reasoningEffort": "medium",
-                    "chat_template_kwargs": { "enable_thinking": true },
-                }),
-                level => serde_json::json!({ "reasoningEffort": level }),
-            };
-            (choice, options)
-        })
-        .collect()
-}
-
-/// Finds opencode on `PATH`, then where its installers put it. The second
-/// check finds a fresh install that this process's `PATH` doesn't include
-/// yet.
-fn find_opencode() -> Option<PathBuf> {
-    find_on_path("opencode").or_else(|| opencode_fallback_paths().into_iter().find(|p| p.is_file()))
-}
-
-/// Where opencode's installers put it: `~/.opencode/bin` (install script)
-/// and, on Windows, `%APPDATA%\npm` (`npm install -g`).
-fn opencode_fallback_paths() -> Vec<PathBuf> {
-    let home = dirs::home_dir();
-    if cfg!(windows) {
-        let mut paths: Vec<PathBuf> = home
-            .iter()
-            .map(|h| h.join(".opencode").join("bin").join("opencode.exe"))
-            .collect();
-        // Treat an empty APPDATA as unset.
-        let roaming = std::env::var_os("APPDATA")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Roaming")));
-        if let Some(npm) = roaming.map(|d| d.join("npm")) {
-            paths.extend(
-                WINDOWS_PATH_EXTS
-                    .iter()
-                    .map(|ext| npm.join(format!("opencode.{ext}"))),
-            );
-        }
-        return paths;
-    }
-    home.iter()
-        .map(|h| h.join(".opencode").join("bin").join("opencode"))
-        .collect()
-}
-
-/// opencode's own `OUTPUT_TOKEN_MAX` (`provider/transform.ts`), the cap
-/// it applies to `limit.output` and the value it substitutes for a 0.
-const OPENCODE_OUTPUT_TOKEN_MAX: u64 = 32_000;
-
-/// `limit.output` for a window of `context` when the catalog names no
-/// real ceiling: a quarter, capped at [`OPENCODE_OUTPUT_TOKEN_MAX`],
-/// never 0.
-///
-/// opencode spends this field twice — the `maxOutputTokens` it sends
-/// and the headroom it keeps before compacting — capping both at its
-/// own [`OPENCODE_OUTPUT_TOKEN_MAX`], which is what makes a catalog
-/// ceiling of any size safe to pass. A quarter is the guess where
-/// there is none: longer than one turn produces, short enough to leave
-/// the window mostly usable.
-fn opencode_output_reserve(context: u64) -> u64 {
-    (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
-}
-
-/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
-/// than `json!`, whose map sorts keys: opencode cycles variants in the
-/// order listed. No variants leaves the key out.
-#[allow(clippy::too_many_arguments)]
-fn opencode_config(
-    server: &str,
-    model: &str,
-    api_key: &str,
-    variants: &[(&str, serde_json::Value)],
-    options: Option<&serde_json::Value>,
-    vision: bool,
-    context_window: Option<u64>,
-    max_output: Option<u32>,
-) -> String {
-    use serde::ser::{SerializeMap, Serializer};
-
-    /// An object with runtime keys, in the order given.
-    fn entries<S: Serializer, V: serde::Serialize>(
-        entries: &[(&str, V)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (key, value) in entries {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
-    }
-
-    #[derive(serde::Serialize)]
-    struct Config<'a> {
-        #[serde(rename = "$schema")]
-        schema: &'static str,
-        provider: Providers<'a>,
-        model: String,
-    }
-    #[derive(serde::Serialize)]
-    struct Providers<'a> {
-        ollama: Provider<'a>,
-    }
-    #[derive(serde::Serialize)]
-    struct Provider<'a> {
-        npm: &'static str,
-        name: &'static str,
-        options: Options<'a>,
-        #[serde(serialize_with = "entries")]
-        models: [(&'a str, Model<'a>); 1],
-    }
-    #[derive(serde::Serialize)]
-    struct Options<'a> {
-        #[serde(rename = "baseURL")]
-        base_url: String,
-        #[serde(rename = "apiKey")]
-        api_key: &'a str,
-    }
-    #[derive(serde::Serialize)]
-    struct Model<'a> {
-        name: &'a str,
-        #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
-        variants: &'a [(&'a str, serde_json::Value)],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        options: Option<&'a serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        modalities: Option<Modalities>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        attachment: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<Limit>,
-    }
-    #[derive(serde::Serialize)]
-    struct Modalities {
-        input: &'static [&'static str],
-        output: &'static [&'static str],
-    }
-    /// opencode's schema requires both fields once `limit` is present.
-    #[derive(serde::Serialize)]
-    struct Limit {
-        context: u64,
-        output: u64,
-    }
-
-    // Declare image input for a vision model so opencode will attach
-    // images; a text-only model gets neither key.
-    let modalities = vision.then_some(Modalities {
-        input: &["text", "image"],
-        output: &["text"],
-    });
-
-    // Without `limit`, opencode normalizes a config-defined model to
-    // `{context: 0, output: 0}` and then skips overflow detection
-    // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
-    // a session never auto-compacts. Declared only when llmman knows the
-    // window; otherwise the key stays out rather than assert a guess.
-    let limit = context_window.map(|context| Limit {
-        context,
-        // The catalog's own ceiling wherever there is one; derived
-        // only for a local model, which has no catalog to name one.
-        output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
-    });
-
-    let config = Config {
-        schema: "https://opencode.ai/config.json",
-        provider: Providers {
-            ollama: Provider {
-                npm: "@ai-sdk/openai-compatible",
-                name: "Ollama",
-                options: Options {
-                    base_url: format!("{server}/v1"),
-                    api_key,
-                },
-                models: [(
-                    model,
-                    Model {
-                        name: model,
-                        variants,
-                        options,
-                        modalities,
-                        attachment: vision.then_some(true),
-                        limit,
-                    },
-                )],
-            },
-        },
-        model: opencode_model_ref(model),
-    };
-    serde_json::to_string(&config).expect("opencode config serializes")
 }
 
 /// pi: register llmman as an OpenAI-compatible provider in `models.json`
@@ -1654,7 +1367,7 @@ fn write_omp_config_in_dir(
         context_window,
         server,
     )?;
-    write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
+    common::write_yaml_merged(&dir.join("config.yml"), "omp", omp_config_merged)
 }
 
 fn omp_config_merged(existing: &serde_json::Value) -> serde_json::Value {
@@ -1679,7 +1392,7 @@ fn write_omp_models_config_at(
     server: &str,
 ) -> anyhow::Result<()> {
     let entry = pi_model_entry(model, reasons, vision, context_window);
-    write_yaml_merged(path, "omp", |existing| {
+    common::write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
 }
@@ -1707,29 +1420,6 @@ fn omp_models_merged(
         provider.insert("authHeader".into(), serde_json::json!(true));
         provider.insert("discovery".into(), serde_json::json!({ "type": "ollama" }));
     })
-}
-
-fn write_yaml_merged(
-    path: &Path,
-    label: &str,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    write_structured_merged(
-        path,
-        label,
-        ("YAML", "yml.bak"),
-        |text| Ok(yaml_serde::from_str(text)?),
-        |value| Ok(yaml_serde::to_string(value)?),
-        |raw, backup| {
-            if !backup.exists() {
-                return true;
-            }
-            yaml_serde::from_str::<serde_json::Value>(raw)
-                .and_then(|value| yaml_serde::to_string(&value))
-                .is_ok_and(|canonical| canonical != raw)
-        },
-        merge,
-    )
 }
 
 /// Select llmman's model through OMP's Ollama provider unless the caller
@@ -1761,7 +1451,7 @@ fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
         return Ok(Some(PathBuf::from(dir)));
     }
     let home = crate::config::home_dir().context("no home directory")?;
-    Ok(Some(expand_tilde(dir, &home)))
+    Ok(Some(common::expand_tilde(dir, &home)))
 }
 
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
@@ -1790,10 +1480,10 @@ fn write_pi_config(
 ) -> anyhow::Result<()> {
     let dir = pi_agent_dir()?;
     let entry = pi_model_entry(model, reasons, vision, context_window);
-    write_json_merged(&dir.join("models.json"), "pi", |existing| {
+    common::write_json_merged(&dir.join("models.json"), "pi", |existing| {
         pi_models_merged(existing, &server(), &entry)
     })?;
-    write_json_merged(&dir.join("settings.json"), "pi", |existing| {
+    common::write_json_merged(&dir.join("settings.json"), "pi", |existing| {
         pi_settings_merged(existing, model)
     })
 }
@@ -1842,7 +1532,7 @@ fn provider_models_merged(
     let Some(root_map) = root.as_object_mut() else {
         return serde_json::json!({});
     };
-    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let provider = common::object_under(common::object_under(root_map, "providers"), provider_name);
     let old_models = provider
         .get("models")
         .and_then(serde_json::Value::as_array)
@@ -1915,112 +1605,6 @@ fn pi_settings_merged(existing: &serde_json::Value, model: &str) -> serde_json::
     root
 }
 
-/// codex: set OPENAI_API_KEY=llmman and write ~/.codex/config.toml with the
-/// ollama provider pointing at our /v1 endpoint.
-fn launch_codex(
-    model: &str,
-    api_key: &str,
-    vision: bool,
-    context_window: Option<u64>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    // Write codex config
-    write_codex_config(model, vision, context_window)?;
-
-    // Regression: this used to pass a bare PathBuf::from("codex") straight
-    // to exec_with_env instead of resolving it via find_on_path like every
-    // other integration here does. That happened to work on Unix (bare
-    // relative names go through $PATH search via execvp with no extension
-    // needed), but on Windows, Command::status() calls CreateProcess
-    // directly (not cmd.exe), which — unlike a shell — does not consult
-    // PATHEXT to try .cmd/.bat alternatives for an extensionless name: it
-    // only ever auto-appends a single ".exe". Since `npm install -g
-    // @openai/codex` installs a "codex.cmd" shim on Windows, not a
-    // "codex.exe", every real Windows codex launch failed with "program
-    // not found" — a real E2E-verified failure, not a theoretical one.
-    let bin = find_on_path("codex").ok_or_else(|| anyhow::anyhow!("codex is not installed"))?;
-
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    // codex profile flag
-    args.extend(["--profile".to_string(), "llmman".to_string()]);
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
-}
-
-/// Writes codex's `llmman` profile.
-///
-/// Codex 0.134+ dropped support for `--profile <name>` reading a
-/// `[profiles.<name>]` table out of `config.toml`: it now only overlays a
-/// sibling `~/.codex/<name>.config.toml`, using top-level keys instead of a
-/// `[profiles.<name>]` wrapper (see
-/// <https://developers.openai.com/codex/config-advanced#profiles>). An
-/// older llmman wrote the now-unsupported `[profiles.llmman]` form directly
-/// into `config.toml`, which current codex refuses to start with at all
-/// ("cannot be used while config.toml contains legacy ... table") — so any
-/// leftover copy of that table is stripped from `config.toml` first, then
-/// the real settings are (re)written to the profile overlay file codex
-/// actually reads.
-fn write_codex_config(
-    model: &str,
-    vision: bool,
-    context_window: Option<u64>,
-) -> anyhow::Result<()> {
-    let config_dir = codex_dir()?;
-    std::fs::create_dir_all(&config_dir)?;
-
-    let config_path = config_dir.join("config.toml");
-    if let Ok(existing) = std::fs::read_to_string(&config_path) {
-        if existing.contains("[profiles.llmman]") {
-            std::fs::write(&config_path, strip_legacy_llmman_profile(&existing))?;
-        }
-    }
-
-    // Without a model there is nothing to describe; codex keeps its defaults.
-    let catalog_path = config_dir.join("llmman-model.json");
-    let catalog = (!model.is_empty()).then(|| {
-        let context_window = codex_context_window(context_window);
-        write_codex_file(
-            &catalog_path,
-            &codex_model_catalog(model, vision, context_window),
-        )
-        .map(|()| catalog_path.clone())
-    });
-    let catalog = catalog.transpose()?;
-
-    let profile_path = config_dir.join("llmman.config.toml");
-    write_codex_file(&profile_path, &codex_profile(&server(), catalog.as_deref()))
-}
-
-fn codex_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home directory")?
-        .join(".codex"))
-}
-
-/// Writes `contents` to `path` unless it already holds exactly that.
-fn write_codex_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
-        return Ok(());
-    }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
-}
-
-/// The catalog's `context_window` where `launch` resolved none at all;
-/// ollama's fallback too.
-const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
-
-/// What codex compacts against: the window `launch` resolved — live from
-/// the loaded runner, and a hybrid pair's larger half — else
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`]. codex's catalog cannot omit the
-/// field, so it guesses where every other integration stays quiet.
-fn codex_context_window(window: Option<u64>) -> u64 {
-    window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
-}
-
 /// The window the daemon serves for `model`, read back from the loaded
 /// runner rather than predicted: an OOM retry halves `--ctx-size` during
 /// the load, and a reused daemon keeps whatever it was started with.
@@ -2074,104 +1658,6 @@ fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> 
     }
 }
 
-/// The `model_catalog_json` for `model`, declaring its image input in
-/// `input_modalities`. The other fields are ones codex requires, valued
-/// as ollama's `buildCodexModelEntry` does.
-fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String {
-    let input: &[&str] = if vision {
-        &["text", "image"]
-    } else {
-        &["text"]
-    };
-    let entry = serde_json::json!({
-        "slug": model,
-        "display_name": model,
-        "context_window": context_window,
-        "shell_type": "default",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 0,
-        "truncation_policy": { "mode": "bytes", "limit": 10000 },
-        "input_modalities": input,
-        "base_instructions": "",
-        "support_verbosity": true,
-        "default_verbosity": "low",
-        "supports_parallel_tool_calls": false,
-        "supports_reasoning_summaries": false,
-        "supported_reasoning_levels": [],
-        "experimental_supported_tools": [],
-    });
-    let catalog = serde_json::json!({ "models": [entry] });
-    serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
-}
-
-/// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
-/// own rather than `openai_base_url` on codex's built-in one, which codex
-/// treats as WebSocket-capable and so opened every session with five
-/// failed `ws://` attempts (~6s of "Reconnecting...") before HTTP.
-fn codex_profile(server: &str, catalog: Option<&Path>) -> String {
-    // A JSON string is also a valid TOML string.
-    let catalog = catalog
-        .map(|p| {
-            let quoted = serde_json::Value::from(p.display().to_string());
-            format!("model_catalog_json = {quoted}\n")
-        })
-        .unwrap_or_default();
-    format!(
-        "# Written by `llmman launch codex`; edits are overwritten.\n\
-         model_provider = \"llmman\"\n\
-         {catalog}\
-         \n\
-         [model_providers.llmman]\n\
-         name = \"llmman\"\n\
-         base_url = \"{server}/v1\"\n\
-         env_key = \"OPENAI_API_KEY\"\n\
-         wire_api = \"responses\"\n\
-         supports_websockets = false\n"
-    )
-}
-
-/// Removes a `[profiles.llmman]` table (and everything up to the next
-/// top-level `[...]` header or end of file) from `config.toml`'s text —
-/// the shape an older llmman wrote there, now rejected by current codex.
-/// Line-based rather than a real TOML parser: this only ever needs to
-/// undo llmman's own prior output, not handle arbitrary user TOML.
-fn strip_legacy_llmman_profile(existing: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[profiles.llmman]" {
-            skipping = true;
-            continue;
-        }
-        if skipping && trimmed.starts_with('[') {
-            skipping = false;
-        }
-        if skipping {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-/// copilot: passes COPILOT_PROVIDER_BASE_URL via env.
-fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin =
-        find_on_path("gh").ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed"))?;
-
-    let base_url = format!("{}/v1", server());
-    let mut args = vec!["copilot".to_string()];
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), model.to_string()]);
-    }
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(&bin, &args, &[("COPILOT_PROVIDER_BASE_URL", &base_url)])
-}
-
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
 fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("gemini").ok_or_else(|| anyhow::anyhow!("gemini is not installed"))?;
@@ -2191,54 +1677,6 @@ fn launch_gemini(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::R
             ("GEMINI_API_KEY", api_key),
         ],
     )
-}
-
-/// AGY speaks Gemini's native generation protocol. The encoded model in the
-/// base URL is llmman's routing instruction; AGY also makes auxiliary calls
-/// with its own hard-coded model names, so the server deliberately ignores
-/// the model segment AGY appends and sends every call to the model selected
-/// here.
-fn launch_agy(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("agy").ok_or_else(|| anyhow::anyhow!("agy is not installed"))?;
-    anyhow::ensure!(
-        !extra_args
-            .iter()
-            .any(|arg| matches!(arg.split('=').next(), Some("--gemini_dir" | "-gemini_dir"))),
-        "llmman manages AGY’s --gemini_dir"
-    );
-    let gemini_dir = agy_settings_dir()?;
-    write_agy_settings_at(&gemini_dir)?;
-    let mut args = vec![format!("--gemini_dir={}", gemini_dir.display())];
-    args.extend_from_slice(extra_args);
-
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(model.as_bytes());
-    let base_url = format!("{}/gemini/{encoded}", server());
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("GOOGLE_GEMINI_BASE_URL", base_url.as_str()),
-            ("GEMINI_API_KEY", api_key),
-            // AGY prefers GOOGLE_API_KEY when both names exist. Override it
-            // too so an unrelated key inherited from the shell cannot bypass
-            // the credential llmman selected for this request.
-            ("GOOGLE_API_KEY", api_key),
-        ],
-    )
-}
-
-fn agy_settings_dir() -> anyhow::Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("no home directory")?
-        .join(".gemini")
-        .join("llmman"))
-}
-
-fn write_agy_settings_at(gemini_dir: &Path) -> anyhow::Result<()> {
-    let settings_path = gemini_dir.join("antigravity-cli").join("settings.json");
-    std::fs::create_dir_all(settings_path.parent().expect("settings file has a parent"))?;
-    crate::fsutil::write_atomic(&settings_path, b"{\n  \"modelProvider\": \"gemini\"\n}\n")
-        .with_context(|| format!("write {}", settings_path.display()))
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
@@ -2285,7 +1723,7 @@ fn hermes_home() -> anyhow::Result<PathBuf> {
 /// Only overwrites the `model:`/`providers:` top-level blocks this
 /// itself writes — everything else in an existing `config.yaml` (other
 /// providers, toolsets, etc.) is preserved, the same way
-/// `write_codex_config`/`strip_legacy_llmman_profile` avoid clobbering
+/// `codex::write_codex_config`/`codex::strip_legacy_llmman_profile` avoid clobbering
 /// unrelated `config.toml` content.
 fn write_hermes_config(model: &str, vision: bool) -> anyhow::Result<()> {
     let config_dir = hermes_home()?;
@@ -2308,8 +1746,8 @@ fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     // Double-quoted (not bare) so a model name that happens to be a YAML
     // keyword (`null`, `true`, ...) or contain metacharacters (`:`, `#`,
     // ...) still parses back as the literal string it is.
-    let model = yaml_quote(model);
-    let base_url = yaml_quote(base_url);
+    let model = common::yaml_quote(model);
+    let base_url = common::yaml_quote(base_url);
     let vision = if vision {
         "  supports_vision: true\n"
     } else {
@@ -2321,17 +1759,9 @@ fn hermes_config_blocks(model: &str, base_url: &str, vision: bool) -> String {
     )
 }
 
-/// Renders `s` as a double-quoted YAML scalar, escaping backslashes and
-/// double quotes — enough to keep any value we generate (a model name, a
-/// URL) a literal string regardless of YAML keywords or metacharacters
-/// it might contain.
-fn yaml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 /// Removes a top-level YAML key (`<key>:` at column 0) and every line
 /// indented under it, up to the next column-0 line or EOF — the YAML
-/// (indentation-block) equivalent of `strip_legacy_llmman_profile`'s
+/// (indentation-block) equivalent of `codex::strip_legacy_llmman_profile`'s
 /// TOML `[...]`-header block removal. Only ever needs to undo llmman's
 /// own prior writes below, not handle arbitrary user YAML.
 fn strip_yaml_top_level_key(existing: &str, key: &str) -> String {
@@ -2363,64 +1793,6 @@ fn strip_yaml_top_level_key(existing: &str, key: &str) -> String {
         out.push('\n');
     }
     out
-}
-
-/// openclaw's own onboarding independently re-verifies/pulls whatever
-/// `--custom-model-id` names against its configured endpoint, and
-/// mishandles llmman's own `docker.io/ai/<name>` form: it treats
-/// "docker.io/ai/" as a container registry path (real observed failure:
-/// "pull failed: copy image: docker.io/ai/0.8b ... requested access to
-/// the resource is denied", mangling "qwen3.5:0.8b" down to "0.8b" in
-/// the process). Stripping that prefix back to the bare short name —
-/// what a real user would actually type — matches what its pull
-/// verification expects. `"default"` when there's nothing left to strip
-/// to (no `--model` given at all).
-fn openclaw_model_id(model: &str) -> &str {
-    let bare = model.strip_prefix("docker.io/ai/").unwrap_or(model);
-    if bare.is_empty() {
-        "default"
-    } else {
-        bare
-    }
-}
-
-/// openclaw: runs its non-interactive onboarding (once) against our
-/// /v1 endpoint, then hands off to it directly. The real gateway/TUI/
-/// channel-setup lifecycle a full setup wizard also manages is left to
-/// openclaw's own defaults.
-fn launch_openclaw(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin =
-        find_on_path("openclaw").ok_or_else(|| anyhow::anyhow!("openclaw is not installed"))?;
-
-    // Matches openclaw.go's own onboarded() check: current config path,
-    // or the legacy pre-rename one.
-    let onboarded = dirs::home_dir().is_some_and(|h| {
-        h.join(".openclaw").join("openclaw.json").exists()
-            || h.join(".clawdbot").join("clawdbot.json").exists()
-    });
-    if !onboarded {
-        let effective_model = openclaw_model_id(model);
-        // Through run_with_env so a --sandbox onboards the copy it runs.
-        let onboard = [
-            "onboard",
-            "--non-interactive",
-            "--accept-risk",
-            "--auth-choice",
-            "ollama",
-            "--custom-base-url",
-            &format!("{}/v1", server()),
-            "--custom-model-id",
-            effective_model,
-            "--skip-health",
-            "--skip-channels",
-            "--skip-skills",
-        ]
-        .map(String::from);
-        let code = run_with_env(&bin, &onboard, &[])?;
-        anyhow::ensure!(code == 0, "openclaw onboarding failed");
-    }
-
-    exec_with_env(&bin, extra_args, &[])
 }
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -2474,7 +1846,7 @@ fn qwen_model_and_vision<'a>(
     vision: bool,
     extra_args: &'a [String],
 ) -> (&'a str, bool) {
-    let forwarded = forwarded_model(extra_args);
+    let forwarded = common::forwarded_model(extra_args);
     let same = forwarded.is_none_or(|f| {
         crate::shortnames::resolve_ollama_api(f).is_ok_and(|resolved| resolved == model)
     });
@@ -2497,24 +1869,6 @@ fn path_with_dir_prepended(
     }
     components.insert(0, dir.to_path_buf());
     std::env::join_paths(components).ok()
-}
-
-/// The value of the last `--model`/`-m` after `--`, as a word or
-/// `=`-joined, the forms `has_flag` takes; yargs keeps the last too.
-fn forwarded_model(extra_args: &[String]) -> Option<&str> {
-    let mut found = None;
-    let mut args = extra_args.iter().map(String::as_str);
-    while let Some(a) = args.next() {
-        match a {
-            "--model" | "-m" => found = args.next().or(found),
-            _ => {
-                if let Some(v) = a.strip_prefix("--model=").or_else(|| a.strip_prefix("-m=")) {
-                    found = Some(v);
-                }
-            }
-        }
-    }
-    found.filter(|v| !v.is_empty())
 }
 
 /// `--auth-type openai --model <model>` ahead of the caller's own
@@ -2621,24 +1975,13 @@ fn qwen_home() -> anyhow::Result<PathBuf> {
     let home = || dirs::home_dir().context("no home directory");
     match std::env::var("QWEN_HOME").ok().filter(|d| !d.is_empty()) {
         Some(dir) if !dir.starts_with('~') => Ok(PathBuf::from(dir)),
-        Some(dir) => Ok(expand_tilde(&dir, &home()?)),
+        Some(dir) => Ok(common::expand_tilde(&dir, &home()?)),
         None => Ok(home()?.join(".qwen")),
     }
 }
 
-/// A leading `~` is `home`, as Qwen Code's `Storage.resolvePath` reads
-/// it; a quoted export leaves it for the program to expand.
-fn expand_tilde(dir: &str, home: &Path) -> PathBuf {
-    match dir.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
-            home.join(rest.trim_start_matches(['/', '\\']))
-        }
-        _ => PathBuf::from(dir),
-    }
-}
-
 /// Records llmman as the `openai` provider for `model` in Qwen Code's
-/// `settings.json`, as `write_codex_config` and `write_hermes_config` do
+/// `settings.json`, as `codex::write_codex_config` and `write_hermes_config` do
 /// for theirs. See `qwen_settings_merged` for what goes in.
 fn write_qwen_settings(model: &str, vision: bool, effort: Option<&Effort>) -> anyhow::Result<()> {
     write_qwen_settings_at(
@@ -2663,140 +2006,9 @@ fn write_qwen_settings_at(
     vision: bool,
     effort: Option<&Effort>,
 ) -> anyhow::Result<()> {
-    write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
+    common::write_json_merged(&dir.join("settings.json"), "qwen", |existing| {
         qwen_settings_merged(existing, model, base_url, vision, effort)
     })
-}
-
-/// Rewrites the JSON object at `path` through `merge`, leaving a file it
-/// does not understand alone and saying so under `label`.
-///
-/// The settings files these integrations read are the user's as much as
-/// llmman's, so: comments survive a parse (`strip_json_comments`) and the
-/// text carrying them is kept as `.bak` before the first rewrite that
-/// would drop them; a rendering that already matches is not written at
-/// all; and the write is atomic, since a half-written settings file is
-/// worse than a stale one. A leading BOM is stripped because a
-/// node-based reader tolerates one and `serde_json` does not.
-fn write_json_merged(
-    path: &Path,
-    label: &str,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    write_structured_merged(
-        path,
-        label,
-        ("JSON", "json.bak"),
-        |text| {
-            let text = text.trim_start_matches('\u{feff}').trim();
-            Ok(serde_json::from_str(&strip_json_comments(text))?)
-        },
-        |value| {
-            let mut out = serde_json::to_string_pretty(value)?;
-            out.push('\n');
-            Ok(out)
-        },
-        |raw, backup| !backup.exists() || strip_json_comments(raw) != raw,
-        merge,
-    )
-}
-
-/// Parse, merge, back up, and atomically rewrite a user-owned structured
-/// settings file. Format-specific parsing and rendering stay at the call site.
-fn write_structured_merged(
-    path: &Path,
-    label: &str,
-    format: (&str, &str),
-    parse: impl FnOnce(&str) -> anyhow::Result<serde_json::Value>,
-    serialize: impl FnOnce(&serde_json::Value) -> anyhow::Result<String>,
-    should_backup: impl FnOnce(&str, &Path) -> bool,
-    merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
-) -> anyhow::Result<()> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => Some(raw),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let existing = match raw.as_deref().map(str::trim) {
-        None | Some("") => serde_json::json!({}),
-        Some(text) => match parse(text) {
-            Ok(value) if value.is_object() => value,
-            _ => {
-                eprintln!(
-                    "[llmman] {label}: {} is not a {} object; leaving it alone",
-                    path.display(),
-                    format.0
-                );
-                return Ok(());
-            }
-        },
-    };
-    let merged = merge(&existing);
-    if merged == existing {
-        return Ok(());
-    }
-    let dir = path.parent().context("settings path has no directory")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    if let Some(raw) = &raw {
-        let backup = path.with_extension(format.1);
-        if should_backup(raw, &backup) {
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
-        }
-    }
-    let out = serialize(&merged)?;
-    crate::fsutil::write_atomic(path, out.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
-}
-
-/// `//` and `/* */` comments outside strings replaced by spaces, so a
-/// parse error still points at the right place; what `strip-json-comments`
-/// does for Qwen Code before `JSON.parse`.
-fn strip_json_comments(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                out.push(' ');
-                while chars.peek().is_some_and(|&n| n != '\n') {
-                    chars.next();
-                    out.push(' ');
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                out.push_str("  ");
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    out.push(if n == '\n' { '\n' } else { ' ' });
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// The variable llmman's entry names as its key, and what marks the entry
@@ -2853,7 +2065,7 @@ fn qwen_settings_merged(
         };
         ours["capabilities"] = serde_json::json!({ "reasoning": reasoning });
     }
-    let openai = object_under(&mut doc, "modelProviders")
+    let openai = common::object_under(&mut doc, "modelProviders")
         .entry("openai")
         .or_insert_with(|| serde_json::json!([]));
     let unwrapped = openai.get("models").is_some_and(|m| m.is_array());
@@ -2871,28 +2083,16 @@ fn qwen_settings_merged(
     if unwrapped {
         doc.insert("$version".into(), 4.into());
     }
-    let auth = object_under(object_under(&mut doc, "security"), "auth");
+    let auth = common::object_under(common::object_under(&mut doc, "security"), "auth");
     auth.insert("selectedType".into(), "openai".into());
     auth.insert("baseUrl".into(), base_url.into());
-    let model_cfg = object_under(&mut doc, "model");
+    let model_cfg = common::object_under(&mut doc, "model");
     model_cfg.insert("name".into(), model.into());
     model_cfg.insert("baseUrl".into(), base_url.into());
     if effort.is_some() {
         model_cfg.remove("reasoningEffort");
     }
     serde_json::Value::Object(doc)
-}
-
-/// The object at `key` in `parent`, put there if absent or not an object.
-fn object_under<'a>(
-    parent: &'a mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
-    let slot = parent.entry(key).or_insert_with(|| serde_json::json!({}));
-    if !slot.is_object() {
-        *slot = serde_json::json!({});
-    }
-    slot.as_object_mut().expect("set to an object just above")
 }
 
 /// An entry llmman wrote: `QWEN_ENV_KEY` as its key, at this daemon's
@@ -2904,65 +2104,6 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
     field("envKey") == Some(QWEN_ENV_KEY)
         && field("baseUrl")
             .is_some_and(|u| u.trim_end_matches('/') == base_url.trim_end_matches('/'))
-}
-
-/// goose: configured entirely through the environment, which goose reads
-/// in preference to its own `config.yaml` — so unlike hermes and qwen
-/// nothing is written to disk and no key is persisted. `OPENAI_HOST` is
-/// the bare origin, not a `/v1` base URL: goose joins it with
-/// `OPENAI_BASE_PATH` itself. Verified against goose 1.50.0 with no
-/// config file and no `goose configure`.
-fn launch_goose(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_goose().ok_or_else(|| anyhow::anyhow!("goose is not installed"))?;
-    let host = server();
-    exec_with_env(&bin, extra_args, &goose_env(model, api_key, &host))
-}
-
-/// Split out so a test can assert what goose is handed: [`exec_with_env`]
-/// never returns, so calling [`launch_goose`] would take the test runner
-/// with it.
-fn goose_env<'a>(model: &'a str, api_key: &'a str, host: &'a str) -> Vec<(&'a str, &'a str)> {
-    let mut env = vec![
-        ("GOOSE_PROVIDER", "openai"),
-        ("OPENAI_API_KEY", api_key),
-        ("OPENAI_HOST", host),
-        ("OPENAI_BASE_PATH", "v1/chat/completions"),
-    ];
-    // Absent, not empty: goose reads "" as a model actually named "".
-    if !model.is_empty() {
-        env.push(("GOOSE_MODEL", model));
-    }
-    env
-}
-
-/// The CLI, never the desktop app standing in for it: the unpacked zip's
-/// executable answers to this name too — exactly on Linux, by case
-/// elsewhere — and handing the GUI `goose run`'s arguments is
-/// block/goose#4079 the other way round.
-fn find_goose() -> Option<PathBuf> {
-    find_on_path_unless("goose", goose_desktop::is_electron_bundle)
-        .or_else(|| goose_fallback(&dirs::home_dir()?))
-}
-
-/// goose's own installer target: `download_cli.sh` writes to
-/// `$GOOSE_BIN_DIR` without putting it on `PATH`. Its default is
-/// `$USERPROFILE/goose` on Windows (what `dirs::home_dir` returns there)
-/// and `~/.local/bin` elsewhere; Windows probes both, since goose's
-/// install instructions and this repo's CI pass the latter (v1.50.0).
-fn goose_fallback(home: &Path) -> Option<PathBuf> {
-    let bin = if cfg!(windows) { "goose.exe" } else { "goose" };
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        candidates.push(home.join("goose").join(bin));
-    }
-    candidates.push(home.join(".local").join("bin").join(bin));
-    // is_file, not exists: a directory of that name would be reported as
-    // installed and then fail to spawn. Not the desktop app either: a
-    // zip can be unpacked into the installer's own directory, and these
-    // names match its executable — exactly on Linux, by case elsewhere.
-    candidates
-        .into_iter()
-        .find(|p| p.is_file() && !goose_desktop::is_electron_bundle(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -3192,7 +2333,7 @@ fn launch_grok(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
-    let effective_model = forwarded_model(extra_args).unwrap_or(model);
+    let effective_model = common::forwarded_model(extra_args).unwrap_or(model);
     let base_url = format!("{}/v1", server());
     let models_url = format!("{base_url}/models");
     // Never edit the user's config.toml. This child is wholly llmman-owned,
@@ -3470,8 +2611,8 @@ fn write_dsh_settings(
     vision: bool,
     effort: Option<&Effort>,
 ) -> anyhow::Result<()> {
-    let quoted_model = yaml_quote(model);
-    let base_url = yaml_quote(&format!("{}/v1", server()));
+    let quoted_model = common::yaml_quote(model);
+    let base_url = common::yaml_quote(&format!("{}/v1", server()));
     // Claiming image input a text-only model can't serve would have dsh
     // attach what the daemon then rejects.
     let input = if vision { "[text, image]" } else { "[text]" };
@@ -3505,7 +2646,7 @@ fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
 /// path on any platform: `yaml_quote` escapes the `\` separators, and
 /// forgetting that is what once turned the Windows leg red.
 fn dsh_patch_document(settings_path: &Path) -> String {
-    let quoted_settings_path = yaml_quote(&settings_path.to_string_lossy());
+    let quoted_settings_path = common::yaml_quote(&settings_path.to_string_lossy());
     format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
          - id: settings\n  config:\n    path: {quoted_settings_path}\n"
@@ -3682,8 +2823,8 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
 /// agent that reaches the model carries one leading system message
 /// whatever the template accepts.
 fn docker_agent_document(model: &str, base_url: &str) -> String {
-    let quoted_model = yaml_quote(model);
-    let quoted_base_url = yaml_quote(base_url);
+    let quoted_model = common::yaml_quote(model);
+    let quoted_base_url = common::yaml_quote(base_url);
     format!(
         "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
          version: \"2\"\n\
@@ -3798,25 +2939,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agy_settings_are_written_to_the_llmman_owned_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-agy-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        write_agy_settings_at(&dir).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dir.join("antigravity-cli/settings.json")).unwrap(),
-            "{\n  \"modelProvider\": \"gemini\"\n}\n"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn agy_is_listed_as_an_integration() {
         let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
         assert_eq!(agy.binary, "agy");
@@ -3884,12 +3006,15 @@ mod tests {
                 written.display()
             );
         };
-        covers("codex", codex_dir().unwrap());
-        covers("opencode", opencode_state_dir().unwrap().join("model.json"));
+        covers("codex", codex::codex_dir().unwrap());
+        covers(
+            "opencode",
+            opencode::opencode_state_dir().unwrap().join("model.json"),
+        );
         covers("pi", pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
         covers("cline", cline_data_dir().unwrap());
-        covers("agy", agy_settings_dir().unwrap());
+        covers("agy", agy::agy_settings_dir().unwrap());
         covers("hermes", hermes_home().unwrap());
         covers("qwen", qwen_home().unwrap());
         covers("dsh", dsh_config_dir().unwrap());
@@ -3901,20 +3026,6 @@ mod tests {
                 .unwrap()
                 .join(".openclaw")
                 .join("openclaw.json"),
-        );
-    }
-
-    /// Regression test for a real CodeRabbit finding: an unquoted model
-    /// value in generated YAML could be misparsed as a non-string
-    /// (`null`, `true`, ...) or broken outright by metacharacters.
-    #[test]
-    fn yaml_quote_escapes_keywords_and_metacharacters() {
-        assert_eq!(yaml_quote("qwen3.5:0.8b"), "\"qwen3.5:0.8b\"");
-        assert_eq!(yaml_quote("null"), "\"null\"");
-        assert_eq!(yaml_quote("true"), "\"true\"");
-        assert_eq!(
-            yaml_quote(r#"a "quoted" \ value"#),
-            r#""a \"quoted\" \\ value""#
         );
     }
 
@@ -3946,23 +3057,6 @@ mod tests {
                 "{local} resolved to a provider-routed reference: {resolved}"
             );
         }
-    }
-
-    /// Regression test for the real openclaw onboarding failure
-    /// described on `openclaw_model_id`'s own doc comment.
-    #[test]
-    fn openclaw_model_id_strips_the_docker_ai_prefix() {
-        assert_eq!(
-            openclaw_model_id("docker.io/ai/qwen3.5:0.8b"),
-            "qwen3.5:0.8b"
-        );
-        assert_eq!(openclaw_model_id("qwen3.5:0.8b"), "qwen3.5:0.8b");
-        assert_eq!(
-            openclaw_model_id("hf.co/unsloth/Qwen3.5-0.8B-GGUF"),
-            "hf.co/unsloth/Qwen3.5-0.8B-GGUF"
-        );
-        assert_eq!(openclaw_model_id(""), "default");
-        assert_eq!(openclaw_model_id("docker.io/ai/"), "default");
     }
 
     /// Every integration `check_model_flag` holds to a model must be one
@@ -4212,24 +3306,6 @@ defaults:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The only configuration goose gets: a wrong or missing one sends
-    /// the session to api.openai.com instead of the daemon. `OPENAI_HOST`
-    /// is the bare origin — goose appends `OPENAI_BASE_PATH` itself, so a
-    /// `/v1` here would request `/v1/v1/chat/completions`.
-    #[test]
-    fn goose_env_points_at_the_daemon_and_carries_the_key() {
-        let env = goose_env("m", "k", "http://127.0.0.1:17434");
-        let get = |k| env.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
-        assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
-        assert_eq!(get("GOOSE_MODEL"), Some("m"));
-        assert_eq!(get("OPENAI_API_KEY"), Some("k"));
-        assert_eq!(get("OPENAI_HOST"), Some("http://127.0.0.1:17434"));
-        assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
-
-        let env = goose_env("", "k", "http://127.0.0.1:17434");
-        assert!(!env.iter().any(|(n, _)| *n == "GOOSE_MODEL"));
-    }
-
     /// goose carries the key in its own environment, so `--provider`
     /// needs neither a refusal nor the daemon holding the key.
     #[test]
@@ -4237,42 +3313,6 @@ defaults:
         assert!(INTEGRATIONS.iter().any(|i| i.name == "goose"));
         assert!(check_provider_supported("goose").is_ok());
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"goose"));
-    }
-
-    /// `download_cli.sh`'s target is off `PATH` on a fresh shell, so this
-    /// fallback is the one that fires for most installs — at every
-    /// directory that installer writes to, Windows included.
-    #[test]
-    fn goose_fallback_finds_the_installers_target() {
-        let name = if cfg!(windows) { "goose.exe" } else { "goose" };
-        let dirs: &[&[&str]] = if cfg!(windows) {
-            &[&["goose"], &[".local", "bin"]]
-        } else {
-            &[&[".local", "bin"]]
-        };
-        for (i, parts) in dirs.iter().enumerate() {
-            let home = std::env::temp_dir().join(format!(
-                "llmman-goose-{}-{}-{i}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let bin = parts.iter().fold(home.clone(), |p, part| p.join(part));
-            std::fs::create_dir_all(&bin).unwrap();
-            assert_eq!(goose_fallback(&home), None);
-            let goose = bin.join(name);
-            // A directory of that name is not the binary: returning it
-            // would report goose as installed and then fail to spawn.
-            std::fs::create_dir(&goose).unwrap();
-            assert_eq!(goose_fallback(&home), None);
-            std::fs::remove_dir(&goose).unwrap();
-            std::fs::write(&goose, "").unwrap();
-            assert_eq!(goose_fallback(&home), Some(goose));
-            assert_eq!(goose_fallback(&home.join("nowhere")), None);
-            let _ = std::fs::remove_dir_all(&home);
-        }
     }
 
     /// The predicate has to be able to veto, or `find_goose`'s refusal of
@@ -4730,18 +3770,6 @@ defaults:
         );
     }
 
-    /// The last forwarded model wins, in either spelling; none is none.
-    #[test]
-    fn forwarded_model_takes_the_last_spelling() {
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(forwarded_model(&args(&["--model", "b"])), Some("b"));
-        assert_eq!(forwarded_model(&args(&["-m=b", "--model", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["--model=b", "-m", "c"])), Some("c"));
-        assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
-        assert_eq!(forwarded_model(&args(&["--model"])), None);
-        assert_eq!(forwarded_model(&args(&["--model="])), None);
-    }
-
     /// A word or `=`-joined, and nothing looser: `-sm` is not `-m`.
     #[test]
     fn has_flag_takes_the_exact_and_joined_forms_only() {
@@ -5000,21 +4028,6 @@ defaults:
         ));
     }
 
-    /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
-    /// and nothing else moves: not a `//` inside a string, not a column.
-    #[test]
-    fn strip_json_comments_keeps_strings_and_columns() {
-        let raw =
-            "{\n  // note\n  \"url\": \"http://h//v1\", /* block\n  */ \"q\": \"a\\\"//b\"\n}\n";
-        let stripped = strip_json_comments(raw);
-        assert_eq!(stripped.chars().count(), raw.chars().count());
-        assert_eq!(stripped.lines().count(), raw.lines().count());
-        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
-        assert_eq!(v["url"], "http://h//v1");
-        assert_eq!(v["q"], "a\"//b");
-        assert_eq!(strip_json_comments("{\"a\": 1}"), "{\"a\": 1}");
-    }
-
     /// pi is node, so its home half is the one node reads — the same
     /// `cline_dir` resolves, and the reason #535 stopped using
     /// `dirs::home_dir` alone. `config::home_dir` reads `%USERPROFILE%`
@@ -5162,16 +4175,6 @@ defaults:
         assert_eq!(merged["defaultModel"], "qwen3.5:0.8b");
     }
 
-    /// A leading `~` is the home directory; anything else is as given.
-    #[test]
-    fn expand_tilde_reads_the_forms_qwen_code_reads() {
-        let home = Path::new("/h");
-        assert_eq!(expand_tilde("~/alt", home), PathBuf::from("/h/alt"));
-        assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
-        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
-        assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
-    }
-
     /// The reading and writing half over a directory of its own: a fresh
     /// one gets the file, a correct file is not touched, a commented one
     /// merges with its text kept as `.bak`, a later rewrite of llmman's
@@ -5237,212 +4240,6 @@ defaults:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression test for the codex config bug described on
-    /// `write_codex_config`'s own doc comment: an older llmman's
-    /// `[profiles.llmman]` table (a format current codex refuses to load
-    /// at all) must be fully removed, leaving everything else in
-    /// `config.toml` untouched.
-    #[test]
-    fn strip_legacy_llmman_profile_removes_only_that_table() {
-        let existing = "\
-[some_other_setting]
-foo = \"bar\"
-
-[profiles.llmman]
-openai_base_url = \"http://127.0.0.1:17434/v1\"
-
-[profiles.other]
-model = \"gpt-5\"
-";
-        let cleaned = strip_legacy_llmman_profile(existing);
-        assert!(!cleaned.contains("[profiles.llmman]"));
-        assert!(!cleaned.contains("openai_base_url"));
-        assert!(cleaned.contains("[some_other_setting]"));
-        assert!(cleaned.contains("foo = \"bar\""));
-        assert!(cleaned.contains("[profiles.other]"));
-        assert!(cleaned.contains("model = \"gpt-5\""));
-    }
-
-    #[test]
-    fn strip_legacy_llmman_profile_is_a_no_op_without_the_legacy_table() {
-        let existing = "[profiles.other]\nmodel = \"gpt-5\"\n";
-        assert_eq!(strip_legacy_llmman_profile(existing), existing);
-    }
-
-    #[test]
-    fn strip_legacy_llmman_profile_handles_the_table_at_end_of_file() {
-        let existing = "[profiles.llmman]\nopenai_base_url = \"http://127.0.0.1:17434/v1\"\n";
-        assert_eq!(strip_legacy_llmman_profile(existing), "");
-    }
-
-    /// The config points at the daemon's `/v1` and lists the variants in
-    /// the order given (a parsed `Value` would re-sort them).
-    #[test]
-    fn opencode_config_lists_the_variants_in_order() {
-        let variants = opencode_variants(None);
-        let text = opencode_config(
-            "http://127.0.0.1:17434",
-            "qwen3.5:0.8b",
-            "k",
-            &variants,
-            None,
-            false,
-            None,
-            None,
-        );
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        assert_eq!(config["$schema"], "https://opencode.ai/config.json");
-        assert_eq!(config["model"], "ollama/qwen3.5:0.8b");
-        let provider = &config["provider"]["ollama"];
-        assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
-        assert_eq!(provider["name"], "Ollama");
-        assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:17434/v1");
-        assert_eq!(provider["options"]["apiKey"], "k");
-        assert_eq!(provider["models"].as_object().map(|m| m.len()), Some(1));
-
-        let model = &provider["models"]["qwen3.5:0.8b"];
-        assert_eq!(model["name"], "qwen3.5:0.8b");
-        let written = model["variants"].as_object().expect("variants object");
-        assert_eq!(written.len(), variants.len());
-        for (name, options) in &variants {
-            assert_eq!(&written[*name], options, "variant {name}");
-        }
-        let positions: Vec<usize> = variants
-            .iter()
-            .map(|(name, _)| text.find(&format!("\"{name}\"")).expect(name))
-            .collect();
-        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
-
-        let bare = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!bare.contains("variants"), "{bare}");
-    }
-
-    /// `--variant` makes its options the model's own, which requests that
-    /// name no variant (all of `opencode run`'s) carry.
-    #[test]
-    fn opencode_config_starts_the_model_at_the_variant() {
-        let variants = opencode_variants(None);
-        let high = variants.iter().find(|(name, _)| *name == "high").unwrap();
-        let text = opencode_config(
-            "http://h",
-            "m",
-            "k",
-            &variants,
-            Some(&high.1),
-            false,
-            None,
-            None,
-        );
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let model = &config["provider"]["ollama"]["models"]["m"];
-        assert_eq!(
-            model["options"],
-            serde_json::json!({ "reasoningEffort": "high" })
-        );
-
-        let text = opencode_config("http://h", "m", "k", &variants, None, false, None, None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        assert!(config["provider"]["ollama"]["models"]["m"]["options"].is_null());
-    }
-
-    #[test]
-    fn write_opencode_variant_selects_the_model_and_keeps_the_rest() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-opencode-state-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("state").join("opencode").join("model.json");
-        let state = path.parent().unwrap();
-        let read = || -> serde_json::Value {
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-        };
-
-        // No file yet.
-        write_opencode_variant(state, "m", "xhigh").unwrap();
-        assert_eq!(
-            read(),
-            serde_json::json!({ "variant": { "ollama/m": "xhigh" } })
-        );
-
-        // Another model's selection and the rest of the state stay.
-        std::fs::write(
-            &path,
-            r#"{"recent":[{"modelID":"o"}],"variant":{"ollama/m":"medium","ollama/o":"low"}}"#,
-        )
-        .unwrap();
-        write_opencode_variant(state, "m", "xhigh").unwrap();
-        let written = read();
-        assert_eq!(written["variant"]["ollama/m"], "xhigh");
-        assert_eq!(written["variant"]["ollama/o"], "low");
-        assert_eq!(written["recent"][0]["modelID"], "o");
-
-        // A `variant` that is not an object is replaced; a file that is not
-        // a JSON object is left alone, as opencode resets it itself.
-        std::fs::write(&path, r#"{"variant":"high"}"#).unwrap();
-        write_opencode_variant(state, "m", "low").unwrap();
-        assert_eq!(read()["variant"], serde_json::json!({ "ollama/m": "low" }));
-        std::fs::write(&path, "[1, 2").unwrap();
-        write_opencode_variant(state, "m", "low").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1, 2");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn opencode_config_declares_image_input_only_for_a_vision_model() {
-        let text = opencode_config("http://h", "m", "k", &[], None, true, None, None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let model = &config["provider"]["ollama"]["models"]["m"];
-        assert_eq!(
-            model["modalities"],
-            serde_json::json!({ "input": ["text", "image"], "output": ["text"] })
-        );
-        assert_eq!(model["attachment"], true);
-
-        let text_only = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!text_only.contains("modalities"), "{text_only}");
-        assert!(!text_only.contains("attachment"), "{text_only}");
-    }
-
-    /// The reserve scales with the window, so a small one keeps a
-    /// usable budget.
-    #[test]
-    fn opencode_output_reserve_scales_with_the_window_and_is_never_zero() {
-        let cases = [
-            (4096, 1024),
-            (32768, 8192),
-            (131072, 32000),
-            // Capped however large the window.
-            (1 << 20, OPENCODE_OUTPUT_TOKEN_MAX),
-            // Never 0, which opencode would replace with its own max.
-            (1, 1),
-            (3, 1),
-        ];
-        for (context, want) in cases {
-            assert_eq!(opencode_output_reserve(context), want, "context={context}");
-        }
-    }
-
-    /// Without `limit` opencode never auto-compacts, so the window has
-    /// to travel.
-    #[test]
-    fn opencode_config_declares_the_window_only_when_it_is_known() {
-        let text = opencode_config("http://h", "m", "k", &[], None, false, Some(8192), None);
-        let config: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
-        assert_eq!(limit["context"], 8192);
-        // Both keys are required once `limit` is present.
-        assert_eq!(limit["output"], 2048);
-
-        // No window: the key stays out and opencode keeps its defaults.
-        let unknown = opencode_config("http://h", "m", "k", &[], None, false, None, None);
-        assert!(!unknown.contains("limit"), "{unknown}");
-    }
-
     /// Only the integrations that put a window somewhere pay for the
     /// load that reads the live one back. Every launcher in [`launch`]
     /// that takes `context_window` must be listed, or it silently gets
@@ -5459,210 +4256,6 @@ model = \"gpt-5\"
         assert!(declares_context_window("omp"));
         assert!(!declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
-    }
-
-    /// opencode sends `limit.output` as the request's max output, so a
-    /// hosted model's own ceiling has to travel: deriving one from the
-    /// window advertises more than the provider will accept.
-    #[test]
-    fn opencode_config_prefers_the_catalogs_output_ceiling_to_a_derived_one() {
-        let hosted = opencode_config(
-            "http://h",
-            "m",
-            "k",
-            &[],
-            None,
-            false,
-            Some(128_000),
-            Some(8_192),
-        );
-        let config: serde_json::Value = serde_json::from_str(&hosted).expect("valid JSON");
-        let limit = &config["provider"]["ollama"]["models"]["m"]["limit"];
-        assert_eq!(limit["context"], 128_000);
-        assert_eq!(
-            limit["output"], 8_192,
-            "the catalog's ceiling, not a quarter of the window"
-        );
-
-        // A local model has no catalog and no ceiling of its own, so the
-        // derived reserve still stands.
-        let local = opencode_config("http://h", "m", "k", &[], None, false, Some(128_000), None);
-        let config: serde_json::Value = serde_json::from_str(&local).expect("valid JSON");
-        assert_eq!(
-            config["provider"]["ollama"]["models"]["m"]["limit"]["output"],
-            OPENCODE_OUTPUT_TOKEN_MAX
-        );
-    }
-
-    #[test]
-    fn opencode_config_escapes_the_model_name() {
-        let model = "we\"ird/mo\\del";
-        let config: serde_json::Value = serde_json::from_str(&opencode_config(
-            "http://h",
-            model,
-            "k",
-            &[],
-            None,
-            false,
-            None,
-            None,
-        ))
-        .expect("valid JSON");
-        assert_eq!(config["model"], format!("ollama/{model}"));
-        assert_eq!(config["provider"]["ollama"]["models"][model]["name"], model);
-    }
-
-    /// Each choice becomes the options that select it; no template means
-    /// the portable set, no thinking means no variants.
-    #[test]
-    fn opencode_variants_follow_the_templates_controls() {
-        let gemma4 = ThinkingControls {
-            thinks: true,
-            enable_thinking: true,
-            efforts: vec![],
-        };
-        assert_eq!(
-            opencode_variants(Some(&Thinking::Template(gemma4.clone()))),
-            [
-                (
-                    "none",
-                    serde_json::json!({
-                        "reasoningEffort": "none",
-                        "chat_template_kwargs": { "enable_thinking": false },
-                    })
-                ),
-                (
-                    "thinking",
-                    serde_json::json!({
-                        "reasoningEffort": "medium",
-                        "chat_template_kwargs": { "enable_thinking": true },
-                    })
-                ),
-            ]
-        );
-        let qwen3_8 = ThinkingControls {
-            efforts: vec!["low", "medium", "xhigh"],
-            ..gemma4
-        };
-        assert_eq!(
-            opencode_variants(Some(&Thinking::Template(qwen3_8))),
-            [
-                ("none", serde_json::json!({ "reasoningEffort": "none" })),
-                ("low", serde_json::json!({ "reasoningEffort": "low" })),
-                ("medium", serde_json::json!({ "reasoningEffort": "medium" })),
-                ("xhigh", serde_json::json!({ "reasoningEffort": "xhigh" })),
-            ]
-        );
-        let plain = Thinking::Template(ThinkingControls::default());
-        assert!(opencode_variants(Some(&plain)).is_empty());
-        let fallback = opencode_variants(None);
-        assert_eq!(fallback.len(), PORTABLE_THINKING_LEVELS.len());
-        assert_eq!(fallback[0].0, "none");
-    }
-
-    /// A provider's model cycles exactly the catalog's levels, with no
-    /// added `none`; an empty list means no variants, not the portable set.
-    #[test]
-    fn opencode_variants_follow_the_catalogs_levels() {
-        let claude = Thinking::Listed(
-            ["low", "medium", "high", "xhigh", "max"]
-                .map(String::from)
-                .to_vec(),
-        );
-        let variants = opencode_variants(Some(&claude));
-        assert_eq!(
-            variants.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            ["low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            variants[4].1,
-            serde_json::json!({ "reasoningEffort": "max" })
-        );
-        assert!(opencode_variants(Some(&Thinking::Listed(Vec::new()))).is_empty());
-        assert!(claude.template().is_none());
-    }
-
-    #[test]
-    fn codex_profile_is_a_websocket_free_provider_at_the_daemon() {
-        let profile: toml::Value = codex_profile("http://127.0.0.1:17434", None)
-            .parse()
-            .expect("valid TOML");
-        assert_eq!(profile["model_provider"].as_str(), Some("llmman"));
-        let provider = &profile["model_providers"]["llmman"];
-        assert_eq!(
-            provider["base_url"].as_str(),
-            Some("http://127.0.0.1:17434/v1")
-        );
-        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
-        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
-        assert!(
-            profile.get("openai_base_url").is_none(),
-            "the built-in openai provider is not the one in use"
-        );
-        assert!(
-            profile.get("model_catalog_json").is_none(),
-            "no model, no catalog to point at"
-        );
-    }
-
-    #[test]
-    fn codex_profile_names_the_catalog_it_was_given() {
-        let path = PathBuf::from("/home/we\"ird/.codex/llmman-model.json");
-        let profile: toml::Value = codex_profile("http://h", Some(&path))
-            .parse()
-            .expect("valid TOML");
-        assert_eq!(
-            profile["model_catalog_json"].as_str(),
-            Some(path.to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
-        let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", true, 32768)).expect("valid JSON");
-        let entry = &catalog["models"][0];
-        assert_eq!(
-            entry["input_modalities"],
-            serde_json::json!(["text", "image"])
-        );
-        assert_eq!(entry["slug"], "m");
-        assert_eq!(entry["display_name"], "m");
-        assert_eq!(entry["context_window"], 32768);
-        // Fields codex requires of an entry.
-        for key in [
-            "context_window",
-            "shell_type",
-            "visibility",
-            "supported_in_api",
-            "priority",
-            "truncation_policy",
-            "support_verbosity",
-            "supported_reasoning_levels",
-            "experimental_supported_tools",
-        ] {
-            assert!(entry.get(key).is_some(), "missing {key}");
-        }
-
-        let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", false, 32768)).expect("valid JSON");
-        assert_eq!(
-            text_only["models"][0]["input_modalities"],
-            serde_json::json!(["text"])
-        );
-    }
-
-    /// codex takes the window `launch` resolved, like every other
-    /// integration; it differs only in having to name one when there is
-    /// none. What that window is made of — live, env, trained, a pair's
-    /// larger half — is `served_context_window`'s and
-    /// `pair_context_window`'s own business, tested there.
-    #[test]
-    fn codex_context_window_falls_back_only_when_there_is_no_window() {
-        assert_eq!(codex_context_window(Some(16384)), 16384);
-        assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
-        assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
     }
 
     /// Requests above the local budget route to the hosted half, so the
@@ -5819,7 +4412,7 @@ model = \"gpt-5\"
         // never matches (a real red Windows CI leg).
         assert!(contents.contains(&format!(
             "path: {}",
-            yaml_quote(&settings_path.to_string_lossy())
+            common::yaml_quote(&settings_path.to_string_lossy())
         )));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -6423,7 +5016,7 @@ toolsets:\n  - web\nmodel:\n  provider: llmman\n  default: old-model\nproviders:
         assert!(check(Some(&thinking), "thinking").is_err());
 
         let widened = unknown_levels_with("xhigh");
-        let variants = opencode_variants(Some(&widened));
+        let variants = opencode::opencode_variants(Some(&widened));
         let names: Vec<_> = variants.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["none", "low", "medium", "high", "xhigh"]);
         assert_eq!(

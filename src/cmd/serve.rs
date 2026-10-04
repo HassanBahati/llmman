@@ -140,7 +140,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
-      LLAMA_ARG_THREADS              Thread count for llama-server (default: llama-server autodetection, overridden by a binding CPU quota/affinity limit)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: half the available CPUs above 8, else all of them)
 ";
 
 #[derive(Args, Debug)]
@@ -1363,7 +1363,7 @@ impl Drop for QueueGuard {
 /// consumer goroutine rather than rejecting every single one outright
 /// — a one-in-flight-at-a-time cap is the closest llmman gets to that
 /// same direct handoff, having no consumer-goroutine equivalent of its
-/// own. Not "unbounded" either way. `fetch_update` (not a plain
+/// own. Not "unbounded" either way. `try_update` (not a plain
 /// increment-then-check) so rejected callers never inflate the counter.
 fn try_admit_against(
     counter: &'static std::sync::atomic::AtomicUsize,
@@ -1371,7 +1371,7 @@ fn try_admit_against(
 ) -> Result<QueueGuard, AppError> {
     let cap = max_queue.max(1);
     let admitted = counter
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |n| (n < cap).then_some(n + 1),
@@ -3982,7 +3982,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let cpu_limit = container_cpu_limit();
     let threads = threads_from_env_or_host();
     if let Some(n) = threads {
-        eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
+        eprintln!("[llmman] llama-server gets --threads {n} (half the available CPUs above 8, else all of them)");
     } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
     }
@@ -4102,8 +4102,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     eprintln!(
-        "llmman serve listening on {addr}{}",
-        if tls.is_some() { " (TLS)" } else { "" }
+        "llmman serve listening on http{}://{addr}",
+        if tls.is_some() { "s" } else { "" }
     );
 
     // Background idle-unload reaper — see reap_idle_models's doc comment.

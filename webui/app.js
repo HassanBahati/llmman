@@ -11,11 +11,24 @@ import { $, $$, toast, icon, iconButton } from "./util.js";
 
 let mode = "chat";
 
+/** Phone width: the sidebar covers the page rather than sitting beside it. */
+const narrow = window.matchMedia("(max-width: 760px)");
+
 // ---- Boot -------------------------------------------------------------
+
+/**
+ * The saved `sidebarCollapsed` is the desktop preference. At phone width
+ * the sidebar covers the page, so it starts closed and opening or closing
+ * it there is not saved; crossing the breakpoint puts it back.
+ */
+function applySidebar() {
+  $("#app").classList.toggle("sidebar-collapsed", narrow.matches || !!settings.get("sidebarCollapsed"));
+}
 
 async function boot() {
   settings.applyTheme();
-  if (settings.get("sidebarCollapsed")) $("#app").classList.add("sidebar-collapsed");
+  applySidebar();
+  narrow.addEventListener("change", applySidebar);
 
   chat.init();
   shell.init();
@@ -132,10 +145,16 @@ function initFrame() {
 
   const collapse = (yes) => {
     $("#app").classList.toggle("sidebar-collapsed", yes);
-    settings.set({ sidebarCollapsed: yes });
+    if (!narrow.matches) settings.set({ sidebarCollapsed: yes });
   };
   $("#sidebar-close").addEventListener("click", () => collapse(true));
   $("#sidebar-open").addEventListener("click", () => collapse(false));
+  // Covering the page, it closes on a tap beside it or on picking somewhere
+  // to go, even the page already open (no hashchange then).
+  $("#sidebar-scrim").addEventListener("click", () => collapse(true));
+  $("#sidebar").addEventListener("click", (e) => {
+    if (narrow.matches && e.target.closest("a[href], #new-chat, .mode-toggle button:not(.disabled)")) collapse(true);
+  });
 
   document.addEventListener("keydown", (e) => {
     const mod = e.metaKey || e.ctrlKey;
