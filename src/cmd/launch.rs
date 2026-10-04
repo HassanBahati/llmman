@@ -27,6 +27,7 @@ use crate::daemon;
 use crate::providers;
 
 mod agy;
+mod aider;
 mod claude;
 mod codex;
 mod common;
@@ -1060,7 +1061,7 @@ fn launch(
         "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => launch_cline(model, extra_args),
-        "aider" => launch_aider(model, api_key, extra_args),
+        "aider" => aider::launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => launch_gemini(model, api_key, extra_args),
@@ -1655,26 +1656,6 @@ fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> 
         Some(explicit) => Some(u64::from(explicit)),
         None => trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))),
     }
-}
-
-/// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
-fn launch_aider(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let base_url = format!("{}/v1", server());
-    let mut args: Vec<String> = Vec::new();
-    if !model.is_empty() {
-        args.extend(["--model".to_string(), format!("openai/{model}")]);
-    }
-    args.extend(["--openai-api-base".to_string(), base_url.clone()]);
-    args.extend_from_slice(extra_args);
-
-    exec_with_env(
-        &PathBuf::from("aider"),
-        &args,
-        &[
-            ("OPENAI_API_KEY", api_key),
-            ("OPENAI_BASE_URL", base_url.as_str()),
-        ],
-    )
 }
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
