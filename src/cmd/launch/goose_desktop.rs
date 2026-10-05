@@ -466,7 +466,7 @@ fn quit_decision(probe: &GooseInstance, approved: u32) -> QuitDecision {
 /// Refuses a launch the running instance would take, or quits that
 /// instance when there is a terminal to answer for it.
 ///
-/// Follows [`super::ensure_cline_installed`]: a pipe or a CI job is told, never
+/// Follows [`super::cline::ensure_cline_installed`]: a pipe or a CI job is told, never
 /// asked, so nothing here can hang waiting on a stdin that will not
 /// answer.
 fn offer_to_quit_goose_desktop(
