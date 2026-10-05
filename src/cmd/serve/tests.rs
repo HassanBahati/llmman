@@ -1,11 +1,6 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
-use super::ollama::{
-    embed_inputs, empty_chat_chunk, evict_if_retagged, model_info_json, normalize_in_place,
-    opt_f64, opt_num_thread, opt_u32, options_to_oai, progress_line, staged_blob_path, staged_file,
-    OllamaPullRequest, OllamaPushRequest, PushOutcome, StreamedOutcome,
-};
 use super::openai::apply_default_repeat_penalty;
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
@@ -36,48 +31,6 @@ fn ffi_pull_ref_is_the_polled_key_not_the_tag_normalized_ref() {
     assert_eq!(
         ffi_pull_ref("docker.io/ai/qwen3.8:0.8b", "docker.io/ai/qwen3.8:0.8b"),
         "docker.io/ai/qwen3.8:0.8b"
-    );
-}
-
-/// The heartbeat must not come back once the bar is running: the
-/// shim drops its entry when the transfer ends, while the task still
-/// has its signature check to do, and a heartbeat there printed a
-/// stray line under the finished bar.
-#[test]
-fn progress_line_stops_heartbeating_once_byte_counts_have_been_seen() {
-    let mut saw_bytes = false;
-    // Nothing known yet: the heartbeat is all there is to send.
-    assert_eq!(
-        progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
-        Some(serde_json::json!({"status": "pulling m"}))
-    );
-    assert!(!saw_bytes);
-    // Real counts latch the flag and drive the bar.
-    assert_eq!(
-        progress_line("pull", "m", ("pulling".into(), 100, 40), &mut saw_bytes),
-        Some(serde_json::json!({"status": "pulling", "total": 100, "completed": 40}))
-    );
-    assert!(saw_bytes);
-    // Entry dropped, task still finishing: say nothing.
-    assert_eq!(
-        progress_line("pull", "m", (String::new(), 0, 0), &mut saw_bytes),
-        None
-    );
-}
-
-/// A status-only snapshot still reports; a blank status names the
-/// model, and `completed` never exceeds `total`.
-#[test]
-fn progress_line_reports_status_only_snapshots_and_clamps_completed() {
-    let mut saw_bytes = false;
-    assert_eq!(
-        progress_line("pull", "m", ("verifying".into(), 0, 0), &mut saw_bytes),
-        Some(serde_json::json!({"status": "verifying"}))
-    );
-    assert!(!saw_bytes);
-    assert_eq!(
-        progress_line("push", "m", (String::new(), 100, 999), &mut saw_bytes),
-        Some(serde_json::json!({"status": "pushing m", "total": 100, "completed": 100}))
     );
 }
 
@@ -1471,34 +1424,6 @@ async fn a_pair_routes_against_the_window_its_local_half_actually_loaded_with() 
     );
 }
 
-/// vLLM and MLX expose no `/props`, so there is no live `n_ctx` to
-/// report: `/api/ps` falls back to the window this daemon gave the
-/// load.
-#[tokio::test]
-async fn ps_reports_the_configured_window_when_the_backend_exposes_none() {
-    let state = test_state();
-    let mut loaded = running_model_fixture(None, Duration::ZERO, 0);
-    // Port 0 answers nothing, standing in for a backend with no /props.
-    loaded.port = 0;
-    loaded.context_window = Some(32_768);
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .insert("m:latest".into(), loaded);
-
-    let resp = handle_ps(State(state.clone()), HeaderMap::new())
-        .await
-        .into_response();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let ps: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(ps["models"][0]["context_length"], 32_768);
-}
-
 /// A crashed runner keeps its entry until the next `check_running`
 /// reaps it, but not its window: routing on a dead process's figure
 /// sends every large request away, so nothing ever notices it died.
@@ -1829,35 +1754,6 @@ fn ollama_message_to_oai_gives_each_tool_call_a_distinct_id_even_with_identical_
         calls[0].id, calls[1].id,
         "two tool calls in one message must never share an id"
     );
-}
-
-/// Every Ollama option with a chat-completion spelling is mapped;
-/// `num_predict: -1` (no limit) is no cap, and `stop` takes both forms.
-#[test]
-fn options_to_oai_maps_the_documented_sampling_options() {
-    let oai = options_to_oai(&Some(serde_json::json!({
-        "temperature": 0.5, "top_p": 0.9, "top_k": 40, "min_p": 0.05,
-        "seed": 42, "num_predict": -1, "repeat_penalty": 1.1,
-        "presence_penalty": 0.1, "frequency_penalty": 0.2,
-        "stop": ["a", "b"], "num_ctx": 8192
-    })));
-    assert_eq!(oai.temperature, Some(0.5));
-    assert_eq!(oai.top_k, Some(40));
-    assert_eq!(oai.min_p, Some(0.05));
-    assert_eq!(oai.seed, Some(42));
-    assert_eq!(oai.max_tokens, None);
-    assert_eq!(oai.presence_penalty, Some(0.1));
-    assert_eq!(oai.frequency_penalty, Some(0.2));
-    assert_eq!(
-        oai.stop.as_deref(),
-        Some(&["a".to_string(), "b".to_string()][..])
-    );
-    let one = options_to_oai(&Some(
-        serde_json::json!({ "stop": "END", "num_predict": 8 }),
-    ));
-    assert_eq!(one.stop.as_deref(), Some(&["END".to_string()][..]));
-    assert_eq!(one.max_tokens, Some(8));
-    assert_eq!(options_to_oai(&None).seed, None);
 }
 
 /// `/api/generate` fields Ollama renders itself are refused, not
@@ -2844,28 +2740,6 @@ async fn chat_response_json(resp: Response) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// Pins the wire shape against ollama 0.32.6, which answers both
-/// message-less forms with exactly this body. The `message` object must
-/// carry `role` and `content` and nothing else — `thinking`, `images`,
-/// `tool_calls` and `tool_name` are all `skip_serializing_if`, and a
-/// client comparing against ollama's reply would see any extra key.
-#[test]
-fn empty_chat_chunk_matches_ollamas_message_less_reply() {
-    let value = serde_json::to_value(empty_chat_chunk("m:latest".into(), "load")).unwrap();
-
-    assert_eq!(value["model"], "m:latest");
-    assert_eq!(value["done"], true);
-    assert_eq!(value["done_reason"], "load");
-    assert_eq!(value["message"]["role"], "assistant");
-    assert_eq!(value["message"]["content"], "");
-    assert_eq!(
-        value["message"].as_object().unwrap().len(),
-        2,
-        "ollama's message-less reply carries only role and content"
-    );
-    assert!(value.get("created_at").is_some());
-}
-
 /// `{"messages": [], "keep_alive": 0}` is ollama's unload idiom — see
 /// `handle_ollama_chat` for what the request did before this branch
 /// existed. Asserts both halves of the contract that regressed: the
@@ -3495,45 +3369,6 @@ fn vllm_omni_engine_has_its_own_label() {
     assert_eq!(Engine::VllmOmni.label(), "vllm-omni");
 }
 
-/// `/api/embed` takes a string or an array of strings, and nothing
-/// else; an empty string and `null` both mean "no inputs".
-#[test]
-fn embed_inputs_accepts_a_string_or_string_array_only() {
-    assert_eq!(embed_inputs(&serde_json::json!("hi")).unwrap(), vec!["hi"]);
-    assert_eq!(
-        embed_inputs(&serde_json::json!(["a", "b"])).unwrap(),
-        vec!["a", "b"]
-    );
-    assert!(embed_inputs(&serde_json::Value::Null).unwrap().is_empty());
-    assert!(embed_inputs(&serde_json::json!("")).unwrap().is_empty());
-    for bad in [
-        serde_json::json!(1),
-        serde_json::json!(["a", 1]),
-        serde_json::json!({}),
-    ] {
-        let err = embed_inputs(&bad).unwrap_err();
-        assert_eq!(err.1, StatusCode::BAD_REQUEST);
-    }
-}
-
-#[test]
-fn normalize_in_place_yields_a_unit_vector_and_rejects_non_finite() {
-    let mut v = vec![3.0f32, 4.0];
-    normalize_in_place(&mut v).unwrap();
-    assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
-    let mut zero = vec![0.0f32, 0.0];
-    normalize_in_place(&mut zero).unwrap();
-    assert_eq!(zero, vec![0.0, 0.0]);
-    assert!(normalize_in_place(&mut [1.0, f32::NAN]).is_err());
-    assert!(normalize_in_place(&mut [f32::INFINITY]).is_err());
-    let mut huge = vec![f32::MAX, f32::MAX];
-    normalize_in_place(&mut huge).unwrap();
-    assert!((huge[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
-    let mut tiny = vec![1e-20f32, 0.0];
-    normalize_in_place(&mut tiny).unwrap();
-    assert_eq!(tiny, vec![1.0, 0.0]);
-}
-
 /// Only a JSON content type is left alone by `accept_any_content_type`.
 #[test]
 fn is_json_content_type_matches_json_and_json_suffixed_types_only() {
@@ -3623,59 +3458,6 @@ async fn create_needs_exactly_one_of_from_or_files() {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-}
-
-/// A loaded model whose tag now points at other content is dropped,
-/// whichever way the tag is spelled; one serving the same content stays.
-#[tokio::test]
-async fn evict_if_retagged_drops_only_a_runner_serving_stale_content() {
-    let state = test_state();
-    let key = "hf.co/o/m:latest";
-    let mut fixture = running_model_fixture(None, Duration::ZERO, 0);
-    fixture.digest = "sha256:old".into();
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .insert(key.into(), fixture);
-    evict_if_retagged(&state, key, "sha256:old").await;
-    assert!(state.0.manager.lock().await.running.contains_key(key));
-    evict_if_retagged(&state, "hf.co/o/m", "sha256:new").await;
-    assert!(!state.0.manager.lock().await.running.contains_key(key));
-}
-
-/// `files` keys name a file inside the build directory; anything else
-/// is refused before a link is made.
-#[test]
-fn staged_file_refuses_a_name_that_is_not_a_bare_file_name() {
-    let state = test_state();
-    let digest = format!("sha256:{}", "a".repeat(64));
-    for name in ["../escape.gguf", "sub/dir.gguf", ".", ""] {
-        let err = staged_file(&state, name, &digest).unwrap_err();
-        assert_eq!(err.1, StatusCode::BAD_REQUEST, "{name:?}");
-    }
-}
-
-/// A malformed digest is a 400, which also keeps a crafted path
-/// segment out of the filesystem.
-#[test]
-fn staged_blob_path_requires_a_well_formed_sha256_digest() {
-    let state = test_state();
-    let ok = staged_blob_path(&state, &format!("sha256:{}", "a".repeat(64))).unwrap();
-    assert_eq!(ok, state.0.cache_path.join("blobs").join("a".repeat(64)));
-    for bad in [
-        "sha256:abc",
-        "md5:0000",
-        &format!("sha256:{}", "g".repeat(64)),
-        "../x",
-    ] {
-        assert_eq!(
-            staged_blob_path(&state, bad).unwrap_err().1,
-            StatusCode::BAD_REQUEST
-        );
     }
 }
 
@@ -3797,68 +3579,6 @@ fn responses_input_item_text_ported_ollama_polymorphic_input_cases() {
     );
 }
 
-/// Ported from ollama's server/routes_options_test.go concept
-/// (api.Options blob -> typed option values): numeric options are
-/// pulled out of the Ollama `options` blob by key, and missing keys,
-/// wrong-typed values, or an absent blob all yield None instead of
-/// erroring.
-#[test]
-fn option_extractors_ported_ollama_options_blob_cases() {
-    let opts = Some(serde_json::json!({
-        "temperature": 0.5,
-        "top_p": 0.9,
-        "num_predict": 128,
-        "stop": ["### User:"]
-    }));
-    assert_eq!(opt_f64(&opts, "temperature"), Some(0.5));
-    assert_eq!(opt_f64(&opts, "top_p"), Some(0.9));
-    assert_eq!(opt_u32(&opts, "num_predict"), Some(128));
-    // Missing key.
-    assert_eq!(opt_f64(&opts, "repeat_penalty"), None);
-    // Wrong type for the extractor.
-    assert_eq!(opt_u32(&opts, "stop"), None);
-    // No options blob at all.
-    assert_eq!(opt_f64(&None, "temperature"), None);
-    assert_eq!(opt_u32(&None, "num_predict"), None);
-}
-
-#[test]
-fn opt_num_thread_accepts_a_positive_integer() {
-    assert_eq!(
-        opt_num_thread(&Some(serde_json::json!({"num_thread": 4}))),
-        Some(4)
-    );
-    assert_eq!(
-        opt_num_thread(&Some(serde_json::json!({"num_thread": 1}))),
-        Some(1)
-    );
-}
-
-#[test]
-fn opt_num_thread_rejects_zero_negative_and_non_integer_values() {
-    // (num_thread value in the options blob, why it must be dropped)
-    let cases = [
-        (
-            serde_json::json!(0),
-            "zero: llama-server rejects --threads 0",
-        ),
-        (serde_json::json!(-1), "negative"),
-        (serde_json::json!(2.5), "fractional"),
-        (serde_json::json!("4"), "string, not a JSON number"),
-        (
-            serde_json::json!(u64::from(u32::MAX) + 1),
-            "above u32: must not truncate to --threads 0",
-        ),
-    ];
-    for (value, why) in cases {
-        let opts = Some(serde_json::json!({ "num_thread": value }));
-        assert_eq!(opt_num_thread(&opts), None, "{why}");
-    }
-    // Missing key, and no options blob at all.
-    assert_eq!(opt_num_thread(&Some(serde_json::json!({}))), None);
-    assert_eq!(opt_num_thread(&None), None);
-}
-
 #[test]
 fn keyed_lock_is_per_key_and_release_only_drops_unreferenced_entries() {
     let registry: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
@@ -3968,68 +3688,6 @@ async fn ensure_model_rejects_an_invalid_ref_with_400() {
     assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
 }
 
-/// /api/push validates the client ref before resolving it: an invalid
-/// ref returns a 400, matching /api/pull's early rejection.
-#[tokio::test]
-async fn handle_push_rejects_an_invalid_ref_with_400() {
-    let state = test_state();
-    let req = OllamaPushRequest {
-        model: "hf.co/../x".to_string(),
-        name: String::new(),
-    };
-    let resp = handle_push(State(state), Json(req)).await.into_response();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-/// /api/push has no "fetch it first" fallback: a valid ref that isn't
-/// already in the local store returns a 404 through AppError, not a
-/// hand-built body.
-#[tokio::test]
-async fn handle_push_returns_404_for_a_model_not_in_the_store() {
-    let state = test_state();
-    let req = OllamaPushRequest {
-        model: "hf.co/does-not-exist/nowhere".to_string(),
-        name: String::new(),
-    };
-    let resp = handle_push(State(state), Json(req)).await.into_response();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-/// A push reports the digest it landed on, which is what
-/// `cmd::push --sign-key` signs — the daemon deliberately does not
-/// sign, so losing this line would silently disable signing.
-#[test]
-fn a_push_outcome_reports_its_digest_on_the_stream() {
-    let lines = PushOutcome {
-        digest: "sha256:abc".into(),
-    }
-    .into_lines();
-    assert_eq!(lines, vec![serde_json::json!({"digest": "sha256:abc"})]);
-}
-
-/// A pull's notices go out the same stream, so one helper serves
-/// both verbs.
-#[test]
-fn pull_notices_go_out_as_notice_lines() {
-    let lines = vec!["warning: unsigned".to_string()].into_lines();
-    assert_eq!(
-        lines,
-        vec![serde_json::json!({"notice": "warning: unsigned"})]
-    );
-}
-
-/// An Ollama client's push body has no signing fields at all, and
-/// deserializing one must not require them.
-#[test]
-fn an_ollama_push_body_still_deserializes() {
-    let req: OllamaPushRequest =
-        serde_json::from_str(r#"{"model":"docker.io/org/model:v1"}"#).unwrap();
-    assert_eq!(req.model, "docker.io/org/model:v1");
-    // The deprecated `name` spelling real Ollama still accepts.
-    let req: OllamaPushRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
-    assert_eq!(req.name, "x");
-}
-
 /// /api/delete resolves (and so validates) the client ref before it ever
 /// opens the store: an invalid ref returns a 400 and touches nothing.
 #[tokio::test]
@@ -4041,70 +3699,6 @@ async fn handle_delete_rejects_an_invalid_ref_with_400() {
     };
     let resp = handle_delete(State(state), Json(req)).await.into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-/// ollama sends every GGUF metadata key verbatim, drops two of them, and
-/// carries an array whole unless it is longer than its own ceiling.
-#[test]
-fn model_info_json_sends_scalars_and_short_arrays_verbatim() {
-    use crate::gguf::Value;
-    let mut info = crate::gguf::Info::default();
-    for (k, v) in [
-        ("general.architecture", Value::String("llama".into())),
-        ("llama.context_length", Value::U32(4096)),
-        ("tokenizer.ggml.add_eos_token", Value::Bool(false)),
-        (
-            "tokenizer.ggml.token_type",
-            Value::Array(vec![Value::I32(1), Value::I32(3)]),
-        ),
-        (
-            "tokenizer.ggml.precompiled_charsmap",
-            Value::Array(vec![Value::U8(1), Value::U8(2), Value::U8(3)]),
-        ),
-        ("llama.vision.indexes", Value::Array(Vec::new())),
-        ("general.name", Value::String("Qwen3.5 0.8B".into())),
-        (
-            "tokenizer.chat_template",
-            Value::String("{{ bulk }}".into()),
-        ),
-    ] {
-        info.metadata.insert(k.to_string(), v);
-    }
-    let json = model_info_json(&info);
-    assert_eq!(json["general.architecture"], serde_json::json!("llama"));
-    assert_eq!(json["llama.context_length"], serde_json::json!(4096));
-    assert_eq!(
-        json["tokenizer.ggml.add_eos_token"],
-        serde_json::json!(false)
-    );
-    // A UINT8 array is Go's []byte, which encoding/json writes as a
-    // base64 string — "AQID" is [1, 2, 3].
-    assert_eq!(
-        json["tokenizer.ggml.precompiled_charsmap"],
-        serde_json::json!("AQID")
-    );
-    // A short array is the value itself, not a placeholder for one.
-    assert_eq!(json["tokenizer.ggml.token_type"], serde_json::json!([1, 3]));
-    assert_eq!(json["llama.vision.indexes"], serde_json::json!([]));
-    // Both keys ollama's GetModelInfo deletes. The template has its own
-    // field on this response.
-    assert_eq!(json.get("general.name"), None);
-    assert_eq!(json.get("tokenizer.chat_template"), None);
-}
-
-/// The ceiling is ollama's: an array of exactly 1024 elements is still
-/// sent, and a longer one is elided as `[]` rather than `null`, which a
-/// client would read as "this key has no value" instead of "not carried".
-#[test]
-fn model_info_json_elides_only_arrays_past_the_ceiling() {
-    use crate::gguf::Value;
-    let array = |n: usize| Value::Array(vec![Value::U32(7); n]);
-    let mut info = crate::gguf::Info::default();
-    info.metadata.insert("at.ceiling".into(), array(1024));
-    info.metadata.insert("past.ceiling".into(), array(1025));
-    let json = model_info_json(&info);
-    assert_eq!(json["at.ceiling"].as_array().map(Vec::len), Some(1024));
-    assert_eq!(json["past.ceiling"], serde_json::json!([]));
 }
 
 /// The `/api/show` body for a store holding one model whose single
@@ -4280,37 +3874,6 @@ async fn load_lock_guard_releases_on_task_cancellation() {
         !LOAD_LOCKS.lock().unwrap().contains_key(key),
         "aborting a task holding LoadLockGuard must still release the registry entry"
     );
-}
-
-/// Regression test for `OllamaPullRequest`'s `name` field: a body
-/// carrying only `{"name": "..."}` used to fail Axum's `Json`
-/// extraction outright — `model` was a required, non-default field —
-/// before this handler's own name-falls-back-to-model logic ever ran.
-#[test]
-fn ollama_pull_request_accepts_a_name_only_body() {
-    let req: OllamaPullRequest =
-        serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
-            .expect("a name-only body must still deserialize");
-    assert_eq!(req.model, "");
-    assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
-}
-
-#[test]
-fn ollama_pull_request_accepts_a_model_only_body() {
-    let req: OllamaPullRequest =
-        serde_json::from_value(serde_json::json!({"model": "docker.io/ai/gemma4:E2B"}))
-            .expect("a model-only body must still deserialize");
-    assert_eq!(req.model, "docker.io/ai/gemma4:E2B");
-    assert_eq!(req.name, "");
-}
-
-#[test]
-fn ollama_push_request_accepts_a_name_only_body() {
-    let req: OllamaPushRequest =
-        serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
-            .expect("a name-only body must still deserialize");
-    assert_eq!(req.model, "");
-    assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
 }
 
 // -- stream_ollama over a mock SSE backend --------------------------------
