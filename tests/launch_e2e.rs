@@ -5,8 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
-//! `hermes`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
+//! `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
@@ -657,6 +657,7 @@ fn launch_command(
         .env("QWEN_HOME", home.join(".qwen"))
         .env("GROK_HOME", home.join(".grok"))
         .env("CLINE_DIR", home.join(".cline"))
+        .env("COPILOT_HOME", home.join(".copilot"))
         .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
@@ -1074,6 +1075,28 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_copilot_with_model() {
+    eprintln!("[test] launch_copilot_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_copilot_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("copilot") {
+        eprintln!("skipping: copilot not on PATH — npm install -g @github/copilot");
+        return;
+    }
+
+    // `-p` is Copilot CLI's non-interactive prompt mode. run_launch's
+    // fresh HOME proves BYOK mode does not depend on a prior GitHub
+    // login or Copilot configuration. `--silent` leaves only the model's
+    // reply on stdout, and the strict assertion prevents Copilot's unusual
+    // zero-exit "Failed to get response" path from passing this test.
+    launch_and_assert_strict("copilot", &["--silent", "-p", PROMPT]);
 }
 
 /// `launch codex --sandbox docker|podman`: codex from Docker Sandboxes'
