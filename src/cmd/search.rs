@@ -58,6 +58,9 @@ const FIT_BUDGET: Duration = Duration::from_secs(10);
 #[derive(Args, Debug)]
 #[command(after_help = FIT_HELP)]
 pub struct SearchArgs {
+    /// Do not pipe output into a pager
+    #[arg(long)]
+    pub no_pager: bool,
     /// Text to match against model names and descriptions
     #[arg(value_name = "QUERY")]
     pub query: String,
@@ -110,10 +113,10 @@ pub fn run(args: &SearchArgs) -> Result<()> {
         anyhow::bail!("no models found for {query:?}");
     }
     let fits = runtime.block_on(fits(&hits));
-    print!("{}", render(&hits, &fits, stdout_color()));
+    let out = render(&hits, &fits, stdout_color());
     // Not `drop`, which would wait out a hung memory probe.
     runtime.shutdown_background();
-    Ok(())
+    crate::pager::emit("search", &out, !args.no_pager)
 }
 
 /// Docker Hub's rows first. With both registries selected, one failing

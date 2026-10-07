@@ -1,10 +1,14 @@
 use clap::Args;
 use serde::Deserialize;
+use std::fmt::Write;
 
 use crate::fmt::{human_size, relative_time_rfc3339, short_id, until_rfc3339};
 
 #[derive(Args, Debug)]
 pub struct PsArgs {
+    /// Do not pipe output into a pager
+    #[arg(long)]
+    pub no_pager: bool,
     /// Only show models whose reference starts with this prefix
     #[arg(value_name = "PREFIX")]
     pub prefix: Option<String>,
@@ -125,7 +129,9 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
             .unwrap_or_default()
     };
 
-    println!(
+    let mut out = String::new();
+    writeln!(
+        &mut out,
         "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    {}UNTIL",
         "NAME",
         "ID",
@@ -137,10 +143,11 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
         name_w = name_w,
         proc_w = proc_w,
         started_w = started_w,
-    );
+    )?;
 
     for ((m, (started, until)), node) in models.iter().zip(rendered.iter()).zip(nodes) {
-        println!(
+        writeln!(
+            &mut out,
             "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    {:<started_w$}    {}{}",
             m.name,
             short_id(&m.digest),
@@ -153,9 +160,9 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
             name_w = name_w,
             proc_w = proc_w,
             started_w = started_w,
-        );
+        )?;
     }
-    Ok(())
+    crate::pager::emit("ps", &out, !args.no_pager)
 }
 
 /// `http://spark:17434` -> `spark:17434`; this daemon's own -> `local`.
