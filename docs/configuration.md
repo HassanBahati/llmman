@@ -364,3 +364,23 @@ GPU device-selection variables `llmman serve` forwards to every
 `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
 `ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`,
 `HSA_OVERRIDE_GFX_VERSION`.
+
+## Pager
+
+`providers` and `log` use a pager when stdout is a terminal. Pipes and
+redirected output are written directly. Use `--no-pager` to bypass it for
+one invocation.
+
+```sh
+llmman config set core.pager 'less -S'
+llmman config set pager.providers false
+llmman config set pager.log 'less -+F'
+```
+
+`pager.providers` and `pager.log` accept the strings `true` or `false` to
+use or disable paging, or a shell command to select that command's pager.
+A command-specific `false` disables paging even when `LLMMAN_PAGER` is set.
+Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
+setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
+or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
+variables are unset.

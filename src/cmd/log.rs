@@ -2,8 +2,7 @@
 //! `crate::promptlog`'s file directly (no daemon, as `git log` needs no
 //! server), newest first, through a pager on a terminal.
 
-use std::io::{self, IsTerminal, Write};
-use std::process::{Command, Stdio};
+use std::io::{self, IsTerminal};
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, Local, Utc};
@@ -92,7 +91,7 @@ pub fn run(args: &LogArgs) -> anyhow::Result<()> {
             full(entry, color, &mut out);
         }
     }
-    emit(&out, !args.no_pager)
+    crate::pager::emit("log", &out, !args.no_pager)
 }
 
 /// As git: `--skip`/`-n` select newest-first, `--reverse` then flips
@@ -232,55 +231,6 @@ fn git_date(rfc3339: &str) -> String {
             .to_string(),
         Err(_) => rfc3339.to_string(),
     }
-}
-
-/// Through the pager when stdout is a terminal, as git: `$LLMMAN_PAGER`,
-/// else `$PAGER`, else `less`, via the shell; empty or `cat` means none.
-/// `LESS=FRX` is git's default too.
-pub(super) fn emit(text: &str, pager: bool) -> anyhow::Result<()> {
-    if pager && io::stdout().is_terminal() {
-        if let Some(mut child) = pager_command().and_then(|cmd| spawn_pager(&cmd).ok()) {
-            if let Some(mut stdin) = child.stdin.take() {
-                // Quitting the pager early closes the pipe; not an error.
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            // 127 (sh) / 9009 (cmd): no such pager, nothing was shown.
-            if !matches!(child.wait()?.code(), Some(127 | 9009)) {
-                return Ok(());
-            }
-        }
-    }
-    match io::stdout().write_all(text.as_bytes()) {
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        other => Ok(other?),
-    }
-}
-
-fn pager_command() -> Option<String> {
-    let cmd = ["LLMMAN_PAGER", "PAGER"]
-        .iter()
-        .find_map(|var| std::env::var(var).ok())
-        .unwrap_or_else(|| "less".to_string());
-    let cmd = cmd.trim().to_string();
-    (!cmd.is_empty() && cmd != "cat").then_some(cmd)
-}
-
-fn spawn_pager(cmd: &str) -> io::Result<std::process::Child> {
-    let mut command = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", cmd]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", cmd]);
-        c
-    };
-    for (var, default) in [("LESS", "FRX"), ("LV", "-c")] {
-        if std::env::var_os(var).is_none() {
-            command.env(var, default);
-        }
-    }
-    command.stdin(Stdio::piped()).spawn()
 }
 
 #[cfg(test)]

@@ -6,15 +6,20 @@
 //! that gets spent (see `resolve_remote_target` in cmd::serve).
 
 use clap::Args;
+use std::fmt::Write;
 
 use crate::daemon::{self, ProviderSummary};
 
-/// No arguments: a positional filter here read `llmman providers ls`
+/// No positional arguments: a positional filter here read `llmman providers ls`
 /// as "providers containing `ls`" and printed modelscope and poolside.
 #[derive(Args, Debug)]
-pub struct ProvidersArgs {}
+pub struct ProvidersArgs {
+    /// Do not pipe the output into a pager
+    #[arg(long)]
+    pub no_pager: bool,
+}
 
-pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
+pub fn run(args: &ProvidersArgs) -> anyhow::Result<()> {
     // Same contract as `run`/`pull`/`launch`: start the daemon rather
     // than tell the user to. It owns the catalog, and whatever runs next
     // needs it anyway.
@@ -27,6 +32,7 @@ pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
         anyhow::bail!("no providers available");
     }
 
+    let mut out = String::new();
     let id_w = shown.iter().map(|p| p.id.len()).max().unwrap_or(8).max(8);
     let name_w = shown.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
     let key_w = shown
@@ -36,7 +42,8 @@ pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
         .unwrap_or(7)
         .max(7);
 
-    println!(
+    writeln!(
+        out,
         "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<14}    MODELS",
         "PROVIDER",
         "NAME",
@@ -45,9 +52,10 @@ pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
         id_w = id_w,
         name_w = name_w,
         key_w = key_w,
-    );
+    )?;
     for p in &shown {
-        println!(
+        writeln!(
+            out,
             "{:<id_w$}    {:<name_w$}    {:<key_w$}    {:<14}    {}",
             p.id,
             p.name,
@@ -57,13 +65,13 @@ pub fn run(_args: &ProvidersArgs) -> anyhow::Result<()> {
             id_w = id_w,
             name_w = name_w,
             key_w = key_w,
-        );
+        )?;
     }
 
     // Nothing after the last row: a trailing count and usage block is
     // something to skip past every time, and something a pipe into
     // `grep`/`awk` has to filter out. `--help` is where usage belongs.
-    Ok(())
+    crate::pager::emit("providers", &out, !args.no_pager)
 }
 
 /// The variable column: `-` for a configured provider that names none.

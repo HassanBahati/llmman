@@ -62,6 +62,10 @@ const FILE: &str = "llmman.conf";
 #[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Conf {
+    #[serde(default)]
+    pub core: CoreConf,
+    #[serde(default)]
+    pub pager: PagerConf,
     /// Short-name aliases — see [`crate::shortnames`].
     #[serde(default)]
     pub aliases: HashMap<String, String>,
@@ -85,6 +89,45 @@ pub struct Conf {
     /// reference names — see [`registry_mirrors`].
     #[serde(default)]
     pub registries: HashMap<String, RegistryConf>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CoreConf {
+    #[serde(default)]
+    pub pager: Option<String>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PagerConf {
+    #[serde(default)]
+    pub log: Option<String>,
+    #[serde(default)]
+    pub providers: Option<String>,
+}
+
+pub(crate) fn pager(command: &str) -> (Option<String>, Option<String>) {
+    pager_from_files(files().unwrap_or_default(), command)
+}
+
+fn pager_from_files(files: &[File], command: &str) -> (Option<String>, Option<String>) {
+    let mut core = None;
+    let mut specific = None;
+    for file in files {
+        if let Some(value) = &file.conf.core.pager {
+            core = Some(value.clone());
+        }
+        let value = match command {
+            "log" => &file.conf.pager.log,
+            "providers" => &file.conf.pager.providers,
+            _ => continue,
+        };
+        if let Some(value) = value {
+            specific = Some(value.clone());
+        }
+    }
+    (core, specific)
 }
 
 /// The `[aggregation]` section.
@@ -881,6 +924,49 @@ mod tests {
 
     fn conf(text: &str) -> Conf {
         parse(text).expect("valid conf")
+    }
+
+    #[test]
+    fn pager_configuration_merges_each_key_independently() {
+        let system = file(
+            r#"[core]
+pager = "less -S"
+[pager]
+providers = "false"
+log = "more""#,
+        );
+        let user = file(
+            r#"[pager]
+log = """#,
+        );
+        assert_eq!(
+            pager_from_files(&[system, user], "log"),
+            (Some("less -S".into()), Some("".into()))
+        );
+        let system = file(
+            r#"[core]
+pager = "less"
+[pager]
+providers = "false""#,
+        );
+        let user = file(
+            r#"[core]
+pager = "cat""#,
+        );
+        assert_eq!(
+            pager_from_files(&[system, user], "providers"),
+            (Some("cat".into()), Some("false".into()))
+        );
+        assert!(parse(
+            r#"[core]
+pagr = "less""#
+        )
+        .is_err());
+        assert!(parse(
+            r#"[pager]
+provider = "false""#
+        )
+        .is_err());
     }
 
     /// `$HOME` is what `dirs::home_dir` reads on Unix anyway, so this
