@@ -2,7 +2,10 @@
 //! `crate::promptlog`'s file directly (no daemon, as `git log` needs no
 //! server), newest first, through a pager on a terminal.
 
-use std::io::{self, IsTerminal};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, Local, Utc};
@@ -12,6 +15,10 @@ use crate::promptlog::Entry;
 
 #[derive(Args, Debug)]
 pub struct LogArgs {
+    /// Print the selected history, then stream new prompts without a pager.
+    /// --max-count, --skip and --reverse apply only to the initial history
+    #[arg(short = 'f', long)]
+    pub follow: bool,
     /// Limit the number of prompts to output
     #[arg(short = 'n', long = "max-count", value_name = "NUMBER")]
     pub max_count: Option<usize>,
@@ -67,31 +74,164 @@ pub fn expand_count_shorthand<I: IntoIterator<Item = std::ffi::OsString>>(
 
 pub fn run(args: &LogArgs) -> anyhow::Result<()> {
     let path = crate::promptlog::path()?;
-    let mut entries = crate::promptlog::read(&path)
-        .with_context(|| format!("read prompt log {}", path.display()))?;
-
     let in_window = window(args.since.as_deref(), args.until.as_deref(), Utc::now())?;
     let model = patterns(&args.model, args.ignore_case)?;
     let grep = patterns(&args.grep, args.ignore_case)?;
-    entries.retain(|e| {
+    let matches = |e: &Entry| {
         in_window(&e.time)
             && model.as_ref().is_none_or(|m| m.is_match(&e.model))
             && grep.as_ref().is_none_or(|g| g.is_match(&e.prompt))
-    });
+    };
+    if args.follow {
+        return follow(&path, args, matches);
+    }
+    let mut entries = crate::promptlog::read(&path)
+        .with_context(|| format!("read prompt log {}", path.display()))?;
+
+    entries.retain(matches);
 
     let color = io::stdout().is_terminal();
+    let out = render(
+        &select(&entries, args.skip, args.max_count, args.reverse),
+        args,
+        color,
+        &mut false,
+    );
+    crate::pager::emit("log", &out, !args.no_pager)
+}
+
+fn render(entries: &[&Entry], args: &LogArgs, color: bool, has_output: &mut bool) -> String {
     let mut out = String::new();
-    for entry in select(&entries, args.skip, args.max_count, args.reverse) {
+    for entry in entries {
         if args.oneline {
             oneline(entry, color, &mut out);
         } else {
-            if !out.is_empty() {
+            if *has_output {
                 out.push('\n');
             }
             full(entry, color, &mut out);
         }
+        *has_output = true;
     }
-    crate::pager::emit("log", &out, !args.no_pager)
+    out
+}
+
+fn follow(path: &Path, args: &LogArgs, matches: impl Fn(&Entry) -> bool) -> anyhow::Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(async {
+        let mut tail = Tail::default();
+        let mut entries = tail.read(path)?;
+        entries.retain(&matches);
+        let color = io::stdout().is_terminal();
+        let mut has_output = false;
+        let out = render(
+            &select(&entries, args.skip, args.max_count, args.reverse),
+            args,
+            color,
+            &mut has_output,
+        );
+        if !write_follow(&out)? {
+            return Ok(());
+        }
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        loop {
+            tokio::select! {
+                result = &mut interrupt => {
+                    result?;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    let entries = tail.read(path)?;
+                    let shown: Vec<_> = entries.iter().filter(|entry| matches(entry)).collect();
+                    let out = render(&shown, args, color, &mut has_output);
+                    if !write_follow(&out)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn write_follow(text: &str) -> io::Result<bool> {
+    if text.is_empty() {
+        return Ok(true);
+    }
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Default)]
+struct Tail {
+    reader: Option<BufReader<File>>,
+    pending: Vec<u8>,
+    checkpoint: Vec<u8>,
+}
+
+impl Tail {
+    fn read(&mut self, path: &Path) -> io::Result<Vec<Entry>> {
+        if self.reader.is_none() {
+            match File::open(path) {
+                Ok(file) => self.reader = Some(BufReader::new(file)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            }
+        }
+        let reader = self.reader.as_mut().unwrap();
+        let position = reader.stream_position()?;
+        let mut reset = reader.get_ref().metadata()?.len() < position;
+        // The log is append-only. A bounded checkpoint also detects refills
+        // without rereading the entire history while idle.
+        if !reset && !self.checkpoint.is_empty() {
+            reader.seek(SeekFrom::Start(position - self.checkpoint.len() as u64))?;
+            let mut bytes = vec![0; self.checkpoint.len()];
+            match reader.read_exact(&mut bytes) {
+                Ok(()) => reset = bytes != self.checkpoint,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => reset = true,
+                Err(e) => return Err(e),
+            }
+            reader.seek(SeekFrom::Start(position))?;
+        }
+        if reset {
+            reader.seek(SeekFrom::Start(0))?;
+            self.pending.clear();
+            self.checkpoint.clear();
+        }
+        let mut entries = Vec::new();
+        loop {
+            let read = reader.read_until(b'\n', &mut self.pending)?;
+            if read == 0 {
+                break;
+            }
+            let bytes = &self.pending[self.pending.len() - read..];
+            const CHECKPOINT_SIZE: usize = 4096;
+            if bytes.len() >= CHECKPOINT_SIZE {
+                self.checkpoint.clear();
+                self.checkpoint
+                    .extend_from_slice(&bytes[bytes.len() - CHECKPOINT_SIZE..]);
+            } else {
+                let excess = (self.checkpoint.len() + bytes.len()).saturating_sub(CHECKPOINT_SIZE);
+                self.checkpoint.drain(..excess);
+                self.checkpoint.extend_from_slice(bytes);
+            }
+            // A JSON value can parse before its writer has finished the line.
+            // Keep the partial line across polls and emit only once it is complete.
+            if self.pending.last() == Some(&b'\n') {
+                if let Ok(entry) = serde_json::from_slice(&self.pending) {
+                    entries.push(entry);
+                }
+                self.pending.clear();
+            }
+        }
+        Ok(entries)
+    }
 }
 
 /// As git: `--skip`/`-n` select newest-first, `--reverse` then flips
@@ -246,6 +386,119 @@ mod tests {
             client: Some("claude-cli/1.2.3".into()),
             prompt: "fix the failing test\nthen commit".into(),
         }
+    }
+
+    #[test]
+    fn follow_reads_each_complete_line_once_and_recovers_after_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        let mut tail = Tail::default();
+        assert!(tail.read(&path).unwrap().is_empty());
+        let first = entry();
+        crate::promptlog::append(&path, &first).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [first]);
+        assert!(tail.read(&path).unwrap().is_empty());
+        let second = Entry {
+            id: "second".into(),
+            ..entry()
+        };
+        let bytes = serde_json::to_vec(&second).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        assert!(tail.read(&path).unwrap().is_empty());
+        file.write_all(b"\ninvalid json\n").unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [second]);
+        assert!(tail.read(&path).unwrap().is_empty());
+        File::create(&path).unwrap();
+        assert!(tail.read(&path).unwrap().is_empty());
+        crate::promptlog::append(&path, &entry()).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [entry()]);
+    }
+
+    #[test]
+    fn follow_recovers_when_truncation_and_refill_happen_between_polls() {
+        for extra in ["", " with a longer prompt"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prompts.jsonl");
+            let mut tail = Tail::default();
+            let first = entry();
+            crate::promptlog::append(&path, &first).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [first]);
+            let replacement = Entry {
+                id: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                prompt: format!("{}{extra}", entry().prompt),
+                ..entry()
+            };
+            File::create(&path).unwrap();
+            crate::promptlog::append(&path, &replacement).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [replacement]);
+            assert!(tail.read(&path).unwrap().is_empty());
+            crate::promptlog::append(&path, &entry()).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [entry()]);
+        }
+    }
+
+    #[test]
+    fn follow_detects_a_refill_that_preserves_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        let mut tail = Tail::default();
+        let first = entry();
+        let last = Entry {
+            id: "last".into(),
+            ..entry()
+        };
+        crate::promptlog::append(&path, &first).unwrap();
+        crate::promptlog::append(&path, &last).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [first, last.clone()]);
+        let previous_len = std::fs::metadata(&path).unwrap().len();
+        let replacement = Entry {
+            id: "fedcba9876543210fedcba9876543210fedcba98".into(),
+            ..entry()
+        };
+        File::create(&path).unwrap();
+        crate::promptlog::append(&path, &replacement).unwrap();
+        crate::promptlog::append(&path, &last).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), previous_len);
+        assert_eq!(tail.read(&path).unwrap(), [replacement, last]);
+        assert!(tail.read(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn follow_keeps_a_bounded_checkpoint_for_large_entries_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        let mut tail = Tail::default();
+        let large = Entry {
+            prompt: "x".repeat(16384),
+            ..entry()
+        };
+        crate::promptlog::append(&path, &large).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [large]);
+        for _ in 0..3 {
+            assert_eq!(tail.checkpoint.len(), 4096);
+            assert!(tail.read(&path).unwrap().is_empty());
+            crate::promptlog::append(&path, &entry()).unwrap();
+            assert_eq!(tail.read(&path).unwrap(), [entry()]);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(tail.checkpoint, bytes[bytes.len() - 4096..]);
+        }
+    }
+
+    #[test]
+    fn follow_discards_a_partial_line_when_the_file_is_refilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.jsonl");
+        std::fs::write(&path, b"{\"id\":\"unfinished").unwrap();
+        let mut tail = Tail::default();
+        assert!(tail.read(&path).unwrap().is_empty());
+        File::create(&path).unwrap();
+        crate::promptlog::append(&path, &entry()).unwrap();
+        assert_eq!(tail.read(&path).unwrap(), [entry()]);
+        assert!(tail.read(&path).unwrap().is_empty());
     }
 
     #[test]

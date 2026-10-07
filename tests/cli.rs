@@ -23,3 +23,102 @@ fn unknown_subcommand_exits_2() {
     let out = llmman().arg("bogus").output().expect("spawn llmman");
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[cfg(unix)]
+#[test]
+fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+
+    struct Fixture {
+        child: std::process::Child,
+        _dir: tempfile::TempDir,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prompts.jsonl");
+    let entry = |id: &str, model: &str, prompt: &str| llmman::promptlog::Entry {
+        id: id.into(),
+        model: model.into(),
+        prompt: prompt.into(),
+        time: "2026-10-06T12:00:00Z".into(),
+        route: "/api/chat".into(),
+        client: None,
+    };
+    for value in [
+        entry("first", "wanted", "keep first"),
+        entry("second", "wanted", "keep second"),
+    ] {
+        llmman::promptlog::append(&path, &value).unwrap();
+    }
+    let child = llmman()
+        .args([
+            "log",
+            "-f",
+            "--oneline",
+            "-n",
+            "1",
+            "--model",
+            "wanted",
+            "--grep",
+            "keep",
+        ])
+        .env("LLMMAN_MODELS", dir.path().join("store"))
+        .env("LLMMAN_PAGER", "exit 1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fixture = Fixture { child, _dir: dir };
+    let stdout = fixture.child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "second keep second"
+    );
+    for value in [
+        entry("wrong-model", "other", "keep hidden"),
+        entry("wrong-text", "wanted", "hidden"),
+        entry("third", "wanted", "keep third"),
+        entry("fourth", "wanted", "keep fourth"),
+    ] {
+        llmman::promptlog::append(&path, &value).unwrap();
+    }
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "third keep third"
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "fourth keep fourth"
+    );
+    unsafe {
+        libc::kill(fixture.child.id() as i32, libc::SIGINT);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = fixture.child.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follow did not exit on Ctrl-C"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    reader.join().unwrap();
+}

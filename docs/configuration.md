@@ -386,3 +386,12 @@ Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
 setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
 or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
 variables are unset.
+
+## Following prompts
+
+`llmman log -f` (`--follow`) bypasses the pager. It prints the selected
+history, then streams new complete prompts in arrival order until Ctrl-C.
+`--max-count`, `--skip`, and `--reverse` affect only the initial history;
+model, text, and date filters also apply to new prompts. Follow mode waits
+if the log has not been created yet and continues across truncation. Like
+`tail -f`, it follows the opened file rather than a replacement at that path.
