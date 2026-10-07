@@ -127,6 +127,7 @@ const PASSTHROUGH_ENV: &[&str] = &[
     "LC_ALL",
     "CLAUDE_CONFIG_DIR",
     "CLINE_DIR",
+    "COPILOT_HOME",
     "GH_CONFIG_DIR",
     "GROK_HOME",
     "HERMES_HOME",
@@ -247,8 +248,14 @@ pub fn prepare(
 }
 
 /// Runs the integration in the prepared sandbox; returns its exit code.
-/// `env` overlays the inherited environment, later entries winning.
-pub fn run(bin: &Path, args: &[String], env: &[(String, String)]) -> anyhow::Result<i32> {
+/// `env` overlays the inherited environment, later entries winning;
+/// `remove_env` is stripped from host-process sandboxes before launch.
+pub fn run(
+    bin: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    remove_env: &[&str],
+) -> anyhow::Result<i32> {
     let active = ACTIVE.get().context("no sandbox prepared")?;
     let filtered;
     let env = if active.sandbox.uses_image() {
@@ -259,7 +266,7 @@ pub fn run(bin: &Path, args: &[String], env: &[(String, String)]) -> anyhow::Res
     };
     match active.sandbox {
         Sandbox::Sbx => anyhow::bail!("--sandbox sbx is not prepared"),
-        Sandbox::Seatbelt => run_seatbelt(active, bin, args, env),
+        Sandbox::Seatbelt => run_seatbelt(active, bin, args, env, remove_env),
         Sandbox::Openshell => run_openshell(active, bin, args, env),
         sandbox => {
             let plan = plan(active, bin, args, env)?;
@@ -532,7 +539,19 @@ fn run_seatbelt(
     bin: &Path,
     args: &[String],
     env: &[(String, String)],
+    remove_env: &[&str],
 ) -> anyhow::Result<i32> {
+    let cmd = seatbelt_command(active, bin, args, env, remove_env)?;
+    status_code(cmd, SANDBOX_EXEC)
+}
+
+fn seatbelt_command(
+    active: &Active,
+    bin: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    remove_env: &[&str],
+) -> anyhow::Result<Command> {
     let (dirs, files) = seatbelt_writable(active);
     let workspace = real_path(&active.workspace);
     let mut cmd = Command::new(SANDBOX_EXEC);
@@ -541,7 +560,10 @@ fn run_seatbelt(
         .arg(bin)
         .args(args);
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
-    status_code(cmd, SANDBOX_EXEC)
+    for name in remove_env {
+        cmd.env_remove(name);
+    }
+    Ok(cmd)
 }
 
 /// Real paths, which seatbelt matches (`/tmp` and `/var` are symlinks).
@@ -1187,6 +1209,7 @@ fn status_code(mut cmd: Command, what: &str) -> anyhow::Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_temp_dir;
     use super::*;
 
     fn strings(args: &[&str]) -> Vec<String> {
@@ -1260,11 +1283,11 @@ mod tests {
     /// hides that the real name is missing.
     #[test]
     fn every_integration_named_here_is_a_real_one() {
-        let known = |id: &str| {
-            id == "copilot-cli" || super::super::INTEGRATIONS.iter().any(|i| i.name == id)
-        };
         for (id, _) in SBX_AGENTS.iter().chain(DEFAULT_IMAGES) {
-            assert!(known(id), "{id} is not an integration");
+            assert!(
+                super::super::integration(id).is_some(),
+                "{id} is not an integration"
+            );
         }
     }
 
@@ -1340,22 +1363,9 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-sandbox-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn the_workspace_is_the_git_work_tree_but_never_the_home_directory() {
-        let root = temp_dir("workspace");
+        let root = test_temp_dir("sandbox-workspace");
         let home = root.join("home");
         let repo = home.join("src").join("repo");
         let sub = repo.join("crate");
@@ -1379,7 +1389,7 @@ mod tests {
 
     #[test]
     fn container_plan_mounts_linked_worktree_git_metadata_read_only() {
-        let root = temp_dir("linked-worktree");
+        let root = test_temp_dir("sandbox-linked-worktree");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1485,7 +1495,7 @@ mod tests {
     fn container_plan_preserves_symlinked_git_metadata_guest_paths() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let git_dir_alias = root.join("gitdir-alias");
@@ -1596,7 +1606,7 @@ mod tests {
     fn container_plan_allows_shared_symlinked_ancestor_for_relative_commondir() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-shared-ancestor-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-shared-ancestor-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let root_alias = root.with_file_name(format!(
@@ -1717,7 +1727,7 @@ mod tests {
     fn container_plan_rejects_relative_commondir_through_symlinked_gitdir_ancestor() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-ancestor-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-ancestor-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         let gitdir_parent_alias = root.join("gitdir-parent-alias");
@@ -1793,7 +1803,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_plan_rejects_a_git_pointer_to_host_ssh() {
-        let root = temp_dir("untrusted-git-pointer");
+        let root = test_temp_dir("sandbox-untrusted-git-pointer");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1827,7 +1837,7 @@ mod tests {
     fn container_plan_rejects_a_symlinked_git_directory_to_host_ssh() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("symlinked-git-directory");
+        let root = test_temp_dir("sandbox-symlinked-git-directory");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1856,7 +1866,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_plan_rejects_an_internal_gitdir_with_external_commondir() {
-        let root = temp_dir("untrusted-commondir");
+        let root = test_temp_dir("sandbox-untrusted-commondir");
         let workspace = root.join("workspace");
         let home = root.join("home");
         let ssh = home.join(".ssh");
@@ -1883,7 +1893,7 @@ mod tests {
 
     #[test]
     fn container_plan_rejects_external_gitdir_outside_worktrees_without_commondir() {
-        let root = temp_dir("external-gitdir-outside-worktrees");
+        let root = test_temp_dir("sandbox-external-gitdir-outside-worktrees");
         let workspace = root.join("workspace");
         let git_dir = root.join("host/metadata/arbitrary/gitdir");
         let dot_git = workspace.join(".git");
@@ -1905,7 +1915,7 @@ mod tests {
     fn container_plan_rejects_symlinked_final_component_of_relative_commondir() {
         use std::os::unix::fs::symlink;
 
-        let root = temp_dir("linked-worktree-final-commondir-symlink");
+        let root = test_temp_dir("sandbox-linked-worktree-final-commondir-symlink");
         let repo = root.join("repo");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1985,9 +1995,48 @@ mod tests {
         assert!(seatbelt_profile(&[PathBuf::from("/tmp/a\"b")], &[], Path::new("/tmp")).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_removes_inherited_environment_before_launch() {
+        let root = test_temp_dir("sandbox-seatbelt-env");
+        let active = Active {
+            sandbox: Sandbox::Seatbelt,
+            integration: "copilot".into(),
+            server: "http://127.0.0.1:17434".into(),
+            workspace: root.clone(),
+            home: root.join("home"),
+            image: None,
+            state: vec![],
+        };
+        let remove = [
+            "COPILOT_PROVIDER_API_KEY_COMMAND",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+        ];
+        let cmd = seatbelt_command(
+            &active,
+            Path::new("copilot"),
+            &[],
+            &[("COPILOT_PROVIDER_API_KEY".into(), "llmman".into())],
+            &remove,
+        )
+        .unwrap();
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.iter().any(|(key, value)| {
+            *key == "COPILOT_PROVIDER_API_KEY" && value.is_some_and(|v| v == "llmman")
+        }));
+        for name in remove {
+            assert!(
+                env.iter()
+                    .any(|(key, value)| *key == name && value.is_none()),
+                "{name} was not removed: {env:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn real_path_resolves_the_existing_part_of_a_missing_path() {
-        let root = temp_dir("realpath");
+        let root = test_temp_dir("sandbox-realpath");
         let missing = root.join("not").join("yet");
         assert_eq!(
             real_path(&missing),
@@ -2135,6 +2184,7 @@ mod tests {
     fn the_guest_env_is_home_the_passthrough_and_the_launchers_last_word() {
         let host = |name: &str| match name {
             "TERM" => Some("xterm-256color".to_string()),
+            "COPILOT_HOME" => Some("/home/me/copilot-state".to_string()),
             "PATH" => Some("/usr/bin".to_string()),
             _ => None,
         };
@@ -2152,6 +2202,7 @@ mod tests {
         .unwrap();
         assert_eq!(env["HOME"], "/home/me");
         assert_eq!(env["TERM"], "xterm-256color");
+        assert_eq!(env["COPILOT_HOME"], "/home/me/copilot-state");
         assert_eq!(env["OLLAMA_HOST"], "http://host.docker.internal:17434");
         // The host's PATH would name directories the image does not have.
         assert!(!env.contains_key("PATH"));

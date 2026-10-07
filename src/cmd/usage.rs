@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
 
-use super::log::{clean, emit, patterns, window};
+use super::log::{clean, patterns, window};
 use crate::usage::{Entry, Tokens};
 
 const AFTER_HELP: &str = "\
@@ -112,7 +112,7 @@ pub fn run(args: &UsageArgs) -> anyhow::Result<()> {
             table(&rows, Some(args.by))
         }
     };
-    emit(&out, false)
+    crate::pager::emit("usage", &out, false)
 }
 
 fn filter(entries: &mut Vec<Entry>, args: &UsageArgs, now: DateTime<Utc>) -> anyhow::Result<()> {

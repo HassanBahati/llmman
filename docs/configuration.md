@@ -54,9 +54,6 @@ peers = "asahi, spark:17434"
 [auth]
 api_keys = "k1, k2"                # what a request to this daemon must present
 
-[websearch]
-api_key = "..."                    # an Exa key, for web search
-
 [registries."docker.io"]
 mirrors = "https://mirror.gcr.io, registry-mirror.corp:5000"
 ```
@@ -111,23 +108,6 @@ serves ordinary routes on a network interface. The client sends its daemon key
 as `X-Api-Key`, leaving `Authorization` for its provider OAuth bearer. See
 [providers.md](providers.md#oauth-credential-forwarding) for routes, capability
 checks, network-policy IP pinning, and header handling.
-
-### Web search
-
-The web UI's *Search the web* ([webui.md](webui.md)) asks
-[Exa](https://exa.ai) through `/llmman/websearch`
-([api.md](api.md#llmmans-own-api)), so the daemon needs an Exa
-[key](https://dashboard.exa.ai/api-keys):
-
-```console
-$ export EXA_API_KEY=...                       # before llmman serve
-$ llmman config set websearch.api_key ...      # or keep it in llmman.conf
-```
-
-The environment wins and blank turns it off. Like the other keys here it
-is ignored, with a warning, if other users can read `llmman.conf`, and
-`llmman config list` prints it as `<redacted>`. Without one, a search
-reports how to set it and nothing else is affected.
 
 ### llmman config
 
@@ -331,7 +311,6 @@ setting may not behave identically.
 | `LLMMAN_API_KEYS` | Comma-separated API keys every request to `llmman serve` must present, as `Authorization: Bearer <key>` or `x-api-key: <key>`. Overrides `[auth] api_keys` in `llmman.conf`; set but empty means none. Required whenever `LLMMAN_HOST` binds beyond loopback: the daemon refuses to start otherwise. See [Authentication](#authentication). |
 | `LLMMAN_AUTH` | `off` (or `0`/`false`/`no`) serves without keys even on a bind the network can reach — for a daemon behind a gateway that authenticates for it. Configured keys are still recognized and stripped from requests, just not required. |
 | `LLMMAN_API_KEY` | The key the `llmman` CLI (and `llmman launch`'s integrations) present to the daemon. Defaults to the first of `LLMMAN_API_KEYS`/`auth.api_keys` (unless `LLMMAN_AUTH=off`), so a CLI and the daemon it manages need only one setting. Sent to a remote `http://` daemon with a one-time warning: prefer TLS. |
-| `EXA_API_KEY` | The [Exa](https://exa.ai) key for the web UI's *Search the web*, overriding `[websearch] api_key`; unset or blank, search is off. See [Web search](#web-search). |
 | `LLMMAN_PEER_API_KEY` | The key `llmman serve` presents to its [aggregation](aggregation.md) peers, overriding `[aggregation] api_key`. Defaults to the first of its own keys, so a pool sharing one key set needs nothing more. |
 | `LLMMAN_TLS_CERT` / `LLMMAN_TLS_KEY` | PEM certificate chain and private key; set both and `llmman serve` terminates TLS itself (rustls). Set `LLMMAN_HOST=https://...` too, so the CLI in the same environment connects accordingly. |
 | `LLMMAN_TLS_CA` | A PEM bundle of extra roots to trust, for a private CA: the daemon uses it to reach peers, and the CLI to reach the daemon. |
@@ -377,7 +356,6 @@ setting may not behave identically.
 | `llama-server` | Passed as `--ctx-size` as-is for generation models (llama-server allocates the KV cache at that size and caps each request slot to the model's trained context). Embedding models are always capped to their trained context, and `0` means that context. | `--ctx-size 262144` (256k), or the model's trained context if smaller. If the load then fails with an out-of-memory error, llmman retries with the context halved (down to a 16384 floor) before giving up. |
 | `vLLM` | Positive values are passed as `--max-model-len`; oversized values are rejected by vLLM. `0` is not forwarded. | Uses vLLM's model-derived default. |
 | `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
-| System One (`/v1/systemone`) | The most the context may grow to (it starts at 2048 tokens and doubles as prompts need it), capped to the model's trained context. | The model's trained context. |
 | `sglang` | Positive values are passed as `--context-length`, the same rule as vLLM's; oversized values are rejected by SGLang. `0` is not forwarded. | Uses the model's `config.json`. |
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
 
@@ -386,3 +364,23 @@ GPU device-selection variables `llmman serve` forwards to every
 `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
 `ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`,
 `HSA_OVERRIDE_GFX_VERSION`.
+
+## Pager
+
+`providers` and `log` use a pager when stdout is a terminal. Pipes and
+redirected output are written directly. Use `--no-pager` to bypass it for
+one invocation.
+
+```sh
+llmman config set core.pager 'less -S'
+llmman config set pager.providers false
+llmman config set pager.log 'less -+F'
+```
+
+`pager.providers` and `pager.log` accept the strings `true` or `false` to
+use or disable paging, or a shell command to select that command's pager.
+A command-specific `false` disables paging even when `LLMMAN_PAGER` is set.
+Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
+setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
+or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those
+variables are unset.

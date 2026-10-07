@@ -5,8 +5,8 @@
 //! from the bare short name the same way `llmman launch`/`pull` always
 //! resolve one — see `shortnames::resolve_ollama_api`), a real
 //! `llama-server` backing it, and the real third-party CLI under test
-//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `cline`, `grok`, `qwen`,
-//! `hermes`,
+//! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `cline`,
+//! `grok`, `qwen`, `hermes`,
 //! `openclaw`, `dsh`, `goose`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
@@ -38,8 +38,7 @@
 //! engine on `PATH`; for mlx, Apple Silicon macOS too) isn't met. The
 //! vllm and sglang ones run a daemon of their own on a fresh port (the
 //! engine choice is daemon-wide environment) — see
-//! `serve_safetensors_with_engine`. So does [`serve_systemone_reads_a_local_model`]
-//! (`POST /v1/systemone` on `qwen3.5:0.8b`; `gemma4` with `--ignored`).
+//! `serve_safetensors_with_engine`.
 //!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
@@ -658,6 +657,7 @@ fn launch_command(
         .env("QWEN_HOME", home.join(".qwen"))
         .env("GROK_HOME", home.join(".grok"))
         .env("CLINE_DIR", home.join(".cline"))
+        .env("COPILOT_HOME", home.join(".copilot"))
         .env("PI_CODING_AGENT_DIR", home.join(".pi").join("agent"))
         // goose asks before each tool call otherwise, and a headless run
         // has nobody to answer. Granted here, not by `launch goose`:
@@ -1075,6 +1075,28 @@ fn launch_codex_with_model() {
 
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
+}
+
+#[test]
+fn launch_copilot_with_model() {
+    eprintln!("[test] launch_copilot_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_copilot_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("copilot") {
+        eprintln!("skipping: copilot not on PATH — npm install -g @github/copilot");
+        return;
+    }
+
+    // `-p` is Copilot CLI's non-interactive prompt mode. run_launch's
+    // fresh HOME proves BYOK mode does not depend on a prior GitHub
+    // login or Copilot configuration. `--silent` leaves only the model's
+    // reply on stdout, and the strict assertion prevents Copilot's unusual
+    // zero-exit "Failed to get response" path from passing this test.
+    launch_and_assert_strict("copilot", &["--silent", "-p", PROMPT]);
 }
 
 /// `launch codex --sandbox docker|podman`: codex from Docker Sandboxes'
@@ -2548,164 +2570,6 @@ fn serve_sglang_safetensors_model() {
         return;
     }
     serve_safetensors_with_engine("sglang", SGLANG_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
-}
-
-/// `POST /v1/systemone` end to end, on a daemon of the test's own and the
-/// ggml libraries of the `llama-server` on `PATH`. Answers are asserted only
-/// where a small model is decisive (an unambiguous ticket, furious vs
-/// grateful); the rest is shapes, sums, no generation, the same answers
-/// from a warm KV cache, and the refusals.
-#[cfg(unix)]
-fn systemone_reads(model: &str, canonical: &str) {
-    if !on_path("llama-server") {
-        eprintln!("skipping: llama-server not on PATH");
-        return;
-    }
-    let host = format!("127.0.0.1:{}", free_loopback_port());
-    // Not the shared daemon's 256k context: nothing here needs more.
-    let mut daemon = spawn_test_daemon(&host, &[("LLMMAN_CONTEXT_LENGTH", "4096")]);
-
-    let result = std::panic::catch_unwind(|| {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(TIMEOUT)
-            .build()
-            .expect("build an HTTP client");
-        let post = |body: &serde_json::Value| {
-            let resp = client
-                .post(format!("http://{host}/v1/systemone"))
-                .json(body)
-                .send()
-                .expect("POST /v1/systemone");
-            let status = resp.status();
-            let text = resp.text().expect("read the reply");
-            let json = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
-            (status, json)
-        };
-        let ask = |state: &str| -> serde_json::Value {
-            let (status, reply) = post(&serde_json::json!({
-                "state": state,
-                "model": model,
-                "questions": {
-                    "team": {
-                        "type": "choice",
-                        "instructions": "Which team should handle this ticket?",
-                        "criteria": {
-                            "billing": "Payment or subscription issues",
-                            "technical": "Bugs or integration problems",
-                            "sales": "Pricing or account questions",
-                        },
-                    },
-                    "angry": { "type": "noul", "instructions": "The customer is angry." },
-                    "mood": { "type": "score", "instructions": "How upset is the customer?",
-                              "criteria": ["Calm", "Annoyed", "Furious"] },
-                },
-            }));
-            assert!(status.is_success(), "{status}: {reply}");
-            reply
-        };
-
-        let billing = ask("I was charged twice for my subscription this month, please refund the duplicate payment.");
-        let technical = ask("The API returns a 500 error every time I call the webhook endpoint.");
-        assert_eq!(billing["answers"]["team"]["choice"], "billing", "{billing}");
-        assert_eq!(
-            technical["answers"]["team"]["choice"], "technical",
-            "{technical}"
-        );
-
-        for reply in [&billing, &technical] {
-            assert_eq!(reply["model"], canonical);
-            let answers = reply["answers"].as_object().unwrap();
-            assert_eq!(answers.len(), 3);
-            for (id, answer) in answers {
-                // thinking is off: the model answers with a label at once
-                let mass = answer["x_label_mass"].as_f64().unwrap();
-                assert!(0.5 < mass && mass <= 1.0 + 1e-6, "{id}: mass {mass}");
-            }
-            for id in ["team", "mood"] {
-                let total: f64 = answers[id]["probabilities"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .map(|p| p.as_f64().unwrap())
-                    .sum();
-                assert!((total - 1.0).abs() < 1e-3, "{id} adds up to {total}");
-            }
-            // nothing is generated; every question's prompt is counted
-            assert_eq!(reply["usage"]["output_tokens"], 0);
-            assert!(reply["usage"]["input_tokens"].as_u64().unwrap() > 100);
-        }
-
-        // asked again, the state is in the KV cache: the same answers
-        let again = ask("The API returns a 500 error every time I call the webhook endpoint.");
-        for id in ["team", "angry", "mood"] {
-            for field in ["choice", "noul", "score"] {
-                let (a, b) = (
-                    &technical["answers"][id][field],
-                    &again["answers"][id][field],
-                );
-                match (a.as_f64(), b.as_f64()) {
-                    (Some(a), Some(b)) => assert!((a - b).abs() < 2e-3, "{id}.{field}: {a} vs {b}"),
-                    _ => assert_eq!(a, b, "{id}.{field}"),
-                }
-            }
-        }
-
-        let grateful = ask("Thanks so much, this was a wonderful experience!");
-        let furious = ask(
-            "This is UNACCEPTABLE. I am FURIOUS. Fix this NOW or I will cancel and tell everyone!!!",
-        );
-        let angry = |r: &serde_json::Value| r["answers"]["angry"]["noul"].as_f64().unwrap();
-        assert!(
-            angry(&furious) > angry(&grateful),
-            "furious {} vs grateful {}",
-            angry(&furious),
-            angry(&grateful)
-        );
-        eprintln!(
-            "[test] systemone {model}: furious {:.2} vs grateful {:.2}",
-            angry(&furious),
-            angry(&grateful)
-        );
-
-        // an invalid request is a 422; thinking cannot be switched on
-        let (status, reply) = post(&serde_json::json!({
-            "state": "s", "model": model, "questions": {"q": {"type": "choice"}}
-        }));
-        assert_eq!(status, 422, "{reply}");
-        assert_eq!(reply["detail"][0]["loc"][3], "criteria", "{reply}");
-        let (status, reply) = post(&serde_json::json!({
-            "state": "s", "model": model, "chat_template_kwargs": {"enable_thinking": true},
-            "questions": {"q": {"type": "noul", "instructions": "i"}}
-        }));
-        assert_eq!(status, 400, "{reply}");
-        assert_eq!(reply["error"]["type"], "invalid_request_error");
-    });
-
-    terminate_daemon(&mut daemon);
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn serve_systemone_reads_a_local_model() {
-    eprintln!("[test] serve_systemone_reads_a_local_model: acquiring SERIAL");
-    let _guard = lock_serial();
-    eprintln!("[test] serve_systemone_reads_a_local_model: acquired SERIAL");
-    systemone_reads(MODEL, "docker.io/ai/qwen3.5:0.8b");
-}
-
-/// [`serve_systemone_reads_a_local_model`] on Gemma 4: another template,
-/// tokenizer and KV cache. `cargo test --test launch_e2e -- --ignored`.
-#[cfg(unix)]
-#[test]
-#[ignore = "pulls gemma4, about 7 GB"]
-fn serve_systemone_reads_gemma4() {
-    eprintln!("[test] serve_systemone_reads_gemma4: acquiring SERIAL");
-    let _guard = lock_serial();
-    eprintln!("[test] serve_systemone_reads_gemma4: acquired SERIAL");
-    systemone_reads("gemma4", "docker.io/ai/gemma4:latest");
 }
 
 /// llmman never links against llama.cpp: `mediagen::ffi` dlopens the

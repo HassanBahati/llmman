@@ -209,14 +209,13 @@ supply chain looks like the container supply chain:
 llmman serve
 ```
 
-One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI, Anthropic and System One:
+One endpoint on `127.0.0.1:17434` that speaks Ollama, OpenAI and Anthropic:
 
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/push`, `/api/create`, ... |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/audio/transcriptions` |
 | Anthropic | `/v1/messages` |
-| System One | `/v1/systemone`, answered from a GGUF model's own token probabilities on ggml ([details](docs/api.md#system-one-api-notes)) |
 
 So any existing client works unchanged:
 
@@ -237,9 +236,9 @@ safetensors by
 (installed for you when the daemon starts). Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
 API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
-`/` (chat with any local or hosted model, with photos, web search and
-voice, generate images, video and audio with a diffusion model, and a
-terminal) and an optional Prometheus `/metrics`.
+`/` (chat with any local or hosted model, generate images, video and
+audio with a diffusion model, and a terminal) and an optional Prometheus
+`/metrics`.
 
 The full endpoint list and per-API notes are in [docs/api.md](docs/api.md);
 backend selection in [docs/backends.md](docs/backends.md); bind address,
@@ -278,6 +277,7 @@ integration:
 
 ```
 llmman launch claude --model qwen3.8
+llmman launch copilot --model qwen3.8 -- -p "Explain this repository"
 llmman launch omp --model qwen3.8 -- -p "Explain this repository"
 llmman launch agy --model qwen3.8 -- -p "Explain this repository"
 llmman launch cline --model qwen3.8 -- --json "Explain this repository"
@@ -285,15 +285,19 @@ llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
 Run `llmman launch` with no arguments to list the supported integrations
-(Claude Code, OpenCode, Codex, Pi, OMP, Cline, Aider, Qwen Code,
-Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent, goose,
-goose Desktop, ...) and whether
+(Claude Code, OpenCode, Codex, GitHub Copilot CLI, Pi, OMP, Cline, Aider,
+Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
+goose, goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed
 globally. Any extra arguments after `--` are forwarded to the integration's
 own CLI. Short names work wherever a model reference is accepted.
+
+GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
+@github/copilot`) in BYOK mode, so a local-model launch does not
+require a GitHub login.
 
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at

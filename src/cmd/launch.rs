@@ -29,6 +29,7 @@ use crate::providers;
 mod agy;
 mod aider;
 mod claude;
+mod cline;
 mod codex;
 mod common;
 mod copilot;
@@ -111,8 +112,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             "--variant does not work with --sandbox sbx"
         );
         anyhow::ensure!(
-            !(MODEL_FLAG_FORWARDED.contains(&name.to_lowercase().as_str())
-                && has_flag(&args.extra_args, "--model", Some("-m"))),
+            !has_forwarded_model_flag(name, &args.extra_args),
             "--variant needs the model as llmman's --model, not after --"
         );
         spell_variant(name, variant)?;
@@ -132,6 +132,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
 
     // Before either arm starts the daemon; see `check_model_flag`.
     check_model_flag(name, args.model.as_deref(), provider, &args.extra_args)?;
+    if name.eq_ignore_ascii_case("copilot") || name.eq_ignore_ascii_case("copilot-cli") {
+        copilot::check_daemon_key_transport()?;
+    }
     anyhow::ensure!(
         overflow.is_none() || args.model.as_deref().is_some_and(|m| !m.trim().is_empty()),
         "--overflow-model needs --model naming the local model to pair it with"
@@ -156,7 +159,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     // Cline follows the install-on-demand behavior expected by its launch
     // integration. Do this before starting the daemon or pulling a model.
     if name.eq_ignore_ascii_case("cline") {
-        ensure_cline_installed()?;
+        cline::ensure_cline_installed()?;
     }
     // Rejects the arguments after `--` that docker-agent cannot be
     // launched with. Here rather than in the launcher so the refusal
@@ -314,6 +317,7 @@ fn integration_key() -> String {
 /// explicit model the request never reaches llmman at all.
 /// OMP needs a model so the launcher can select the matching entry its
 /// Ollama discovery reads from llmman's `/api/tags`.
+/// Copilot's BYOK mode also requires an explicit model.
 /// Checked before `ensure_server`, so the refusal costs no daemon start.
 const MODEL_REQUIRED: &[&str] = &[
     "qwen",
@@ -325,6 +329,8 @@ const MODEL_REQUIRED: &[&str] = &[
     "cline",
     "pi",
     "omp",
+    "copilot",
+    "copilot-cli",
     "docker-agent",
 ];
 
@@ -337,6 +343,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// also wins over the provider selected in its settings.
 /// OMP's argument builder drops the generated Ollama model when the caller
 /// supplies one.
+/// Copilot's argument builder likewise yields to its own `--model`.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent_document` wrote, `base_url` included, so a forwarded one
 /// reaches api.openai.com. `check_docker_agent_args` refuses it rather
@@ -349,7 +356,15 @@ const MODEL_REQUIRED: &[&str] = &[
 /// `goose session`'s, and the desktop app has no documented equivalent,
 /// so promising the caller's wins would be false. Move it here if it
 /// turns out to take one.
-const MODEL_FLAG_FORWARDED: &[&str] = &["qwen", "goose", "grok", "cline", "omp"];
+const MODEL_FLAG_FORWARDED: &[&str] = &[
+    "qwen",
+    "goose",
+    "grok",
+    "cline",
+    "omp",
+    "copilot",
+    "copilot-cli",
+];
 
 /// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
 /// `--provider` too. A second `--model` after `--` is the caller's to
@@ -370,13 +385,21 @@ fn check_model_flag(
         let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
         anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
-    if MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", Some("-m"))
-    {
+    if has_forwarded_model_flag(&name, extra_args) {
         eprintln!(
             "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
         );
     }
     Ok(())
+}
+
+/// Whether this integration accepts a forwarded model flag. Copilot's
+/// documented spelling is only `--model`; the other launchers also accept
+/// `-m`.
+fn has_forwarded_model_flag(integration: &str, extra_args: &[String]) -> bool {
+    let name = integration.to_lowercase();
+    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli")).then_some("-m");
+    MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", short)
 }
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
@@ -396,7 +419,7 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 ///
 /// `launch_simple` only exports `OLLAMA_HOST`: it never passes a model,
 /// so Kimi picks its own and the provider-routed reference never reaches
-/// the daemon. `copilot` takes a model but has no way to carry a key.
+/// the daemon.
 /// Refusing is the same call the catalog filter makes — a
 /// combination llmman cannot actually drive is absent, not offered and
 /// then broken at the first request.
@@ -405,8 +428,6 @@ const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
         "kimi",
         "it selects its own model rather than taking one from llmman",
     ),
-    ("copilot", "it has no way to send a provider API key"),
-    ("copilot-cli", "it has no way to send a provider API key"),
     // Its key variable feeds a native Google client, and llmman has not
     // verified that GEMINI_BASE_URL still redirects it here. Getting that
     // wrong sends someone's OpenRouter key to Google, which is a worse
@@ -672,7 +693,7 @@ const INTEGRATIONS: &[Integration] = &[
     Integration {
         name: "copilot",
         description: "GitHub Copilot CLI",
-        binary: "gh",
+        binary: "copilot",
     },
     Integration {
         name: "kimi",
@@ -730,6 +751,17 @@ const INTEGRATIONS: &[Integration] = &[
         binary: "docker-agent",
     },
 ];
+
+/// The registry entry for a launch name, after resolving supported aliases.
+#[cfg(test)]
+fn integration(name: &str) -> Option<&'static Integration> {
+    let name = name.to_ascii_lowercase();
+    let canonical = match name.as_str() {
+        "copilot-cli" => "copilot",
+        other => other,
+    };
+    INTEGRATIONS.iter().find(|i| i.name == canonical)
+}
 
 fn print_integrations() {
     println!("Available integrations:\n");
@@ -804,11 +836,26 @@ fn env_dir(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+#[cfg(test)]
+fn test_temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "llmman-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// The binary `launch` will run for `i`, so the listing does not report
 /// as missing what the launcher would find: `PATH`, then what the
 /// launcher knows.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
+        "copilot" => copilot::find_copilot(),
         "opencode" => opencode::find_opencode(),
         "omp" => find_omp(),
         "qwen" => find_qwen(),
@@ -819,67 +866,6 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
         "docker-agent" => find_docker_agent(),
         _ => find_on_path(i.binary),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Cline install on demand
-// ---------------------------------------------------------------------------
-
-const CLINE_NPM_INSTALL_ARGS: &[&str] = &["install", "-g", "cline@latest"];
-const CLINE_INSTALL_PROMPT: &str = "Cline is not installed. Install with npm? [y/N] ";
-const CLINE_INSTALL_CANCELLED: &str = "cline installation cancelled";
-
-/// Offers the official npm install when Cline is missing. This runs before
-/// the daemon starts, so declining or lacking npm has no model-pull side
-/// effects. Re-resolving from PATH after npm exits also catches a global npm
-/// prefix that the current shell does not yet know about.
-fn ensure_cline_installed() -> anyhow::Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
-
-    if find_on_path("cline").is_some() {
-        return Ok(());
-    }
-    let npm = find_on_path("npm").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cline is not installed and npm is not on PATH\n\n\
-             Install Node.js from https://nodejs.org/, then re-run:\n  \
-             llmman launch cline"
-        )
-    })?;
-    anyhow::ensure!(
-        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
-        "cline is not installed\n\nInstall it with:\n  npm install -g cline@latest\n\n\
-         Then re-run:\n  llmman launch cline"
-    );
-
-    eprint!("{CLINE_INSTALL_PROMPT}");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    anyhow::ensure!(accepts_prompt(&answer), CLINE_INSTALL_CANCELLED);
-
-    eprintln!("\nInstalling Cline...");
-    let status = Command::new(&npm)
-        .args(CLINE_NPM_INSTALL_ARGS)
-        .status()
-        .with_context(|| format!("failed to run {}", npm.display()))?;
-    anyhow::ensure!(status.success(), "failed to install cline: {status}");
-    let cline = find_on_path("cline").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cline was installed but the binary was not found on PATH\n\n\
-         You may need to restart your shell"
-        )
-    })?;
-    let version = Command::new(&cline)
-        .arg("--version")
-        .status()
-        .with_context(|| format!("failed to run {} --version", cline.display()))?;
-    anyhow::ensure!(
-        version.success(),
-        "cline was installed but failed to start ({version})"
-    );
-    eprintln!("Cline installed successfully\n");
-    Ok(())
 }
 
 /// A yes to an interactive `[y/N]`. Shared by the Cline install
@@ -970,7 +956,8 @@ struct Effort<'a> {
 /// dsh take it in their configuration instead.
 fn effort_args(integration: &str, effort: &str) -> Vec<String> {
     let flags: &[&str] = match integration {
-        "claude" | "copilot" | "copilot-cli" | "grok" => &["--effort"],
+        "claude" | "grok" => &["--effort"],
+        "copilot" | "copilot-cli" => &["--reasoning-effort"],
         "pi" | "omp" | "cline" => &["--thinking"],
         "hermes" => &["--reasoning"],
         // Else aider drops the effort for a model it does not know.
@@ -1064,9 +1051,9 @@ fn launch(
         "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
         "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
-        "cline" => launch_cline(model, extra_args),
+        "cline" => cline::launch_cline(model, extra_args),
         "aider" => aider::launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => copilot::launch_copilot(model, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
         "kimi" => launch_simple("kimi", model, extra_args),
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
@@ -1142,10 +1129,10 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "codex" => vec![Dir(codex::codex_dir()?)],
         "pi" => vec![Dir(pi_agent_dir()?)],
         "omp" => vec![Dir(omp_agent_dir()?)],
-        "cline" => vec![Dir(cline_dir()?)],
+        "cline" => vec![Dir(cline::cline_dir()?)],
         "aider" => vec![Dir(home.join(".aider"))],
         "copilot" | "copilot-cli" => vec![
-            Dir(home.join(".copilot")),
+            Dir(env_dir("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot"))),
             Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
         ],
         "kimi" => vec![Dir(home.join(".kimi"))],
@@ -1192,6 +1179,13 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
 // ---------------------------------------------------------------------------
 // Per-integration launchers
 // ---------------------------------------------------------------------------
+
+/// `%USERPROFILE%` on Windows, where node's `os.homedir()` reads it and
+/// `dirs::home_dir` does not. `None` elsewhere, where `os.homedir()`
+/// reads `$HOME` and `dirs` agrees.
+fn node_user_profile() -> Option<PathBuf> {
+    cfg!(windows).then(|| env_dir("USERPROFILE")).flatten()
+}
 
 /// `$var`, else `default` under `home`.
 fn xdg_dir(home: &Path, var: &str, default: &str) -> PathBuf {
@@ -1460,7 +1454,7 @@ fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
 
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
 ///
-/// The home half is [`cline_dir`]'s, not [`qwen_home`]'s: pi is node as
+/// The home half is [`cline::cline_dir`]'s, not [`qwen_home`]'s: pi is node as
 /// Cline is, so `os.homedir()` reads `USERPROFILE` on Windows — see
 /// `cline_dir`'s own doc comment for what disagreeing there cost. The
 /// `~` handling is qwen's, for the quoted export that leaves one behind.
@@ -1981,208 +1975,6 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// cline
-// ---------------------------------------------------------------------------
-
-/// cline: merge llmman's Ollama route into Cline's own settings, then pass
-/// through exactly the arguments supplied after `--`. Cline reads both the
-/// current provider store and legacy global-state fields, so keep them in
-/// sync while preserving unrelated user settings in each file.
-fn launch_cline(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("cline is not installed"))?;
-    write_cline_settings(model)?;
-    exec_with_env(&bin, extra_args, &[])
-}
-
-/// Cline's own resolution: `CLINE_DIR || path.join(os.homedir(), ".cline")`.
-/// Node's `os.homedir()` reads `USERPROFILE` on Windows, which
-/// `dirs::home_dir` ignores; disagreeing with Cline there means it
-/// never sees the settings and exits "Not authenticated".
-fn cline_dir() -> anyhow::Result<PathBuf> {
-    resolve_cline_dir(env_dir("CLINE_DIR"), node_user_profile(), || {
-        dirs::home_dir().context("no home directory")
-    })
-}
-
-/// `%USERPROFILE%` on Windows, where node's `os.homedir()` reads it and
-/// `dirs::home_dir` does not. `None` elsewhere, where `os.homedir()`
-/// reads `$HOME` and `dirs` agrees.
-fn node_user_profile() -> Option<PathBuf> {
-    cfg!(windows).then(|| env_dir("USERPROFILE")).flatten()
-}
-
-fn resolve_cline_dir(
-    cline_dir: Option<PathBuf>,
-    user_profile: Option<PathBuf>,
-    home: impl FnOnce() -> anyhow::Result<PathBuf>,
-) -> anyhow::Result<PathBuf> {
-    if let Some(dir) = cline_dir {
-        return Ok(dir);
-    }
-    Ok(match user_profile {
-        Some(profile) => profile,
-        None => home()?,
-    }
-    .join(".cline"))
-}
-
-fn cline_data_dir() -> anyhow::Result<PathBuf> {
-    Ok(cline_dir()?.join("data"))
-}
-
-fn write_cline_settings(model: &str) -> anyhow::Result<()> {
-    let server = server();
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
-}
-
-/// Cline's `providers.<id>.settings.timeout` (ms): how long its Ollama
-/// vendor waits for a response to *start*; its default is 5 minutes,
-/// sized for Ollama's model load. Through llmman it also has to cover
-/// llama-server prefilling Cline's ~12k-token system prompt, since no
-/// bytes are sent before the first token: on CPU that takes minutes (a
-/// 4-vCPU aarch64 runner manages ~44 tok/s even on a 0.8B model), and
-/// llmman's own load deadline is already 10 minutes. In CI run
-/// 35602511987 Cline dropped its first request 5:00 into the prefill and
-/// re-sent it. 30 minutes covers load plus a long prefill; connection
-/// failures still fail fast, and a user-set value is kept.
-const CLINE_RESPONSE_START_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-
-fn read_cline_json(path: &Path) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
-    let raw = match std::fs::read(path) {
-        Ok(raw) => Some(raw),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    let document = match raw.as_deref().map(|bytes| String::from_utf8_lossy(bytes)) {
-        None => serde_json::json!({}),
-        Some(text) if text.trim().is_empty() => serde_json::json!({}),
-        Some(text) => serde_json::from_str(&text)
-            .with_context(|| format!("parse {} as JSON", path.display()))?,
-    };
-    anyhow::ensure!(
-        document.is_object(),
-        "{} is not a JSON object",
-        path.display()
-    );
-    Ok((raw, document))
-}
-
-/// Writes a changed Cline JSON document atomically, copying the exact prior
-/// bytes to `<name>.json.bak` before replacing it.
-fn write_cline_json(
-    path: &Path,
-    raw: Option<&[u8]>,
-    before: &serde_json::Value,
-    after: &serde_json::Value,
-) -> anyhow::Result<()> {
-    if before == after {
-        return Ok(());
-    }
-    let parent = path
-        .parent()
-        .context("Cline settings path has no directory")?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    if let Some(raw) = raw {
-        let backup = path.with_extension("json.bak");
-        std::fs::write(&backup, raw)
-            .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
-    }
-    let mut contents = serde_json::to_vec_pretty(after).context("serialize Cline settings")?;
-    contents.push(b'\n');
-    crate::fsutil::write_atomic(path, &contents)
-        .with_context(|| format!("write {}", path.display()))
-}
-
-fn write_cline_settings_at(
-    data_dir: &Path,
-    model: &str,
-    server: &str,
-    now: &str,
-) -> anyhow::Result<()> {
-    let providers_path = data_dir.join("settings/providers.json");
-    let (providers_raw, mut providers_document) = read_cline_json(&providers_path)?;
-    let providers_before = providers_document.clone();
-    let base_url = format!("{server}/v1");
-    let route_changed = providers_document
-        .pointer("/providers/ollama/settings/model")
-        .and_then(serde_json::Value::as_str)
-        != Some(model)
-        || providers_document
-            .pointer("/providers/ollama/settings/baseUrl")
-            .and_then(serde_json::Value::as_str)
-            != Some(base_url.as_str())
-        || providers_document
-            .pointer("/providers/ollama/settings/timeout")
-            .is_none();
-
-    let root = providers_document
-        .as_object_mut()
-        .expect("read_cline_json returns an object");
-    root.insert("version".to_string(), serde_json::json!(1));
-    root.insert("lastUsedProvider".to_string(), serde_json::json!("ollama"));
-    let providers = root
-        .entry("providers")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("Cline providers is not a JSON object")?;
-    let ollama = providers
-        .entry("ollama")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("Cline providers.ollama is not a JSON object")?;
-    let settings = ollama
-        .entry("settings")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .context("Cline providers.ollama.settings is not a JSON object")?;
-    settings.insert("provider".to_string(), serde_json::json!("ollama"));
-    settings.insert("model".to_string(), serde_json::json!(model));
-    settings.insert("baseUrl".to_string(), serde_json::json!(base_url));
-    settings
-        .entry("timeout")
-        .or_insert_with(|| serde_json::json!(CLINE_RESPONSE_START_TIMEOUT_MS));
-    settings.remove("apiKey");
-    ollama.insert("tokenSource".to_string(), serde_json::json!("manual"));
-    if route_changed {
-        ollama.insert("updatedAt".to_string(), serde_json::json!(now));
-    }
-    write_cline_json(
-        &providers_path,
-        providers_raw.as_deref(),
-        &providers_before,
-        &providers_document,
-    )?;
-
-    let global_state_path = data_dir.join("globalState.json");
-    let (global_raw, mut global_document) = read_cline_json(&global_state_path)?;
-    let global_before = global_document.clone();
-    let global = global_document
-        .as_object_mut()
-        .expect("read_cline_json returns an object");
-    for key in [
-        "ollamaBaseUrl",
-        "actModeOllamaBaseUrl",
-        "planModeOllamaBaseUrl",
-    ] {
-        global.insert(key.to_string(), serde_json::json!(server));
-    }
-    for key in ["actModeApiProvider", "planModeApiProvider"] {
-        global.insert(key.to_string(), serde_json::json!("ollama"));
-    }
-    for key in ["actModeOllamaModelId", "planModeOllamaModelId"] {
-        global.insert(key.to_string(), serde_json::json!(model));
-    }
-    global.insert("welcomeViewCompleted".to_string(), serde_json::json!(true));
-    write_cline_json(
-        &global_state_path,
-        global_raw.as_deref(),
-        &global_before,
-        &global_document,
-    )
-}
-
-// ---------------------------------------------------------------------------
 // docker-agent (Docker Agent)
 // ---------------------------------------------------------------------------
 
@@ -2418,12 +2210,30 @@ fn docker_agent_fallback(home: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn exec_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
-    std::process::exit(run_with_env(bin, args, extra_env)?);
+    exec_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn exec_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<()> {
+    std::process::exit(run_with_env_removing(bin, args, extra_env, remove_env)?);
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
 /// returns its exit code.
 fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<i32> {
+    run_with_env_removing(bin, args, extra_env, &[])
+}
+
+fn run_with_env_removing(
+    bin: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> anyhow::Result<i32> {
     // The inherited environment, overlaid with OLLAMA_HOST and the
     // integration's variables, later ones winning.
     let mut overlay = vec![("OLLAMA_HOST".to_string(), server())];
@@ -2433,7 +2243,7 @@ fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyh
             .map(|(k, v)| (k.to_string(), v.to_string())),
     );
     if sandbox::active() {
-        return sandbox::run(bin, args, &overlay);
+        return sandbox::run(bin, args, &overlay, remove_env);
     }
 
     let mut cmd = Command::new(bin);
@@ -2442,6 +2252,9 @@ fn run_with_env(bin: &Path, args: &[String], extra_env: &[(&str, &str)]) -> anyh
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     cmd.envs(overlay);
+    for name in remove_env {
+        cmd.env_remove(name);
+    }
 
     let status = cmd
         .status()
@@ -2465,16 +2278,25 @@ mod tests {
         assert_eq!(agy.binary, "agy");
     }
 
+    #[test]
+    fn copilot_is_the_standalone_model_required_byok_integration() {
+        let copilot = INTEGRATIONS.iter().find(|i| i.name == "copilot").unwrap();
+        assert_eq!(copilot.binary, "copilot");
+        for id in ["copilot", "copilot-cli"] {
+            assert!(MODEL_REQUIRED.contains(&id));
+            assert!(MODEL_FLAG_FORWARDED.contains(&id));
+            assert!(!PROVIDER_UNSUPPORTED.iter().any(|(name, _)| *name == id));
+            assert_eq!(effort_args(id, "high"), ["--reasoning-effort", "high"]);
+        }
+    }
+
     /// Every integration `--provider` refuses must be one `launch`
     /// actually dispatches, or the refusal is for a name nobody can type
     /// and the real one is still silently broken.
     #[test]
     fn every_provider_unsupported_integration_is_a_real_one() {
         for (id, why) in PROVIDER_UNSUPPORTED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id) || *id == "copilot-cli",
-                "{id} is not an integration"
-            );
+            assert!(integration(id).is_some(), "{id} is not an integration");
             assert!(!why.is_empty(), "{id} has no reason");
             assert!(check_provider_supported(id).is_err(), "{id} was accepted");
             // Case-insensitively, the way `launch` dispatches.
@@ -2534,7 +2356,7 @@ mod tests {
         );
         covers("pi", pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
-        covers("cline", cline_data_dir().unwrap());
+        covers("cline", cline::cline_data_dir().unwrap());
         covers("agy", agy::agy_settings_dir().unwrap());
         covers("hermes", hermes::hermes_home().unwrap());
         covers("qwen", qwen_home().unwrap());
@@ -2587,10 +2409,7 @@ mod tests {
     fn model_required_integrations_are_refused_without_a_model() {
         let none: Vec<String> = vec![];
         for id in MODEL_REQUIRED {
-            assert!(
-                INTEGRATIONS.iter().any(|i| i.name == *id),
-                "{id} is not an integration"
-            );
+            assert!(integration(id).is_some(), "{id} is not an integration");
             assert!(check_model_flag(id, None, None, &none).is_err());
             assert!(check_model_flag(id, Some(" "), None, &none).is_err());
             assert!(check_model_flag(&id.to_uppercase(), None, None, &none).is_err());
@@ -2705,14 +2524,7 @@ mod tests {
 
     #[test]
     fn omp_config_is_created_for_a_fresh_home_and_round_trips() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-omp-models-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = test_temp_dir("omp-models");
         let models_path = dir.join("models.yml");
         write_omp_config_in_dir(
             &dir,
@@ -2746,15 +2558,7 @@ mod tests {
 
     #[test]
     fn omp_models_yml_backs_up_the_exact_commented_file_before_rewriting() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-omp-models-backup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_temp_dir("omp-models-backup");
         let path = dir.join("models.yml");
         let config_path = dir.join("config.yml");
         let original = r#"# my own notes, do not delete
@@ -2913,164 +2717,6 @@ defaults:
     }
 
     #[test]
-    fn cline_settings_merge_ollama_and_preserve_user_state() {
-        let root = std::env::temp_dir().join(format!(
-            "llmman-cline-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let providers_path = root.join("settings/providers.json");
-        let global_path = root.join("globalState.json");
-        let model = r#"org/model.\"quoted\""#;
-        let providers_original = r#"{
-  "version": 7,
-  "lastUsedProvider": "anthropic",
-  "mine": true,
-  "providers": {
-    "anthropic": { "settings": { "model": "mine" } },
-    "ollama": {
-      "settings": { "provider": "ollama", "model": "old", "baseUrl": "http://old", "apiKey": "delete-me", "keep": 1 },
-      "updatedAt": "2000-01-01T00:00:00Z",
-      "other": true
-    }
-  }
-}"#;
-        let global_original = r#"{"theme":"mine","welcomeViewCompleted":false}"#;
-        std::fs::create_dir_all(providers_path.parent().unwrap()).unwrap();
-        std::fs::write(&providers_path, providers_original).unwrap();
-        std::fs::write(&global_path, global_original).unwrap();
-
-        write_cline_settings_at(
-            &root,
-            model,
-            "http://127.0.0.1:17434",
-            "2026-09-20T06:00:00Z",
-        )
-        .unwrap();
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
-        let entry = &parsed["providers"]["ollama"];
-        assert_eq!(parsed["version"], 1);
-        assert_eq!(parsed["lastUsedProvider"], "ollama");
-        assert_eq!(parsed["mine"], true);
-        assert_eq!(
-            parsed["providers"]["anthropic"]["settings"]["model"],
-            "mine"
-        );
-        assert_eq!(entry["settings"]["provider"], "ollama");
-        assert_eq!(entry["settings"]["model"], model);
-        assert_eq!(entry["settings"]["baseUrl"], "http://127.0.0.1:17434/v1");
-        assert_eq!(entry["settings"]["keep"], 1);
-        assert_eq!(
-            entry["settings"]["timeout"], CLINE_RESPONSE_START_TIMEOUT_MS,
-            "a missing response-start timeout gets llmman's slow-prefill default"
-        );
-        assert!(entry["settings"].get("apiKey").is_none());
-        assert_eq!(entry["tokenSource"], "manual");
-        assert_eq!(entry["updatedAt"], "2026-09-20T06:00:00Z");
-        assert_eq!(entry["other"], true);
-        assert_eq!(
-            std::fs::read_to_string(root.join("settings/providers.json.bak")).unwrap(),
-            providers_original
-        );
-
-        let global: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
-        assert_eq!(global["theme"], "mine");
-        assert_eq!(global["ollamaBaseUrl"], "http://127.0.0.1:17434");
-        assert_eq!(global["actModeApiProvider"], "ollama");
-        assert_eq!(global["planModeApiProvider"], "ollama");
-        assert_eq!(global["actModeOllamaModelId"], model);
-        assert_eq!(global["planModeOllamaModelId"], model);
-        assert_eq!(global["actModeOllamaBaseUrl"], "http://127.0.0.1:17434");
-        assert_eq!(global["planModeOllamaBaseUrl"], "http://127.0.0.1:17434");
-        assert_eq!(global["welcomeViewCompleted"], true);
-        assert_eq!(
-            std::fs::read_to_string(root.join("globalState.json.bak")).unwrap(),
-            global_original
-        );
-
-        let providers_written = std::fs::read(&providers_path).unwrap();
-        let global_written = std::fs::read(&global_path).unwrap();
-        write_cline_settings_at(
-            &root,
-            model,
-            "http://127.0.0.1:17434",
-            "2026-09-20T07:00:00Z",
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&providers_path).unwrap(), providers_written);
-        assert_eq!(std::fs::read(&global_path).unwrap(), global_written);
-
-        write_cline_settings_at(
-            &root,
-            "new-model",
-            "http://127.0.0.1:17434",
-            "2026-09-20T08:00:00Z",
-        )
-        .unwrap();
-        let changed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
-        assert_eq!(
-            changed["providers"]["ollama"]["updatedAt"],
-            "2026-09-20T08:00:00Z"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cline_settings_keep_a_user_set_response_start_timeout() {
-        let root = std::env::temp_dir().join(format!(
-            "llmman-cline-timeout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let providers_path = root.join("settings/providers.json");
-        std::fs::create_dir_all(providers_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &providers_path,
-            r#"{"providers":{"ollama":{"settings":{"timeout":45000}}}}"#,
-        )
-        .unwrap();
-
-        write_cline_settings_at(
-            &root,
-            "some-model",
-            "http://127.0.0.1:17434",
-            "2026-09-20T06:00:00Z",
-        )
-        .unwrap();
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
-        assert_eq!(parsed["providers"]["ollama"]["settings"]["timeout"], 45000);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cline_install_contract_uses_latest_and_only_yes_accepts() {
-        assert_eq!(CLINE_NPM_INSTALL_ARGS, ["install", "-g", "cline@latest"]);
-        assert_eq!(
-            CLINE_INSTALL_PROMPT,
-            "Cline is not installed. Install with npm? [y/N] "
-        );
-        assert_eq!(CLINE_INSTALL_CANCELLED, "cline installation cancelled");
-        for answer in ["y", "Y", "yes", "YES", " yes\n"] {
-            assert!(accepts_prompt(answer));
-        }
-        for answer in ["", "\n", "n", "no", "yep"] {
-            assert!(!accepts_prompt(answer));
-        }
-    }
-
-    #[test]
     fn cline_is_model_required_and_supports_provider_routes() {
         assert!(INTEGRATIONS.iter().any(|i| i.name == "cline"));
         assert!(MODEL_REQUIRED.contains(&"cline"));
@@ -3078,24 +2724,6 @@ defaults:
         assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "cline"));
         assert!(PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
         assert!(check_provider_supported("cline").is_ok());
-    }
-
-    /// Same precedence as Cline: `CLINE_DIR`, then `USERPROFILE` (Windows'
-    /// `os.homedir()`), then the process home.
-    #[test]
-    fn cline_dir_follows_cline_dir_then_userprofile_then_home() {
-        let p = |s: &str| Some(PathBuf::from(s));
-        let home = || Ok(PathBuf::from("/home"));
-        let resolve = |dir, profile| resolve_cline_dir(dir, profile, home).unwrap();
-        assert_eq!(
-            resolve(p("/explicit"), p("/profile")),
-            PathBuf::from("/explicit")
-        );
-        assert_eq!(
-            resolve(None, p("/profile")),
-            PathBuf::from("/profile/.cline")
-        );
-        assert_eq!(resolve(None, None), PathBuf::from("/home/.cline"));
     }
 
     #[test]
