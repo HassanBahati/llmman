@@ -367,7 +367,7 @@ GPU device-selection variables `llmman serve` forwards to every
 
 ## Pager
 
-`providers` and `log` use a pager when stdout is a terminal. Pipes and
+`providers`, `log`, `list`, `search`, and `ps` use a pager when stdout is a terminal. Pipes and
 redirected output are written directly. Use `--no-pager` to bypass it for
 one invocation.
 
@@ -377,9 +377,11 @@ llmman config set pager.providers false
 llmman config set pager.log 'less -+F'
 ```
 
-`pager.providers` and `pager.log` accept the strings `true` or `false` to
-use or disable paging, or a shell command to select that command's pager.
-A command-specific `false` disables paging even when `LLMMAN_PAGER` is set.
+`pager.<command>` accepts `true`, `yes`, `on`, or `1` to use paging, and
+`false`, `no`, `off`, or `0` to disable it (case-insensitive). A shell command
+selects that command's pager. Supported commands are `providers`, `log`,
+`list`, `search`, and `ps`.
+A command-specific false value disables paging even when `LLMMAN_PAGER` is set.
 Otherwise, the pager command is chosen from `LLMMAN_PAGER`, the command-specific
 setting, `core.pager`, `PAGER`, then `less`, in that order. An empty command
 or `cat` disables paging. `LESS=FRX` and `LV=-c` are supplied only when those

@@ -6,6 +6,8 @@
 //! reaches them (see `Target` in cmd::serve). `--provider`'s answer comes
 //! from the daemon's catalog — see cmd::providers for why.
 
+use std::fmt::Write;
+
 use clap::Args;
 
 use crate::fmt::{human_size, relative_time, short_id};
@@ -14,6 +16,9 @@ use crate::storage::OciStore;
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
+    /// Do not pipe output into a pager
+    #[arg(long)]
+    pub no_pager: bool,
     /// Only show images whose repository (ignoring tag) matches this reference
     #[arg(value_name = "REFERENCE")]
     pub reference: Option<String>,
@@ -34,7 +39,7 @@ pub struct ListArgs {
 
 pub fn run(args: &ListArgs) -> anyhow::Result<()> {
     if let Some(provider) = crate::providers::provider_flag(args.provider.as_deref())? {
-        return list_provider_models(provider);
+        return list_provider_models(provider, !args.no_pager);
     }
 
     let store_root = crate::default_store()?;
@@ -53,11 +58,12 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let mut out = String::new();
     if let Some(template) = &args.format {
         for img in &images {
-            println!("{}", render_format(template, img)?);
+            writeln!(&mut out, "{}", render_format(template, img)?)?;
         }
-        return Ok(());
+        return crate::pager::emit("list", &out, !args.no_pager);
     }
 
     let name_w = images
@@ -67,32 +73,34 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
         .unwrap_or(4)
         .max(4);
 
-    println!(
+    writeln!(
+        &mut out,
         "{:<name_w$}    {:<16}    {:<10}    MODIFIED",
         "NAME",
         "ID",
         "SIZE",
         name_w = name_w,
-    );
+    )?;
 
     for img in &images {
-        println!(
+        writeln!(
+            &mut out,
             "{:<name_w$}    {:<16}    {:<10}    {}",
             img.reference,
             short_id(&img.digest),
             human_size(img.size),
             relative_time(img.modified_at),
             name_w = name_w,
-        );
+        )?;
     }
-    Ok(())
+    crate::pager::emit("list", &out, !args.no_pager)
 }
 
 /// Prints the models a provider serves and what it charges, from the
 /// daemon's catalog (`GET /llmman/providers/:id`). Nothing is downloaded:
 /// these are ids for `llmman run --provider`. Price replaces
 /// SIZE/MODIFIED, which mean nothing for someone else's weights.
-fn list_provider_models(provider: &str) -> anyhow::Result<()> {
+fn list_provider_models(provider: &str, pager: bool) -> anyhow::Result<()> {
     crate::daemon::ensure_server("")?;
     let entry = crate::daemon::provider(provider, None)?;
     if entry.models.is_empty() {
@@ -107,24 +115,27 @@ fn list_provider_models(provider: &str) -> anyhow::Result<()> {
         .max()
         .unwrap_or(4)
         .max(4);
+    let mut out = String::new();
     // "IN $/Mtok" is the widest thing in its column, so it sizes itself.
-    println!(
+    writeln!(
+        &mut out,
         "{:<name_w$}    {:<9}    OUT $/Mtok",
         "NAME",
         "IN $/Mtok",
         name_w = name_w
-    );
+    )?;
     for model in &entry.models {
         let cost = model.cost;
-        println!(
+        writeln!(
+            &mut out,
             "{:<name_w$}    {:<9}    {}",
             model.id,
             price(cost.map(|c| c.input)),
             price(cost.map(|c| c.output)),
             name_w = name_w,
-        );
+        )?;
     }
-    Ok(())
+    crate::pager::emit("list", &out, pager)
 }
 
 /// Renders one dollars-per-million-tokens figure.

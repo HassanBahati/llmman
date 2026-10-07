@@ -3,7 +3,8 @@ use std::process::{Command, Stdio};
 
 /// Through the pager when stdout is a terminal, as git: `$LLMMAN_PAGER`,
 /// then the command-specific pager, `core.pager`, `$PAGER`, or `less`.
-/// Empty or `cat` means none; `pager.<command> = "false"` disables paging.
+/// Empty or `cat` means none; false boolean values in `pager.<command>`
+/// disable paging even when `$LLMMAN_PAGER` is set.
 /// `LESS=FRX` is git's default too.
 pub(crate) fn emit(subcommand: &str, text: &str, pager: bool) -> anyhow::Result<()> {
     if pager && io::stdout().is_terminal() {
@@ -40,10 +41,15 @@ fn resolve(
     specific: Option<&str>,
     pager: Option<&str>,
 ) -> Option<String> {
-    if specific == Some("false") {
+    let enabled = specific.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    });
+    if enabled == Some(false) {
         return None;
     }
-    let specific = specific.filter(|value| *value != "true");
+    let specific = specific.filter(|_| enabled.is_none());
     let cmd = env.or(specific).or(core).or(pager).unwrap_or("less").trim();
     (!cmd.is_empty() && cmd != "cat").then(|| cmd.to_string())
 }
@@ -96,7 +102,15 @@ mod tests {
         for disabled in ["", "cat", "  cat  "] {
             assert_eq!(resolve(Some(disabled), Some("less"), None, None), None);
         }
-        assert_eq!(resolve(Some("less"), None, Some("false"), None), None);
+        for value in ["false", "no", "off", "0", "FALSE", " No ", "OFF"] {
+            assert_eq!(resolve(Some("less"), None, Some(value), None), None);
+        }
+        for value in ["true", "yes", "on", "1", "TRUE", " Yes ", "ON"] {
+            assert_eq!(
+                resolve(None, Some("less -S"), Some(value), None).as_deref(),
+                Some("less -S")
+            );
+        }
         assert_eq!(resolve(None, Some("less"), Some(""), None), None);
     }
 }

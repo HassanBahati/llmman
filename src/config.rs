@@ -105,6 +105,12 @@ pub struct PagerConf {
     pub log: Option<String>,
     #[serde(default)]
     pub providers: Option<String>,
+    #[serde(default)]
+    pub list: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub ps: Option<String>,
 }
 
 pub(crate) fn pager(command: &str) -> (Option<String>, Option<String>) {
@@ -121,6 +127,9 @@ fn pager_from_files(files: &[File], command: &str) -> (Option<String>, Option<St
         let value = match command {
             "log" => &file.conf.pager.log,
             "providers" => &file.conf.pager.providers,
+            "list" => &file.conf.pager.list,
+            "search" => &file.conf.pager.search,
+            "ps" => &file.conf.pager.ps,
             _ => continue,
         };
         if let Some(value) = value {
@@ -967,6 +976,22 @@ pagr = "less""#
 provider = "false""#
         )
         .is_err());
+    }
+
+    #[test]
+    fn pager_settings_support_model_listing_commands() {
+        let settings = file(
+            r#"[pager]
+list = "yes"
+search = "less -S"
+ps = "off""#,
+        );
+        for (command, value) in [("list", "yes"), ("search", "less -S"), ("ps", "off")] {
+            assert_eq!(
+                pager_from_files(std::slice::from_ref(&settings), command),
+                (None, Some(value.into()))
+            );
+        }
     }
 
     /// `$HOME` is what `dirs::home_dir` reads on Unix anyway, so this

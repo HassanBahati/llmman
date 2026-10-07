@@ -10,7 +10,7 @@ use super::common;
 use super::{exec_with_env, find_on_path, has_flag, server};
 
 /// The env var the generated `token_key` names, so no key reaches disk
-/// (same role as `QWEN_ENV_KEY` and `DSH_API_KEY_ENV`).
+/// (same role as `QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
 const DOCKER_AGENT_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
 /// The generated model entry's name, which its `root` agent selects it by.
@@ -96,7 +96,7 @@ fn docker_agent_own_agent_file_error(file: &str) -> String {
 }
 
 /// `~/.config/llmman/launch/docker-agent`, derived from `llmman.conf`'s
-/// directory so the two cannot drift (as `dsh_config_dir` does).
+/// directory so the two cannot drift (as `dsh::dsh_config_dir` does).
 /// docker-agent reads nothing here on its own; `docker_agent_args`
 /// passes it the path.
 pub(super) fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
@@ -290,7 +290,7 @@ mod tests {
 
     /// The key is named, never written, so a `--provider` launch does
     /// not persist a real credential — as `write_qwen_settings_at` and
-    /// `write_dsh_settings` also promise.
+    /// `dsh::write_dsh_settings` also promise.
     #[test]
     fn docker_agent_document_names_the_key_variable_rather_than_a_key() {
         let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
