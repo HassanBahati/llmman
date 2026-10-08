@@ -207,8 +207,106 @@ pub(super) fn object_under<'a>(
     slot.as_object_mut().expect("set to an object just above")
 }
 
+/// The explicit agent directory understood by both Pi and OMP.
+pub(super) fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
+    let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = dir.trim();
+    if !dir.starts_with('~') {
+        return Ok(Some(PathBuf::from(dir)));
+    }
+    let home = crate::config::home_dir().context("no home directory")?;
+    Ok(Some(expand_tilde(dir, &home)))
+}
+
+/// The model entry Pi and OMP are told about: its display name, what it can
+/// take in, whether it thinks, and how much it can hold. Every example in
+/// Pi's own `models.md`
+/// declares these, and what it assumes for an entry that omits them is
+/// not written down, so they are stated rather than left to it.
+pub(super) fn pi_model_entry(
+    model: &str,
+    reasons: bool,
+    vision: bool,
+    context_window: Option<u64>,
+) -> serde_json::Value {
+    let input: &[&str] = if vision {
+        &["text", "image"]
+    } else {
+        &["text"]
+    };
+    let mut entry = serde_json::json!({
+        "id": model,
+        "name": model,
+        "input": input,
+    });
+    if reasons {
+        entry["reasoning"] = serde_json::json!(true);
+    }
+    if let Some(context) = context_window {
+        entry["contextWindow"] = serde_json::json!(context);
+    }
+    entry
+}
+
+/// Merge one model into a named provider while retaining unrelated providers,
+/// provider options, and models. OMP also retains unowned fields on the
+/// matching model; Pi rebuilds its matching entry from daemon metadata.
+pub(super) fn provider_models_merged(
+    existing: &serde_json::Value,
+    provider_name: &str,
+    entry: &serde_json::Value,
+    preserve_existing_model_fields: bool,
+    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> serde_json::Value {
+    let mut root = existing.clone();
+    let Some(root_map) = root.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    let provider = object_under(object_under(root_map, "providers"), provider_name);
+    let old_models = provider
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut replaced = false;
+    let mut models = Vec::with_capacity(old_models.len() + 1);
+    for old in old_models {
+        if old.get("id") != entry.get("id") {
+            models.push(old);
+            continue;
+        }
+        if replaced {
+            continue;
+        }
+        let mut merged = if preserve_existing_model_fields {
+            old
+        } else {
+            serde_json::json!({})
+        };
+        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
+            merged.extend(update.clone());
+        } else {
+            merged = entry.clone();
+        }
+        models.push(merged);
+        replaced = true;
+    }
+    if !replaced {
+        models.push(entry.clone());
+    }
+    configure(provider);
+    provider.insert("models".into(), serde_json::json!(models));
+    root
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::{pair_context_window, served_context_window};
     use super::*;
 
     /// Regression test for a real CodeRabbit finding: an unquoted model
@@ -260,5 +358,45 @@ mod tests {
         assert_eq!(expand_tilde("~", home), PathBuf::from("/h"));
         assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
         assert_eq!(expand_tilde("~user/x", home), PathBuf::from("~user/x"));
+    }
+
+    #[test]
+    fn pi_model_entry_declares_what_the_daemon_serves() {
+        let entry = pi_model_entry("qwen3.5:0.8b", true, true, Some(32768));
+        assert_eq!(entry["id"], "qwen3.5:0.8b");
+        assert_eq!(entry["name"], "qwen3.5:0.8b");
+        assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(entry["reasoning"], true);
+        assert_eq!(entry["contextWindow"], 32768);
+
+        // A text-only model that does not think, and no window to
+        // declare: pi keeps its own default rather than being told a guess.
+        let plain = pi_model_entry("smol", false, false, None);
+        assert_eq!(plain["input"], serde_json::json!(["text"]));
+        assert_eq!(plain.get("reasoning"), None);
+        assert_eq!(plain.get("contextWindow"), None);
+    }
+
+    /// The entry — pi's and omp's alike — carries the window `launch`
+    /// resolved, not the raw trained context. Which file it lands in is
+    /// covered by `write_omp_config_in_dir`'s own tests; this pins where
+    /// the number comes from.
+    #[test]
+    fn pi_model_entry_declares_the_resolved_window_not_the_trained_context() {
+        // A pair's larger half, as `pair_context_window` resolves it —
+        // a figure no trained context could have produced.
+        let pair = pair_context_window(Some(32_768), Some(200_000));
+        assert_eq!(pair, Some(200_000));
+        let entry = pi_model_entry("gemma4", false, false, pair);
+        assert_eq!(entry["contextWindow"], 200_000);
+
+        // And the daemon's clamp travels: a model trained past
+        // DEFAULT_CTX_SIZE is served only the default, so it declares
+        // only the default.
+        let default = u64::from(crate::cmd::serve::DEFAULT_CTX_SIZE);
+        let served = served_context_window(None, Some(1 << 20));
+        assert_eq!(served, Some(default));
+        let entry = pi_model_entry("big", false, false, served);
+        assert_eq!(entry["contextWindow"], default);
     }
 }
