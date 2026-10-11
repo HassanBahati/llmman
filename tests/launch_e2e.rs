@@ -1449,7 +1449,7 @@ fn launch_cline_with_model() {
                 provider["baseUrl"],
                 format!("{}/v1", llmman::daemon::server())
             );
-            // See CLINE_RESPONSE_START_TIMEOUT_MS in launch.rs.
+            // See CLINE_RESPONSE_START_TIMEOUT_MS in launch/cline.rs.
             assert!(
                 provider["timeout"].as_u64().is_some_and(|ms| ms > 300_000),
                 "expected `llmman launch cline` to raise Cline's response-start timeout: {text}"
@@ -1470,6 +1470,13 @@ fn launch_cline_with_model() {
             assert_eq!(global["actModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
             assert_eq!(global["planModeOllamaModelId"], "docker.io/ai/qwen3.5:0.8b");
             assert_eq!(global["welcomeViewCompleted"], true);
+            // Cline 2.18 reads its timeout from here, not providers.json.
+            assert!(
+                global["requestTimeoutMs"]
+                    .as_u64()
+                    .is_some_and(|ms| ms > 300_000),
+                "expected `llmman launch cline` to raise Cline's requestTimeoutMs: {global_text}"
+            );
         },
     );
 }
