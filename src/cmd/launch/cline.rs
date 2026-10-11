@@ -109,16 +109,21 @@ fn write_cline_settings(model: &str) -> anyhow::Result<()> {
     write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
 }
 
-/// Cline's `providers.<id>.settings.timeout` (ms): how long its Ollama
-/// vendor waits for a response to *start*; its default is 5 minutes,
-/// sized for Ollama's model load. Through llmman it also has to cover
-/// llama-server prefilling Cline's ~12k-token system prompt, since no
-/// bytes are sent before the first token: on CPU that takes minutes (a
-/// 4-vCPU aarch64 runner manages ~44 tok/s even on a 0.8B model), and
-/// llmman's own load deadline is already 10 minutes. In CI run
-/// 35602511987 Cline dropped its first request 5:00 into the prefill and
-/// re-sent it. 30 minutes covers load plus a long prefill; connection
-/// failures still fail fast, and a user-set value is kept.
+/// How long Cline's Ollama provider waits for a response to *start*, in
+/// ms. Through llmman it also has to cover llama-server prefilling
+/// Cline's ~12k-token system prompt, since no bytes are sent before the
+/// first token: on CPU that takes minutes (a 4-vCPU aarch64 runner
+/// manages ~44 tok/s even on a 0.8B model), and llmman's own load
+/// deadline is already 10 minutes. In CI run 35602511987 Cline dropped
+/// its first request 5:00 into the prefill and re-sent it. 30 minutes
+/// covers load plus a long prefill; connection failures still fail fast,
+/// and a user-set value is kept.
+///
+/// Written twice, since Cline has read it from two places: older versions
+/// from `providers.ollama.settings.timeout` (default 5 minutes), and 2.18
+/// from `requestTimeoutMs` in `globalState.json`, whose Ollama handler
+/// falls back to 30 seconds without it. In CI run 38123323946 every
+/// aarch64 Cline request timed out that way and was re-sent mid-prefill.
 const CLINE_RESPONSE_START_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 fn read_cline_json(path: &Path) -> anyhow::Result<(Option<Vec<u8>>, serde_json::Value)> {
@@ -247,6 +252,9 @@ fn write_cline_settings_at(
         global.insert(key.to_string(), serde_json::json!(model));
     }
     global.insert("welcomeViewCompleted".to_string(), serde_json::json!(true));
+    global
+        .entry("requestTimeoutMs")
+        .or_insert_with(|| serde_json::json!(CLINE_RESPONSE_START_TIMEOUT_MS));
     write_cline_json(
         &global_state_path,
         global_raw.as_deref(),
@@ -337,6 +345,10 @@ mod tests {
         assert_eq!(global["planModeOllamaBaseUrl"], "http://127.0.0.1:17434");
         assert_eq!(global["welcomeViewCompleted"], true);
         assert_eq!(
+            global["requestTimeoutMs"], CLINE_RESPONSE_START_TIMEOUT_MS,
+            "a missing response-start timeout gets llmman's slow-prefill default"
+        );
+        assert_eq!(
             std::fs::read_to_string(root.join("globalState.json.bak")).unwrap(),
             global_original
         );
@@ -386,6 +398,8 @@ mod tests {
             r#"{"providers":{"ollama":{"settings":{"timeout":45000}}}}"#,
         )
         .unwrap();
+        let global_path = root.join("globalState.json");
+        std::fs::write(&global_path, r#"{"requestTimeoutMs":90000}"#).unwrap();
 
         write_cline_settings_at(
             &root,
@@ -398,6 +412,9 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
         assert_eq!(parsed["providers"]["ollama"]["settings"]["timeout"], 45000);
+        let global: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
+        assert_eq!(global["requestTimeoutMs"], 90000);
         let _ = std::fs::remove_dir_all(root);
     }
 
