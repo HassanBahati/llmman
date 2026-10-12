@@ -35,10 +35,10 @@ const PI_PROVIDER: &str = "llmman";
 /// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
 ///
 /// The home half is [`super::cline::cline_dir`]'s, not
-/// [`super::qwen_home`]'s: pi is node as Cline is, so `os.homedir()`
-/// reads `USERPROFILE` on Windows — see `cline_dir`'s own doc comment
-/// for what disagreeing there cost. The `~` handling is qwen's, for the
-/// quoted export that leaves one behind.
+/// [`super::qwen::qwen_home`]'s: pi is node as Cline is, so
+/// `os.homedir()` reads `USERPROFILE` on Windows — see `cline_dir`'s own
+/// doc comment for what disagreeing there cost. The `~` handling is
+/// qwen's, for the quoted export that leaves one behind.
 pub(super) fn pi_agent_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = common::configured_pi_agent_dir()? {
         return Ok(dir);
