@@ -1833,10 +1833,20 @@ jobs:
       # unexpected daemon restart, a crashed llama-server, ...) — always
       # run (not just on failure) since a *passing* run's log is useful
       # comparison context for a failing one on another platform/run.
+      #
+      # On Linux the shared daemon is the install script's systemd user
+      # unit, not one `ensure_server` spawned, so its output is in the
+      # journal rather than serve.log (launch_e2e prints each failed
+      # attempt's share of it as well).
       - name: Show llmman serve.log (diagnostic)
         if: always()
         shell: bash
         run: |
+          if [ "${{ runner.os }}" = "Linux" ] \
+            && systemctl --user cat llmman.service >/dev/null 2>&1; then
+            echo "--- journalctl --user -u llmman.service (last 400 lines) ---"
+            journalctl --user -u llmman.service --no-pager -o cat | tail -n 400
+          fi
           if [ "${{ runner.os }}" = "Windows" ]; then
             log="$LOCALAPPDATA/llmman/serve.log"
           else
