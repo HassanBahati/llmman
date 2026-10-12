@@ -1846,7 +1846,6 @@ jobs:
             && systemctl --user cat llmman.service >/dev/null 2>&1; then
             echo "--- journalctl --user -u llmman.service (last 400 lines) ---"
             journalctl --user -u llmman.service --no-pager -o cat | tail -n 400
-            exit 0
           fi
           if [ "${{ runner.os }}" = "Windows" ]; then
             log="$LOCALAPPDATA/llmman/serve.log"

@@ -648,16 +648,21 @@ impl DaemonLog {
                 .status()
                 .is_ok_and(|s| s.success()))
         .then(|| {
-            let secs = SystemTime::now()
+            // Microseconds, since a retry starts right after the attempt
+            // before it.
+            let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            format!("@{secs}")
+                .unwrap_or_default();
+            format!("@{}.{:06}", now.as_secs(), now.subsec_micros())
         });
-        let serve_log = serve_log_path().map(|path| {
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            let head = bytes[..bytes.len().min(256)].to_vec();
-            (path, bytes.len() as u64, head)
-        });
+        // Where `ensure_server` puts it: next to the store.
+        let serve_log = llmman::promptlog::beside_store("serve.log")
+            .ok()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let head = bytes[..bytes.len().min(256)].to_vec();
+                (path, bytes.len() as u64, head)
+            });
         Self {
             journal_since,
             serve_log,
@@ -690,15 +695,6 @@ impl DaemonLog {
             }
         }
         text
-    }
-}
-
-/// `serve.log` where `ensure_server` puts it for this process's `HOME`.
-fn serve_log_path() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("llmman/serve.log"))
-    } else {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/llmman/serve.log"))
     }
 }
 
@@ -774,6 +770,13 @@ fn daemon_log_excerpt(log: &str) -> String {
     out
 }
 
+/// The one-line llama-server timing summary for a launch that passed.
+fn print_timing_summary(integration: &str, log: &DaemonLog) {
+    if let Some(summary) = timing_summary(&log.since()) {
+        eprintln!("[test] {integration}: llama-server: {summary}");
+    }
+}
+
 /// Prints what the daemon wrote during an attempt that did not pass.
 fn report_daemon_log(integration: &str, log: &DaemonLog) {
     let text = log.since();
@@ -838,18 +841,14 @@ fn launch_command(
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
-/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
-/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
-/// that and why.
+/// panicking) if it had to be killed at `TIMEOUT` — see
+/// `try_spawn_with_timeout` and `launch_and_assert` for who retries that
+/// and why. The caller warms the model first (`warm_model`).
 fn run_launch(
     home: &Path,
     integration: &str,
     extra_args: &[&str],
 ) -> Result<std::process::Output, TimedOut> {
-    eprintln!("[run_launch] {integration}: calling warm_model()");
-    warm_model();
-    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
-
     try_spawn_with_timeout(
         launch_command(home, integration, &[], extra_args),
         TIMEOUT,
@@ -1045,6 +1044,8 @@ fn launch_and_assert_with(
     let mut gave_up_after_timeout = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
+        // Warmed first, so this attempt's timings are the launch's own.
+        warm_model();
         let daemon_log = DaemonLog::mark();
         let output = match run_launch(&home, integration, extra_args) {
             Ok(output) => output,
@@ -1065,17 +1066,21 @@ fn launch_and_assert_with(
         if !output.status.success() {
             match nonzero_disposition(&stdout, &stderr) {
                 NonzeroDisposition::Accept if accept_stdout(&stdout) => {
+                    print_timing_summary(integration, &daemon_log);
                     inspect_home(&home);
                     return;
                 }
                 NonzeroDisposition::Accept | NonzeroDisposition::Retry => {
                     report_daemon_log(integration, &daemon_log)
                 }
-                NonzeroDisposition::Reject => panic!(
-                    "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
-                     (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-                    output.status
-                ),
+                NonzeroDisposition::Reject => {
+                    report_daemon_log(integration, &daemon_log);
+                    panic!(
+                        "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
+                         (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                        output.status
+                    )
+                }
             }
             eprintln!(
                 "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} failed via its own \
@@ -1095,15 +1100,15 @@ fn launch_and_assert_with(
         }
         // A zero exit isn't proof the launch worked for every CLI: a
         // self-reported failure is a bug, not sampling variance.
-        assert!(
-            !reject_stdout(&stdout),
-            "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
-             reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-        );
+        if reject_stdout(&stdout) {
+            report_daemon_log(integration, &daemon_log);
+            panic!(
+                "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` exited 0 but \
+                 reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
         if accept_stdout(&stdout) {
-            if let Some(summary) = timing_summary(&daemon_log.since()) {
-                eprintln!("[test] {integration}: llama-server: {summary}");
-            }
+            print_timing_summary(integration, &daemon_log);
             inspect_home(&home);
             return;
         }
