@@ -10,20 +10,68 @@ pub(super) fn launch_claude(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_on_path("claude").ok_or_else(|| anyhow::anyhow!("claude is not installed"))?;
+    let server = server();
+    exec_with_env(
+        &bin,
+        &claude_args(model, extra_args),
+        &claude_env(api_key, &server),
+    )
+}
 
+/// Split out so a test can assert what claude is handed:
+/// [`super::exec_with_env`] never returns, so calling [`launch_claude`] would
+/// take the test runner with it.
+fn claude_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
+    // Absent, not empty: claude reads "" as a model actually named "".
     if !model.is_empty() {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args.extend_from_slice(extra_args);
+    args
+}
 
-    let server = server();
-    exec_with_env(
-        &bin,
-        &args,
-        &[
-            ("ANTHROPIC_BASE_URL", server.as_str()),
-            ("ANTHROPIC_API_KEY", api_key),
-        ],
-    )
+/// What llmman sets for claude. `base_url` is the bare origin: claude
+/// appends `/v1/messages` itself. The model goes in [`claude_args`].
+fn claude_env<'a>(api_key: &'a str, base_url: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("ANTHROPIC_BASE_URL", base_url),
+        ("ANTHROPIC_API_KEY", api_key),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn args_select_the_resolved_model_and_pass_the_rest_through() {
+        assert_eq!(
+            claude_args("local/model", &["-p".into(), "hello".into()]),
+            ["--model", "local/model", "-p", "hello"]
+        );
+        assert_eq!(
+            claude_args("", &["-p".into(), "hello".into()]),
+            ["-p", "hello"]
+        );
+        // `run` prepends `effort_args`, so `--effort` arrives in `extra_args`.
+        assert_eq!(
+            claude_args(
+                "local/model",
+                &["--effort".into(), "high".into(), "-p".into(), "x".into()]
+            ),
+            ["--model", "local/model", "--effort", "high", "-p", "x"]
+        );
+    }
+
+    /// A wrong or missing base URL sends the session to api.anthropic.com
+    /// instead of the daemon.
+    #[test]
+    fn env_points_at_the_daemon_and_carries_its_key() {
+        let env = claude_env("secret", "http://127.0.0.1:17434");
+        let get = |key| env.iter().find(|(name, _)| *name == key).map(|(_, v)| *v);
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("http://127.0.0.1:17434"));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some("secret"));
+        assert_eq!(env.len(), 2, "llmman sets no other variables");
+    }
 }
