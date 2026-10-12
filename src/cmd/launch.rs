@@ -42,6 +42,7 @@ mod grok;
 mod hermes;
 mod openclaw;
 mod opencode;
+mod pi;
 mod qwen;
 mod sandbox;
 
@@ -1075,7 +1076,7 @@ fn launch(
             extra_args,
         ),
         "codex" => codex::launch_codex(model, api_key, vision, context_window, extra_args),
-        "pi" => launch_pi(model, reasons, vision, context_window, extra_args),
+        "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args),
         "omp" => launch_omp(model, reasons, vision, context_window, extra_args),
         "cline" => cline::launch_cline(model, extra_args),
         "aider" => aider::launch_aider(model, api_key, extra_args),
@@ -1153,7 +1154,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
             Dir(xdg("XDG_CACHE_HOME", ".cache").join("opencode")),
         ],
         "codex" => vec![Dir(codex::codex_dir()?)],
-        "pi" => vec![Dir(pi_agent_dir()?)],
+        "pi" => vec![Dir(pi::pi_agent_dir()?)],
         "omp" => vec![Dir(omp_agent_dir()?)],
         "cline" => vec![Dir(cline::cline_dir()?)],
         "aider" => vec![Dir(home.join(".aider"))],
@@ -1273,28 +1274,6 @@ fn unknown_levels_with(variant: &str) -> Thinking {
     Thinking::Listed(levels)
 }
 
-/// pi: register llmman as an OpenAI-compatible provider in `models.json`
-/// and point `settings.json` at it. pi runs with the caller's own
-/// arguments and nothing else — `settings.json` already selects the
-/// model, and a key on argv would be readable in `ps`.
-///
-/// pi is in [`PROVIDER_NEEDS_DAEMON_KEY`] for that reason: a `--provider`
-/// credential stays with the daemon, and the stored `apiKey` is the
-/// literal placeholder codex and hermes also write. An environment
-/// reference (`"$VAR"`, which pi does interpolate) would read as
-/// "unresolved" outside `llmman launch` and take the provider down.
-fn launch_pi(
-    model: &str,
-    reasons: bool,
-    vision: bool,
-    context_window: Option<u64>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
-    let bin = find_on_path("pi").ok_or_else(|| anyhow::anyhow!("pi is not installed"))?;
-    write_pi_config(model, reasons, vision, context_window)?;
-    exec_with_env(&bin, extra_args, &[])
-}
-
 /// omp: register llmman's endpoint and the selected model in `models.yml`.
 ///
 /// OMP's built-in Ollama discovery sees llmman's `/api/tags`, but model
@@ -1351,7 +1330,7 @@ fn omp_fallback_paths() -> Vec<PathBuf> {
 /// OMP's agent directory. These are the paths OMP exposes for callers to
 /// configure; profile layout remains OMP's responsibility.
 fn omp_agent_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = configured_pi_agent_dir()? {
+    if let Some(dir) = common::configured_pi_agent_dir()? {
         return Ok(dir);
     }
     let home = crate::config::home_dir().context("no home directory")?;
@@ -1418,7 +1397,7 @@ fn write_omp_models_config_at(
     context_window: Option<u64>,
     server: &str,
 ) -> anyhow::Result<()> {
-    let entry = pi_model_entry(model, reasons, vision, context_window);
+    let entry = common::pi_model_entry(model, reasons, vision, context_window);
     common::write_yaml_merged(path, "omp", |existing| {
         omp_models_merged(existing, server, &entry)
     })
@@ -1433,7 +1412,7 @@ fn omp_models_merged(
     server: &str,
     entry: &serde_json::Value,
 ) -> serde_json::Value {
-    provider_models_merged(existing, OMP_PROVIDER, entry, true, |provider| {
+    common::provider_models_merged(existing, OMP_PROVIDER, entry, true, |provider| {
         provider.insert(
             "baseUrl".into(),
             serde_json::json!(format!("{}/v1", server.trim_end_matches('/'))),
@@ -1460,176 +1439,6 @@ fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
     }
     args.extend_from_slice(extra_args);
     args
-}
-
-/// The provider key llmman owns in pi's `models.json`.
-const PI_PROVIDER: &str = "llmman";
-
-/// The explicit agent directory understood by both Pi and OMP.
-fn configured_pi_agent_dir() -> anyhow::Result<Option<PathBuf>> {
-    let Some(dir) = std::env::var("PI_CODING_AGENT_DIR")
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-    else {
-        return Ok(None);
-    };
-    let dir = dir.trim();
-    if !dir.starts_with('~') {
-        return Ok(Some(PathBuf::from(dir)));
-    }
-    let home = crate::config::home_dir().context("no home directory")?;
-    Ok(Some(common::expand_tilde(dir, &home)))
-}
-
-/// pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
-///
-/// The home half is [`cline::cline_dir`]'s, not [`qwen::qwen_home`]'s: pi is node as
-/// Cline is, so `os.homedir()` reads `USERPROFILE` on Windows — see
-/// `cline_dir`'s own doc comment for what disagreeing there cost. The
-/// `~` handling is qwen's, for the quoted export that leaves one behind.
-fn pi_agent_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = configured_pi_agent_dir()? {
-        return Ok(dir);
-    }
-    Ok(crate::config::home_dir()
-        .context("no home directory")?
-        .join(".pi")
-        .join("agent"))
-}
-
-/// Writes pi's `models.json` provider and points `settings.json` at it.
-/// Both go through [`write_json_merged`], which qwen writes through too.
-fn write_pi_config(
-    model: &str,
-    reasons: bool,
-    vision: bool,
-    context_window: Option<u64>,
-) -> anyhow::Result<()> {
-    let dir = pi_agent_dir()?;
-    let entry = pi_model_entry(model, reasons, vision, context_window);
-    common::write_json_merged(&dir.join("models.json"), "pi", |existing| {
-        pi_models_merged(existing, &server(), &entry)
-    })?;
-    common::write_json_merged(&dir.join("settings.json"), "pi", |existing| {
-        pi_settings_merged(existing, model)
-    })
-}
-
-/// The model entry Pi and OMP are told about: its display name, what it can
-/// take in, whether it thinks, and how much it can hold. Every example in
-/// Pi's own `models.md`
-/// declares these, and what it assumes for an entry that omits them is
-/// not written down, so they are stated rather than left to it.
-fn pi_model_entry(
-    model: &str,
-    reasons: bool,
-    vision: bool,
-    context_window: Option<u64>,
-) -> serde_json::Value {
-    let input: &[&str] = if vision {
-        &["text", "image"]
-    } else {
-        &["text"]
-    };
-    let mut entry = serde_json::json!({
-        "id": model,
-        "name": model,
-        "input": input,
-    });
-    if reasons {
-        entry["reasoning"] = serde_json::json!(true);
-    }
-    if let Some(context) = context_window {
-        entry["contextWindow"] = serde_json::json!(context);
-    }
-    entry
-}
-
-/// Merge one model into a named provider while retaining unrelated providers,
-/// provider options, and models. OMP also retains unowned fields on the
-/// matching model; Pi rebuilds its matching entry from daemon metadata.
-fn provider_models_merged(
-    existing: &serde_json::Value,
-    provider_name: &str,
-    entry: &serde_json::Value,
-    preserve_existing_model_fields: bool,
-    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-) -> serde_json::Value {
-    let mut root = existing.clone();
-    let Some(root_map) = root.as_object_mut() else {
-        return serde_json::json!({});
-    };
-    let provider = common::object_under(common::object_under(root_map, "providers"), provider_name);
-    let old_models = provider
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut replaced = false;
-    let mut models = Vec::with_capacity(old_models.len() + 1);
-    for old in old_models {
-        if old.get("id") != entry.get("id") {
-            models.push(old);
-            continue;
-        }
-        if replaced {
-            continue;
-        }
-        let mut merged = if preserve_existing_model_fields {
-            old
-        } else {
-            serde_json::json!({})
-        };
-        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
-            merged.extend(update.clone());
-        } else {
-            merged = entry.clone();
-        }
-        models.push(merged);
-        replaced = true;
-    }
-    if !replaced {
-        models.push(entry.clone());
-    }
-    configure(provider);
-    provider.insert("models".into(), serde_json::json!(models));
-    root
-}
-
-/// `existing` with llmman's provider updated around `entry`, keeping
-/// everything it does not own.
-///
-/// The provider object is merged, not replaced: `baseUrl` always points
-/// at the running daemon, `api` and `apiKey` are filled in only when
-/// absent, and anything else under it — `headers`, `compat`,
-/// `modelOverrides` — is left as the user wrote it. Only the model entry
-/// with this same `id` is rebuilt, so launching a second model does not
-/// drop the first, whoever added it.
-fn pi_models_merged(
-    existing: &serde_json::Value,
-    server: &str,
-    entry: &serde_json::Value,
-) -> serde_json::Value {
-    provider_models_merged(existing, PI_PROVIDER, entry, false, |provider| {
-        provider.insert("baseUrl".into(), serde_json::json!(format!("{server}/v1")));
-        provider
-            .entry("api")
-            .or_insert_with(|| serde_json::json!("openai-completions"));
-        // A literal, not a `"$VAR"` reference pi would interpolate: see
-        // launch_pi's own doc comment.
-        provider
-            .entry("apiKey")
-            .or_insert_with(|| serde_json::json!("llmman"));
-    })
-}
-
-/// `existing` with pi's startup provider and model pointed at this launch,
-/// leaving every other setting alone.
-fn pi_settings_merged(existing: &serde_json::Value, model: &str) -> serde_json::Value {
-    let mut root = existing.clone();
-    root["defaultProvider"] = serde_json::json!(PI_PROVIDER);
-    root["defaultModel"] = serde_json::json!(model);
-    root
 }
 
 /// The window the daemon serves for `model`, read back from the loaded
@@ -1849,7 +1658,7 @@ mod tests {
             "opencode",
             opencode::opencode_state_dir().unwrap().join("model.json"),
         );
-        covers("pi", pi_agent_dir().unwrap());
+        covers("pi", pi::pi_agent_dir().unwrap());
         covers("omp", omp_agent_dir().unwrap());
         covers("cline", cline::cline_data_dir().unwrap());
         covers("agy", agy::agy_settings_dir().unwrap());
@@ -2248,153 +2057,6 @@ defaults:
             "--model",
             Some("-m")
         ));
-    }
-
-    /// pi is node, so its home half is the one node reads — the same
-    /// `cline_dir` resolves, and the reason #535 stopped using
-    /// `dirs::home_dir` alone. `config::home_dir` reads `%USERPROFILE%`
-    /// first for that same reason, so one helper answers both.
-    #[test]
-    fn pi_agent_dir_reads_the_home_node_reads() {
-        assert_eq!(
-            crate::config::home_dir(),
-            node_user_profile().or_else(dirs::home_dir)
-        );
-        if cfg!(windows) {
-            assert_eq!(node_user_profile(), env_dir("USERPROFILE"));
-        } else {
-            assert_eq!(node_user_profile(), None);
-        }
-    }
-
-    #[test]
-    fn pi_model_entry_declares_what_the_daemon_serves() {
-        let entry = pi_model_entry("qwen3.5:0.8b", true, true, Some(32768));
-        assert_eq!(entry["id"], "qwen3.5:0.8b");
-        assert_eq!(entry["name"], "qwen3.5:0.8b");
-        assert_eq!(entry["input"], serde_json::json!(["text", "image"]));
-        assert_eq!(entry["reasoning"], true);
-        assert_eq!(entry["contextWindow"], 32768);
-
-        // A text-only model that does not think, and no window to
-        // declare: pi keeps its own default rather than being told a guess.
-        let plain = pi_model_entry("smol", false, false, None);
-        assert_eq!(plain["input"], serde_json::json!(["text"]));
-        assert_eq!(plain.get("reasoning"), None);
-        assert_eq!(plain.get("contextWindow"), None);
-    }
-
-    /// The entry — pi's and omp's alike — carries the window `launch`
-    /// resolved, not the raw trained context. Which file it lands in is
-    /// covered by `write_omp_config_in_dir`'s own tests; this pins where
-    /// the number comes from.
-    #[test]
-    fn pi_model_entry_declares_the_resolved_window_not_the_trained_context() {
-        // A pair's larger half, as `pair_context_window` resolves it —
-        // a figure no trained context could have produced.
-        let pair = pair_context_window(Some(32_768), Some(200_000));
-        assert_eq!(pair, Some(200_000));
-        let entry = pi_model_entry("gemma4", false, false, pair);
-        assert_eq!(entry["contextWindow"], 200_000);
-
-        // And the daemon's clamp travels: a model trained past
-        // DEFAULT_CTX_SIZE is served only the default, so it declares
-        // only the default.
-        let default = u64::from(super::super::serve::DEFAULT_CTX_SIZE);
-        let served = served_context_window(None, Some(1 << 20));
-        assert_eq!(served, Some(default));
-        let entry = pi_model_entry("big", false, false, served);
-        assert_eq!(entry["contextWindow"], default);
-    }
-
-    #[test]
-    fn pi_models_merged_keeps_other_providers_and_hand_added_models() {
-        let existing: serde_json::Value = serde_json::from_str(
-            r#"{
-              "providers": {
-                "other": { "baseUrl": "https://example.invalid/v1" },
-                "llmman": {
-                  "headers": { "X-Trace": "1" },
-                  "apiKey": "mine-not-yours",
-                  "models": [{ "id": "mine" }, { "id": "stale" }]
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-        let entry = pi_model_entry("qwen3.5:0.8b", false, false, None);
-        let merged = pi_models_merged(&existing, "http://127.0.0.1:17434", &entry);
-
-        assert_eq!(
-            merged["providers"]["other"]["baseUrl"],
-            "https://example.invalid/v1"
-        );
-        assert_eq!(
-            merged["providers"]["llmman"]["baseUrl"],
-            "http://127.0.0.1:17434/v1"
-        );
-        // Keys llmman does not own survive the rewrite, and an apiKey
-        // the user already set is left alone.
-        assert_eq!(merged["providers"]["llmman"]["headers"]["X-Trace"], "1");
-        assert_eq!(merged["providers"]["llmman"]["apiKey"], "mine-not-yours");
-        let ids: Vec<&str> = merged["providers"]["llmman"]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
-        // Both survive; llmman's own is rebuilt in place, not doubled.
-        assert_eq!(ids, vec!["mine", "stale", "qwen3.5:0.8b"]);
-    }
-
-    /// A file may hold `"providers": []` and still be valid JSON;
-    /// indexing that with a key panics, so it is replaced rather than
-    /// indexed (see `object_under`).
-    #[test]
-    fn pi_models_merged_survives_a_wrong_shaped_providers_value() {
-        for raw in [r#"{"providers": []}"#, r#"{"providers": "x"}"#, r#"{}"#] {
-            let existing: serde_json::Value = serde_json::from_str(raw).unwrap();
-            let entry = pi_model_entry("m", false, false, None);
-            let merged = pi_models_merged(&existing, "http://s", &entry);
-            assert_eq!(merged["providers"]["llmman"]["baseUrl"], "http://s/v1");
-            assert_eq!(merged["providers"]["llmman"]["models"][0]["id"], "m");
-        }
-    }
-
-    /// Nothing was there before, so llmman fills in the fields it owns.
-    #[test]
-    fn pi_models_merged_writes_the_placeholder_key_into_a_fresh_provider() {
-        let entry = pi_model_entry("m", false, false, None);
-        let merged = pi_models_merged(&serde_json::json!({}), "http://127.0.0.1:17434", &entry);
-        let provider = &merged["providers"]["llmman"];
-        assert_eq!(provider["baseUrl"], "http://127.0.0.1:17434/v1");
-        assert_eq!(provider["api"], "openai-completions");
-        // Literal, never an interpolated reference — see launch_pi.
-        assert_eq!(provider["apiKey"], "llmman");
-    }
-
-    /// Launching a second model must not drop the first.
-    #[test]
-    fn pi_models_merged_keeps_a_previously_launched_model() {
-        let first = pi_model_entry("a", false, false, None);
-        let one = pi_models_merged(&serde_json::json!({}), "http://s", &first);
-        let two = pi_models_merged(&one, "http://s", &pi_model_entry("b", false, false, None));
-        let ids: Vec<&str> = two["providers"]["llmman"]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn pi_settings_merged_leaves_unrelated_settings_alone() {
-        let existing = serde_json::json!({ "theme": "dark", "defaultModel": "old" });
-        let merged = pi_settings_merged(&existing, "qwen3.5:0.8b");
-        assert_eq!(merged["theme"], "dark");
-        assert_eq!(merged["defaultProvider"], "llmman");
-        assert_eq!(merged["defaultModel"], "qwen3.5:0.8b");
     }
 
     /// Only the integrations that put a window somewhere pay for the
