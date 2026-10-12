@@ -636,8 +636,8 @@ fn daemon_still_answers(integration: &str) -> bool {
 struct DaemonLog {
     /// `journalctl --since` for the systemd unit, when it is active.
     journal_since: Option<String>,
-    /// `serve.log` and its length when the attempt began.
-    serve_log: Option<(PathBuf, u64)>,
+    /// `serve.log`, its length and its first bytes when the attempt began.
+    serve_log: Option<(PathBuf, u64, Vec<u8>)>,
 }
 
 impl DaemonLog {
@@ -654,8 +654,9 @@ impl DaemonLog {
             format!("@{secs}")
         });
         let serve_log = serve_log_path().map(|path| {
-            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
-            (path, len)
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            let head = bytes[..bytes.len().min(256)].to_vec();
+            (path, bytes.len() as u64, head)
         });
         Self {
             journal_since,
@@ -675,10 +676,12 @@ impl DaemonLog {
                 text.push_str(&String::from_utf8_lossy(&out.stdout));
             }
         }
-        if let Some((path, start)) = &self.serve_log {
+        if let Some((path, start, head)) = &self.serve_log {
             if let Ok(bytes) = std::fs::read(path) {
-                // Shorter than at the mark: rotated by a new daemon, all new.
-                let start = if (bytes.len() as u64) < *start {
+                // A new daemon rotates serve.log before it starts, so a file
+                // that no longer begins as it did at the mark (or is shorter)
+                // is a replacement, all of it written during the attempt.
+                let start = if (bytes.len() as u64) < *start || !bytes.starts_with(head) {
                     0
                 } else {
                     *start as usize
