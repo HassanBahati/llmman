@@ -627,6 +627,166 @@ fn daemon_still_answers(integration: &str) -> bool {
     }
 }
 
+/// The shared daemon's output from one launch attempt on: its llama-server
+/// timings, the only record of why a launch was slow. Each attempt runs
+/// under a fresh `HOME`, but the daemon does not: on Linux CI it is the
+/// install script's systemd user unit (`llmman.service`), whose output
+/// goes to the journal; elsewhere it is whatever `ensure_server` spawned,
+/// writing `serve.log` under this process's own data directory.
+struct DaemonLog {
+    /// `journalctl --since` for the systemd unit, when it is active.
+    journal_since: Option<String>,
+    /// `serve.log` and its length when the attempt began.
+    serve_log: Option<(PathBuf, u64)>,
+}
+
+impl DaemonLog {
+    fn mark() -> Self {
+        let journal_since = (cfg!(target_os = "linux")
+            && Command::new("systemctl")
+                .args(["--user", "is-active", "--quiet", "llmman.service"])
+                .status()
+                .is_ok_and(|s| s.success()))
+        .then(|| {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            format!("@{secs}")
+        });
+        let serve_log = serve_log_path().map(|path| {
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            (path, len)
+        });
+        Self {
+            journal_since,
+            serve_log,
+        }
+    }
+
+    /// What the daemon wrote since [`DaemonLog::mark`].
+    fn since(&self) -> String {
+        let mut text = String::new();
+        if let Some(since) = &self.journal_since {
+            if let Ok(out) = Command::new("journalctl")
+                .args(["--user", "-u", "llmman.service", "--no-pager", "-o", "cat"])
+                .args(["--since", since])
+                .output()
+            {
+                text.push_str(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
+        if let Some((path, start)) = &self.serve_log {
+            if let Ok(bytes) = std::fs::read(path) {
+                // Shorter than at the mark: rotated by a new daemon, all new.
+                let start = if (bytes.len() as u64) < *start {
+                    0
+                } else {
+                    *start as usize
+                };
+                text.push_str(&String::from_utf8_lossy(&bytes[start..]));
+            }
+        }
+        text
+    }
+}
+
+/// `serve.log` where `ensure_server` puts it for this process's `HOME`.
+fn serve_log_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("llmman/serve.log"))
+    } else {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/llmman/serve.log"))
+    }
+}
+
+/// One line totalling llama-server's per-request `print_timing` lines:
+/// how much prompt it prefilled, and how fast. `None` without any.
+fn timing_summary(log: &str) -> Option<String> {
+    // "... | prompt eval time =   20.78 ms /    47 tokens (...)"
+    let parse = |line: &str, key: &str| -> Option<(f64, u64)> {
+        let rest = line.split_once(key)?.1.trim_start().strip_prefix('=')?;
+        let (ms, rest) = rest.split_once("ms /")?;
+        let tokens = rest.split_whitespace().next()?;
+        Some((ms.trim().parse().ok()?, tokens.parse().ok()?))
+    };
+    let (mut requests, mut prompt, mut generated) = (0, (0.0, 0), (0.0, 0));
+    for line in log.lines() {
+        if let Some((ms, n)) = parse(line, "prompt eval time") {
+            requests += 1;
+            prompt = (prompt.0 + ms, prompt.1 + n);
+        } else if let Some((ms, n)) = parse(line, "eval time") {
+            generated = (generated.0 + ms, generated.1 + n);
+        }
+    }
+    if requests == 0 {
+        return None;
+    }
+    let rate = |(ms, n): (f64, u64)| {
+        if ms > 0.0 {
+            n as f64 / (ms / 1000.0)
+        } else {
+            0.0
+        }
+    };
+    Some(format!(
+        "{requests} request(s); prompt eval {} tokens in {:.1}s ({:.0} tok/s); \
+         generated {} tokens in {:.1}s ({:.0} tok/s)",
+        prompt.1,
+        prompt.0 / 1000.0,
+        rate(prompt),
+        generated.1,
+        generated.0 / 1000.0,
+        rate(generated),
+    ))
+}
+
+/// A bounded excerpt of the daemon's output for a log that must stay
+/// readable: the last 40 llama-server timing and slot lines, then the last
+/// 50 lines of all, each cut at 300 characters.
+fn daemon_log_excerpt(log: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "print_timing",
+        "launch_slot_",
+        "release:",
+        "cancel task",
+        "prompt processing",
+        "n_ctx_slot",
+    ];
+    let lines: Vec<&str> = log.lines().collect();
+    let tail_start = lines.len().saturating_sub(50);
+    let timing: Vec<&str> = lines[..tail_start]
+        .iter()
+        .filter(|l| MARKERS.iter().any(|m| l.contains(m)))
+        .copied()
+        .collect();
+    let mut out = String::new();
+    for line in timing[timing.len().saturating_sub(40)..]
+        .iter()
+        .chain(&lines[tail_start..])
+    {
+        let cut: String = line.chars().take(300).collect();
+        out.push_str(&cut);
+        out.push('\n');
+    }
+    out
+}
+
+/// Prints what the daemon wrote during an attempt that did not pass.
+fn report_daemon_log(integration: &str, log: &DaemonLog) {
+    let text = log.since();
+    if text.trim().is_empty() {
+        eprintln!("[test] {integration}: the daemon wrote nothing during this attempt");
+        return;
+    }
+    if let Some(summary) = timing_summary(&text) {
+        eprintln!("[test] {integration}: llama-server: {summary}");
+    }
+    eprintln!(
+        "[test] {integration}: daemon output during this attempt (excerpt):\n{}",
+        daemon_log_excerpt(&text)
+    );
+}
+
 /// `llmman launch <integration> --model qwen3.5:0.8b <launch_flags> --
 /// <extra_args>` with `home` as its `HOME`, and every directory an
 /// integration keeps its state in under it.
@@ -882,6 +1042,7 @@ fn launch_and_assert_with(
     let mut gave_up_after_timeout = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
+        let daemon_log = DaemonLog::mark();
         let output = match run_launch(&home, integration, extra_args) {
             Ok(output) => output,
             Err(timed_out) => {
@@ -890,6 +1051,7 @@ fn launch_and_assert_with(
                      (see launch_and_assert's doc comment); not retried, giving up\n{}",
                     timed_out.message
                 );
+                report_daemon_log(integration, &daemon_log);
                 last_failure = Some(timed_out.message);
                 gave_up_after_timeout = Some(attempt);
                 break;
@@ -903,7 +1065,9 @@ fn launch_and_assert_with(
                     inspect_home(&home);
                     return;
                 }
-                NonzeroDisposition::Accept | NonzeroDisposition::Retry => {}
+                NonzeroDisposition::Accept | NonzeroDisposition::Retry => {
+                    report_daemon_log(integration, &daemon_log)
+                }
                 NonzeroDisposition::Reject => panic!(
                     "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
                      (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
@@ -934,9 +1098,13 @@ fn launch_and_assert_with(
              reported a failure of its own\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
         if accept_stdout(&stdout) {
+            if let Some(summary) = timing_summary(&daemon_log.since()) {
+                eprintln!("[test] {integration}: llama-server: {summary}");
+            }
             inspect_home(&home);
             return;
         }
+        report_daemon_log(integration, &daemon_log);
         eprintln!(
             "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
              didn't satisfy the output assertion; {}",
@@ -1511,6 +1679,39 @@ fn cline_nonzero_is_a_malformed_tool_call(stdout: &str, stderr: &str) -> bool {
                         })
                 })
         })
+}
+
+/// Real llama-server b11429 lines: two finished requests are totalled, the
+/// generation progress line is not a request, and the excerpt stays bounded.
+#[test]
+fn daemon_timings_are_summarized_and_the_excerpt_is_bounded() {
+    let log = "\
+0.00.482.322 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.00.616.768 I slot print_timing: id  3 | task 0 | prompt eval time =   20000.00 ms /  1000 tokens (   20.00 ms per token,    50.00 tokens per second)
+0.00.616.771 I slot print_timing: id  3 | task 0 |        eval time =     113.61 ms /    33 tokens (    3.55 ms per token,   281.66 tokens per second)
+0.00.616.772 I slot print_timing: id  3 | task 0 |       total time =   20113.61 ms /  1033 tokens
+1.02.457.226 I slot print_timing: id  3 | task 39 | n_gen =    894, tg = 297.44 t/s, tg_3s = 297.78 t/s
+1.03.671.356 W srv          stop: cancel task, id_task = 39
+1.04.616.768 I slot print_timing: id  3 | task 40 | prompt eval time =   10000.00 ms /   500 tokens (   20.00 ms per token,    50.00 tokens per second)
+1.04.616.771 I slot print_timing: id  3 | task 40 |        eval time =     100.00 ms /    10 tokens (   10.00 ms per token,   100.00 tokens per second)
+";
+    assert_eq!(
+        timing_summary(log).as_deref(),
+        Some(
+            "2 request(s); prompt eval 1500 tokens in 30.0s (50 tok/s); \
+             generated 43 tokens in 0.2s (201 tok/s)"
+        )
+    );
+    assert_eq!(timing_summary("no timings here"), None);
+
+    let noisy: String = (0..1000)
+        .map(|i| format!("{i} {}\n", "x".repeat(400)))
+        .chain(std::iter::once(log.to_string()))
+        .collect();
+    let excerpt = daemon_log_excerpt(&noisy);
+    assert!(excerpt.lines().count() <= 90, "{}", excerpt.lines().count());
+    assert!(excerpt.lines().all(|l| l.chars().count() <= 300));
+    assert!(excerpt.contains("cancel task"), "{excerpt}");
 }
 
 #[test]
