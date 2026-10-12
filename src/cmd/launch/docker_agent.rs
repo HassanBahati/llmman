@@ -7,7 +7,7 @@ use anyhow::Context;
 use crate::daemon;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_flag, server};
+use super::{before_terminator, exec_with_env, find_on_path, has_flag, server};
 
 /// The env var the generated `token_key` names, so no key reaches disk
 /// (same role as `qwen::QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
@@ -63,11 +63,7 @@ pub(super) fn check_docker_agent_args(extra_args: &[String]) -> anyhow::Result<(
     //
     // Only up to a forwarded `--`: Cobra takes everything after one as
     // arguments, so a prompt there that reads like a flag is a message.
-    let flags = &extra_args[..extra_args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(extra_args.len())];
-    if has_flag(flags, "--model", None) {
+    if has_flag(before_terminator(extra_args), "--model", None) {
         anyhow::bail!(
             "docker-agent's --model would replace the endpoint llmman configured and send the \
              request to api.openai.com; select the model with `llmman launch docker-agent \

@@ -351,6 +351,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// OMP's argument builder drops the generated Ollama model when the caller
 /// supplies one.
 /// Copilot's argument builder likewise yields to its own `--model`.
+/// claude: `claude::claude_args` likewise drops the generated `--model`.
 /// Not docker-agent: its `--model` replaces the whole model entry
 /// `docker_agent::docker_agent_document` wrote, `base_url` included, so
 /// a forwarded one reaches api.openai.com.
@@ -365,6 +366,7 @@ const MODEL_REQUIRED: &[&str] = &[
 /// so promising the caller's wins would be false. Move it here if it
 /// turns out to take one.
 const MODEL_FLAG_FORWARDED: &[&str] = &[
+    "claude",
     "qwen",
     "goose",
     "grok",
@@ -386,12 +388,16 @@ fn check_model_flag(
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
-    if !MODEL_REQUIRED.contains(&name.as_str()) {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let Some(model) = model else {
+        if MODEL_REQUIRED.contains(&name.as_str()) {
+            let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
+            anyhow::bail!(
+                "{name} needs a model: llmman launch {name}{with_provider} --model <model>"
+            );
+        }
+        // No resolved model for a forwarded one to win over.
         return Ok(());
-    }
-    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
-        let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
-        anyhow::bail!("{name} needs a model: llmman launch {name}{with_provider} --model <model>");
     };
     if has_forwarded_model_flag(&name, extra_args) {
         eprintln!(
@@ -401,13 +407,24 @@ fn check_model_flag(
     Ok(())
 }
 
-/// Whether this integration accepts a forwarded model flag. Copilot's
-/// documented spelling is only `--model`; the other launchers also accept
-/// `-m`.
+/// Whether this integration accepts a forwarded model flag. Copilot and
+/// claude spell it only `--model`; the other launchers also accept `-m`.
 fn has_forwarded_model_flag(integration: &str, extra_args: &[String]) -> bool {
     let name = integration.to_lowercase();
-    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli")).then_some("-m");
-    MODEL_FLAG_FORWARDED.contains(&name.as_str()) && has_flag(extra_args, "--model", short)
+    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli" | "claude")).then_some("-m");
+    MODEL_FLAG_FORWARDED.contains(&name.as_str())
+        && has_flag(before_terminator(extra_args), "--model", short)
+}
+
+/// `extra_args` up to a forwarded `--`. The launched CLI takes everything
+/// after one as arguments, so a prompt there that reads like a flag is a
+/// message, not a flag.
+fn before_terminator(extra_args: &[String]) -> &[String] {
+    let end = extra_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(extra_args.len());
+    &extra_args[..end]
 }
 
 /// Whether `extra_args` spells `long` or `short`, as a word or `=`-joined.
@@ -1733,9 +1750,13 @@ mod tests {
         // The "yours wins" warning is only claimed for launchers that
         // actually yield to it; dsh has no `--model` flag to yield to.
         for id in MODEL_FLAG_FORWARDED {
-            assert!(MODEL_REQUIRED.contains(id), "{id} is not model-required");
+            assert!(integration(id).is_some(), "{id} is not an integration");
         }
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
+        // claude yields without requiring a model, so the warning must not
+        // depend on `MODEL_REQUIRED`.
+        assert!(MODEL_FLAG_FORWARDED.contains(&"claude"));
+        assert!(!MODEL_REQUIRED.contains(&"claude"));
     }
 
     #[test]
@@ -2056,6 +2077,32 @@ defaults:
             &args(&["--model-context", "x"]),
             "--model",
             Some("-m")
+        ));
+    }
+
+    /// The `--variant` guard in `run` relies on this to refuse a forwarded
+    /// `--model`.
+    #[test]
+    fn forwarded_model_flag_is_seen_for_each_integration_that_yields() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let model = args(&["--model", "other/model"]);
+        for name in MODEL_FLAG_FORWARDED {
+            assert!(has_forwarded_model_flag(name, &model), "{name}");
+        }
+        // docker-agent refuses a forwarded model; dsh takes none.
+        assert!(!has_forwarded_model_flag("docker-agent", &model));
+        assert!(!has_forwarded_model_flag("dsh", &model));
+        // copilot and claude have no `-m`; grok does.
+        let short = args(&["-m", "other/model"]);
+        assert!(!has_forwarded_model_flag("claude", &short));
+        assert!(!has_forwarded_model_flag("copilot", &short));
+        assert!(has_forwarded_model_flag("grok", &short));
+        // After a second `--` it is a message, not a flag.
+        let message = args(&["--", "--model", "other/model"]);
+        assert!(!has_forwarded_model_flag("claude", &message));
+        assert!(has_forwarded_model_flag(
+            "claude",
+            &args(&["--model", "other/model", "--", "hi"])
         ));
     }
 
