@@ -123,16 +123,17 @@ fn log_follow_filters_new_prompts_and_does_not_limit_them_to_max_count() {
     reader.join().unwrap();
 }
 
-/// A launch whose agent is not installed fails on that, before it starts
-/// a daemon or pulls the model: nothing listens at LLMMAN_HOST, so any
-/// attempt to reach one would be a different error, and PATH is empty.
-#[test]
-fn launch_reports_a_missing_agent_before_starting_or_pulling_anything() {
-    let home = std::env::temp_dir().join(format!("llmman-cli-launch-{}", std::process::id()));
+/// Runs `llmman launch` with an empty PATH and nothing at LLMMAN_HOST,
+/// so any attempt to start a daemon or reach one would be a different
+/// error from the one under test. `tag` keeps parallel tests' homes apart.
+/// Returns whether it succeeded, and its stderr.
+fn launch_with_empty_path(tag: &str, args: &[&str]) -> (bool, String) {
+    let home = std::env::temp_dir().join(format!("llmman-cli-{tag}-{}", std::process::id()));
     let empty_path = home.join("bin");
     std::fs::create_dir_all(&empty_path).unwrap();
     let out = llmman()
-        .args(["launch", "claude", "--model", "ai/smollm2"])
+        .arg("launch")
+        .args(args)
         .env("PATH", &empty_path)
         .env("HOME", &home)
         .env("LLMMAN_HOST", "127.0.0.1:9")
@@ -140,11 +141,45 @@ fn launch_reports_a_missing_agent_before_starting_or_pulling_anything() {
         .output()
         .expect("spawn llmman");
     let _ = std::fs::remove_dir_all(&home);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "stderr: {stderr}");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A launch whose agent is not installed fails on that, before it starts
+/// a daemon or pulls the model.
+#[test]
+fn launch_reports_a_missing_agent_before_starting_or_pulling_anything() {
+    let (ok, stderr) = launch_with_empty_path("launch", &["claude", "--model", "ai/smollm2"]);
+    assert!(!ok, "stderr: {stderr}");
     assert!(
         stderr.contains("claude is not installed"),
         "stderr: {stderr}"
     );
     assert!(!stderr.contains("pull"), "stderr: {stderr}");
+}
+
+/// claude yields to a `--model` after `--`, so a `--variant` checked
+/// against llmman's `--model` is refused before anything starts.
+#[test]
+fn launch_claude_refuses_a_variant_with_a_forwarded_model() {
+    let (ok, stderr) = launch_with_empty_path(
+        "variant",
+        &[
+            "claude",
+            "--model",
+            "ai/smollm2",
+            "--variant",
+            "high",
+            "--",
+            "--model",
+            "other/model",
+        ],
+    );
+    assert!(!ok, "stderr: {stderr}");
+    assert!(
+        stderr.contains("--variant needs the model as llmman's --model, not after --"),
+        "stderr: {stderr}"
+    );
 }

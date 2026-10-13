@@ -1,6 +1,6 @@
 //! `llmman launch claude`.
 
-use super::{exec_with_env, find_on_path, server};
+use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server};
 
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
@@ -22,9 +22,10 @@ pub(super) fn launch_claude(
 /// [`super::exec_with_env`] never returns, so calling [`launch_claude`] would
 /// take the test runner with it.
 fn claude_args(model: &str, extra_args: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
+    let mut args = Vec::new();
     // Absent, not empty: claude reads "" as a model actually named "".
-    if !model.is_empty() {
+    // A forwarded `--model` replaces llmman's.
+    if !model.is_empty() && !has_forwarded_model_flag("claude", extra_args) {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args.extend_from_slice(extra_args);
@@ -61,6 +62,16 @@ mod tests {
                 &["--effort".into(), "high".into(), "-p".into(), "x".into()]
             ),
             ["--model", "local/model", "--effort", "high", "-p", "x"]
+        );
+        // A forwarded `--model` replaces llmman's.
+        assert_eq!(
+            claude_args("local/model", &["--model".into(), "other/model".into()]),
+            ["--model", "other/model"]
+        );
+        // claude has no `-m`, so it is not read as a model.
+        assert_eq!(
+            claude_args("local/model", &["-m".into(), "not-a-model-flag".into()]),
+            ["--model", "local/model", "-m", "not-a-model-flag"]
         );
     }
 
