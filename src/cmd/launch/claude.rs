@@ -1,6 +1,9 @@
 //! `llmman launch claude`.
 
-use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
+use super::common;
+use super::{
+    before_terminator, exec_with_env_removing, find_on_path, has_forwarded_model_flag, server,
+};
 
 /// Inherited variables that point claude at another provider or credential.
 const CLAUDE_ENV_TO_CLEAR: &[&str] = &[
@@ -25,6 +28,10 @@ const CLAUDE_MODEL_ENV: &[&str] = &[
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
+/// claude's model aliases, each with an optional `[1m]` suffix. They resolve
+/// through [`CLAUDE_MODEL_ENV`].
+const CLAUDE_MODEL_ALIASES: &[&str] = &["best", "fable", "opus", "sonnet", "haiku", "opusplan"];
+
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
 pub(super) fn launch_claude(
@@ -37,7 +44,7 @@ pub(super) fn launch_claude(
     exec_with_env_removing(
         &bin,
         &claude_args(model, extra_args),
-        &claude_env(model, api_key, &server),
+        &claude_env(session_model(model, extra_args), api_key, &server),
         CLAUDE_ENV_TO_CLEAR,
     )
 }
@@ -54,6 +61,25 @@ fn claude_args(model: &str, extra_args: &[String]) -> Vec<String> {
     }
     args.extend_from_slice(extra_args);
     args
+}
+
+/// The model to set [`CLAUDE_MODEL_ENV`] to: a forwarded `--model`, unless
+/// it is an alias, else `model`. Empty when a forwarded `--model` has no value.
+fn session_model<'a>(model: &'a str, extra_args: &'a [String]) -> &'a str {
+    if !has_forwarded_model_flag("claude", extra_args) {
+        return model;
+    }
+    match common::forwarded_model(before_terminator(extra_args)) {
+        Some(forwarded) if !is_claude_alias(forwarded) => forwarded,
+        Some(_) => model,
+        None => "",
+    }
+}
+
+fn is_claude_alias(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix("[1m]").unwrap_or(&name);
+    CLAUDE_MODEL_ALIASES.contains(&name)
 }
 
 /// What llmman sets for claude. `base_url` is the bare origin: claude
@@ -101,6 +127,48 @@ mod tests {
         assert_eq!(
             claude_args("local/model", &["-m".into(), "not-a-model-flag".into()]),
             ["--model", "local/model", "-m", "not-a-model-flag"]
+        );
+    }
+
+    #[test]
+    fn session_model_is_the_forwarded_one_when_there_is_one() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            session_model("local/model", &args(&["-p", "x"])),
+            "local/model"
+        );
+        assert_eq!(
+            session_model("local/model", &args(&["--model", "other/model"])),
+            "other/model"
+        );
+        assert_eq!(
+            session_model("local/model", &args(&["--model=other/model"])),
+            "other/model"
+        );
+        assert_eq!(
+            session_model("", &args(&["--model", "other/model"])),
+            "other/model"
+        );
+        assert_eq!(session_model("local/model", &args(&["--model="])), "");
+        // An alias resolves through the variables, so they keep `model`.
+        for alias in ["sonnet", "Opus", "fable[1m]", "opusplan"] {
+            assert_eq!(
+                session_model("local/model", &args(&["--model", alias])),
+                "local/model",
+                "{alias}"
+            );
+        }
+        assert_eq!(
+            session_model("local/model", &args(&["--model", "sonnet-local"])),
+            "sonnet-local"
+        );
+        // After a second `--` it is a message, not a flag.
+        assert_eq!(
+            session_model(
+                "local/model",
+                &args(&["-p", "--", "--model", "other/model"])
+            ),
+            "local/model"
         );
     }
 
