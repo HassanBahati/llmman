@@ -6,8 +6,8 @@ use anyhow::Context;
 
 use super::common;
 use super::{
-    before_terminator, exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server,
-    Effort, WINDOWS_PATH_EXTS,
+    exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server, Effort,
+    WINDOWS_PATH_EXTS,
 };
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -61,7 +61,7 @@ fn qwen_model_and_vision<'a>(
     vision: bool,
     extra_args: &'a [String],
 ) -> (&'a str, bool) {
-    let forwarded = common::forwarded_model(before_terminator(extra_args));
+    let forwarded = common::forwarded_model(extra_args);
     let same = forwarded.is_none_or(|f| {
         crate::shortnames::resolve_ollama_api(f).is_ok_and(|resolved| resolved == model)
     });

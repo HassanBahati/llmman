@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{env_dir, exec_with_env, find_on_path, has_flag, server, Effort};
+use super::{env_dir, exec_with_env, find_on_path, has_forwarded_model_flag, server, Effort};
 
 /// The per-model `env_key` in llmman's Grok config reads this variable.
 /// A model credential outranks both Grok's signed-in session and its global
@@ -19,8 +19,9 @@ const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
 /// daemon to load one after the main model already answered successfully.
 ///
 /// The model flag is injected only when the caller did not provide one
-/// after `--`. This matches qwen's behavior in `super` and lets an explicit
-/// integration argument win without passing a duplicate flag.
+/// after `--`. This matches `qwen::qwen_args` and lets an explicit
+/// integration argument win without passing a duplicate flag. `--model` is
+/// not looked for after a second `--`.
 pub(super) fn launch_grok(
     model: &str,
     api_key: &str,
@@ -113,7 +114,7 @@ fn grok_config_document(model: &str, base_url: &str, efforts: &[&str]) -> String
 
 fn grok_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::with_capacity(extra_args.len() + 2);
-    if !has_flag(extra_args, "--model", Some("-m")) {
+    if !has_forwarded_model_flag("grok", extra_args) {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args.extend_from_slice(extra_args);
@@ -245,6 +246,11 @@ mod tests {
         assert_eq!(
             grok_args("m:latest", &args(&["--model=theirs"])),
             ["--model=theirs"]
+        );
+        // After a second `--` it is not a flag, so llmman's `--model` is kept.
+        assert_eq!(
+            grok_args("m:latest", &args(&["--single", "hi", "--", "--model", "x"])),
+            ["--model", "m:latest", "--single", "hi", "--", "--model", "x"]
         );
     }
 
