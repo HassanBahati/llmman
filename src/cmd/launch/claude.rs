@@ -28,9 +28,11 @@ const CLAUDE_MODEL_ENV: &[&str] = &[
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
-/// claude's model aliases, each with an optional `[1m]` suffix. They resolve
-/// through [`CLAUDE_MODEL_ENV`].
-const CLAUDE_MODEL_ALIASES: &[&str] = &["best", "fable", "opus", "sonnet", "haiku", "opusplan"];
+/// claude's model aliases, each with an optional `[1m]` suffix, and
+/// `default`. They resolve through [`CLAUDE_MODEL_ENV`].
+const CLAUDE_MODEL_ALIASES: &[&str] = &[
+    "default", "best", "fable", "opus", "sonnet", "haiku", "opusplan",
+];
 
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
@@ -151,13 +153,15 @@ mod tests {
         );
         assert_eq!(session_model("local/model", &args(&["--model="])), "");
         // An alias resolves through the variables, so they keep `model`.
-        for alias in ["sonnet", "Opus", "fable[1m]", "opusplan"] {
+        for alias in ["sonnet", "Opus", "fable[1m]", "opusplan", "default"] {
             assert_eq!(
                 session_model("local/model", &args(&["--model", alias])),
                 "local/model",
                 "{alias}"
             );
         }
+        // With no `model`, an alias leaves the variables unset.
+        assert_eq!(session_model("", &args(&["--model", "default"])), "");
         assert_eq!(
             session_model("local/model", &args(&["--model", "sonnet-local"])),
             "sonnet-local"
