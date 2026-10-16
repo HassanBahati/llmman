@@ -7,7 +7,7 @@ use anyhow::Context;
 use crate::providers;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_flag, server, WINDOWS_PATH_EXTS};
+use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server, WINDOWS_PATH_EXTS};
 
 /// omp: register llmman's endpoint and the selected model in `models.yml`.
 ///
@@ -169,7 +169,7 @@ fn omp_models_merged(
 /// of version-specific repeated-option behavior.
 fn omp_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::with_capacity(extra_args.len() + 2);
-    if !has_flag(extra_args, "--model", Some("-m")) {
+    if !has_forwarded_model_flag("omp", extra_args) {
         args.extend(["--model".to_string(), format!("ollama/{model}")]);
     }
     args.extend_from_slice(extra_args);
@@ -258,6 +258,11 @@ mod tests {
         assert_eq!(
             omp_args("local", &strings(&["-p", "ping"])),
             strings(&["--model", "ollama/local", "-p", "ping"])
+        );
+        // After a second `--` it is not a flag, so llmman's model stays.
+        assert_eq!(
+            omp_args("local", &strings(&["--", "--model", "x"])),
+            strings(&["--model", "ollama/local", "--", "--model", "x"])
         );
     }
 

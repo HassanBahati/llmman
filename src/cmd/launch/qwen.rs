@@ -6,8 +6,8 @@ use anyhow::Context;
 
 use super::common;
 use super::{
-    exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server, Effort,
-    WINDOWS_PATH_EXTS,
+    before_terminator, exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server,
+    Effort, WINDOWS_PATH_EXTS,
 };
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
@@ -91,11 +91,15 @@ fn path_with_dir_prepended(
 /// Qwen Code 0.22.3 crashes on either flag repeated (a `toLowerCase`
 /// TypeError) rather than taking the last one, and a caller who spelled
 /// out an auth type meant it. `--authType` is checked too — yargs accepts
-/// a flag's camelCase spelling as well. `--model` is not looked for after
-/// a second `--`: Qwen Code does not read anything there as a flag.
+/// a flag's camelCase spelling as well. Neither is looked for after a
+/// second `--`: Qwen Code does not read anything there as a flag.
 fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::with_capacity(extra_args.len() + 4);
-    if !has_flag(extra_args, "--auth-type", Some("--authType")) {
+    if !has_flag(
+        before_terminator(extra_args),
+        "--auth-type",
+        Some("--authType"),
+    ) {
         args.extend(["--auth-type".to_string(), "openai".to_string()]);
     }
     if !has_forwarded_model_flag("qwen", extra_args) {
@@ -410,8 +414,10 @@ mod tests {
             ["--model", "m:latest", "--authType", "openai"]
         );
 
-        // After a second `--` it is not a flag, so llmman's `--model` is kept.
-        let after_terminator: Vec<String> = ["--", "--model", "x"].map(String::from).to_vec();
+        // After a second `--` neither is a flag, so llmman's are kept.
+        let after_terminator: Vec<String> = ["--", "--model", "x", "--auth-type=qwen-oauth"]
+            .map(String::from)
+            .to_vec();
         assert_eq!(
             qwen_args("m:latest", &after_terminator),
             [
@@ -421,7 +427,8 @@ mod tests {
                 "m:latest",
                 "--",
                 "--model",
-                "x"
+                "x",
+                "--auth-type=qwen-oauth"
             ]
         );
     }
