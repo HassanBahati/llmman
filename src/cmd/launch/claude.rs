@@ -1,9 +1,7 @@
 //! `llmman launch claude`.
 
 use super::common;
-use super::{
-    before_terminator, exec_with_env_removing, find_on_path, has_forwarded_model_flag, server,
-};
+use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
 
 /// Inherited variables that point claude at another provider or credential.
 const CLAUDE_ENV_TO_CLEAR: &[&str] = &[
@@ -71,7 +69,7 @@ fn session_model<'a>(model: &'a str, extra_args: &'a [String]) -> &'a str {
     if !has_forwarded_model_flag("claude", extra_args) {
         return model;
     }
-    match common::forwarded_model(before_terminator(extra_args)) {
+    match common::forwarded_model(extra_args) {
         Some(forwarded) if !is_claude_alias(forwarded) => forwarded,
         Some(_) => model,
         None => "",
@@ -173,6 +171,13 @@ mod tests {
                 &args(&["-p", "--", "--model", "other/model"])
             ),
             "local/model"
+        );
+        assert_eq!(
+            session_model(
+                "local/model",
+                &args(&["--model", "other/model", "--", "--model", "x"])
+            ),
+            "other/model"
         );
     }
 
