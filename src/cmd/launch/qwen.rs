@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
-use super::{exec_with_env, find_on_path, has_flag, server, Effort, WINDOWS_PATH_EXTS};
+use super::{
+    exec_with_env, find_on_path, has_flag, has_forwarded_model_flag, server, Effort,
+    WINDOWS_PATH_EXTS,
+};
 
 /// qwen: Qwen Code's OpenAI-compatible mode, pointed at our /v1 by the
 /// command line, the environment and its settings file together, since
@@ -88,13 +91,14 @@ fn path_with_dir_prepended(
 /// Qwen Code 0.22.3 crashes on either flag repeated (a `toLowerCase`
 /// TypeError) rather than taking the last one, and a caller who spelled
 /// out an auth type meant it. `--authType` is checked too — yargs accepts
-/// a flag's camelCase spelling as well.
+/// a flag's camelCase spelling as well. `--model` is not looked for after
+/// a second `--`: Qwen Code does not read anything there as a flag.
 fn qwen_args(model: &str, extra_args: &[String]) -> Vec<String> {
     let mut args = Vec::with_capacity(extra_args.len() + 4);
     if !has_flag(extra_args, "--auth-type", Some("--authType")) {
         args.extend(["--auth-type".to_string(), "openai".to_string()]);
     }
-    if !has_flag(extra_args, "--model", Some("-m")) {
+    if !has_forwarded_model_flag("qwen", extra_args) {
         args.extend(["--model".to_string(), model.to_string()]);
     }
     args.extend_from_slice(extra_args);
@@ -405,6 +409,21 @@ mod tests {
             qwen_args("m:latest", &user_camel),
             ["--model", "m:latest", "--authType", "openai"]
         );
+
+        // After a second `--` it is not a flag, so llmman's `--model` is kept.
+        let after_terminator: Vec<String> = ["--", "--model", "x"].map(String::from).to_vec();
+        assert_eq!(
+            qwen_args("m:latest", &after_terminator),
+            [
+                "--auth-type",
+                "openai",
+                "--model",
+                "m:latest",
+                "--",
+                "--model",
+                "x"
+            ]
+        );
     }
 
     /// Any node version under `~/.nvm` that has qwen.
@@ -534,6 +553,12 @@ mod tests {
             // Another model, and one that is not a reference at all.
             (forwarded("qwen3.5:0.8b"), "qwen3.5:0.8b", false),
             (forwarded("not a reference"), "not a reference", false),
+            // After a second `--` it is not a flag, so llmman's model stays.
+            (
+                ["--", "--model", "qwen3.5:0.8b"].map(String::from).to_vec(),
+                resolved.as_str(),
+                true,
+            ),
         ];
         for (extra_args, model, vision) in cases {
             assert_eq!(

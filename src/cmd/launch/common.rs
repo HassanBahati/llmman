@@ -63,9 +63,12 @@ pub(super) fn yaml_quote(s: &str) -> String {
 
 /// The value of the last `--model`/`-m` after `--`, as a word or
 /// `=`-joined, the forms `has_flag` takes; yargs keeps the last too.
+/// Nothing after a second `--` counts, as in `has_forwarded_model_flag`.
 pub(super) fn forwarded_model(extra_args: &[String]) -> Option<&str> {
     let mut found = None;
-    let mut args = extra_args.iter().map(String::as_str);
+    let mut args = super::before_terminator(extra_args)
+        .iter()
+        .map(String::as_str);
     while let Some(a) = args.next() {
         match a {
             "--model" | "-m" => found = args.next().or(found),
@@ -373,6 +376,12 @@ mod tests {
         assert_eq!(forwarded_model(&args(&["-p", "x"])), None);
         assert_eq!(forwarded_model(&args(&["--model"])), None);
         assert_eq!(forwarded_model(&args(&["--model="])), None);
+        // After a second `--` it is not a flag.
+        assert_eq!(forwarded_model(&args(&["--", "--model", "c"])), None);
+        assert_eq!(
+            forwarded_model(&args(&["--model", "b", "--", "--model", "c"])),
+            Some("b")
+        );
     }
 
     /// Comments go, as `strip-json-comments` takes them out for Qwen Code,
