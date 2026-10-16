@@ -41,6 +41,7 @@ mod goose;
 mod goose_desktop;
 mod grok;
 mod hermes;
+mod kimi;
 mod omp;
 mod openclaw;
 mod opencode;
@@ -509,7 +510,7 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 
 /// Integrations `--provider` cannot drive, and why.
 ///
-/// `launch_simple` only exports `OLLAMA_HOST`: it never passes a model,
+/// `kimi::launch_kimi` only exports `OLLAMA_HOST`: it never passes a model,
 /// so Kimi picks its own and the provider-routed reference never reaches
 /// the daemon.
 /// Refusing is the same call the catalog filter makes — a
@@ -1182,7 +1183,7 @@ fn launch(
         "aider" => aider::launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
         "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args),
-        "kimi" => launch_simple("kimi", model, extra_args),
+        "kimi" => kimi::launch_kimi(extra_args),
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
         "hermes" => hermes::launch_hermes(model, vision, extra_args),
@@ -1428,13 +1429,6 @@ fn served_context_window(env: Option<u32>, trained: Option<u64>) -> Option<u64> 
         Some(explicit) => Some(u64::from(explicit)),
         None => trained.map(|trained| trained.min(u64::from(super::serve::DEFAULT_CTX_SIZE))),
     }
-}
-
-/// Generic launcher: just set OLLAMA_HOST and run the binary.
-fn launch_simple(binary: &str, _model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path(binary).ok_or_else(|| anyhow::anyhow!("{binary} is not installed"))?;
-    let server = server();
-    exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", server.as_str())])
 }
 
 // ---------------------------------------------------------------------------
