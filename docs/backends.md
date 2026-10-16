@@ -7,6 +7,7 @@ already exists for the model format it finds, and runs it unmodified.
 |--------------|---------|---------------------|
 | GGUF | `llama-server` in a container | `--runtime docker` / `podman` (Linux only; what `auto` tries first): the `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for your GPU |
 | GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | `--runtime bin`: a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached; `--runtime path`: the one on your `PATH` |
+| GGUF (ds4's own) | [`ds4-server`](https://github.com/antirez/ds4) | Your `PATH`, with `LLMMAN_GGUF_ENGINE=ds4` |
 | safetensors | `vllm` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
@@ -237,6 +238,42 @@ With `--runtime docker` (or `podman`) and `LLMMAN_SAFETENSORS_ENGINE=sglang`,
 safetensors model when the variable is set. `CUDA_VISIBLE_DEVICES` and
 friends plus every `SGLANG_*` variable are forwarded into the container,
 which runs with `--ipc=host` like vLLM's.
+
+## ds4
+
+`LLMMAN_GGUF_ENGINE=ds4` sends GGUF models to
+[ds4](https://github.com/antirez/ds4)'s `ds4-server` instead of
+llama-server. ds4 is a native engine for DeepSeek V4 Flash and a few other
+models on Metal, CUDA and ROCm. It is not a general GGUF runner: it loads
+only the GGUFs the ds4 project publishes. ds4 has no release binaries.
+Build it with the `make` target for your GPU, then put `ds4-server` on
+`PATH`. A symlink into the checkout works:
+
+```sh
+git clone https://github.com/antirez/ds4 && cd ds4 && make
+ln -s "$PWD/ds4-server" ~/.local/bin/ds4-server
+LLMMAN_GGUF_ENGINE=ds4 llmman serve
+llmman run hf.co/antirez/qwen3.8-flash-next-gguf:Q2 "hello"
+```
+
+`llmman pull` skips files with `imatrix` in their name, which includes
+the DeepSeek V4 Flash builds ds4 recommends. Download one with ds4's
+`./download_model.sh ds4f-q2`, move the file into a directory of its own,
+and package it with `llmman build -t ds4f:q2 <dir>`.
+
+llmman runs `ds4-server -m <gguf> --host 127.0.0.1 --port <port> --chdir
+<dir>`, where `<dir>` is the directory of the binary `PATH`'s
+`ds4-server` resolves to; ds4 reads its Metal kernel sources relative to
+it. For a `ds4-server` copied out of the
+checkout, name the checkout with `LLMMAN_DS4_ARGS="--chdir
+/path/to/ds4"` (the last `--chdir` wins). Embedding and decision models
+stay on llama-server, since ds4 serves neither. A model's mmproj is
+passed as `--vision`. `LLMMAN_CONTEXT_LENGTH` is forwarded as `--ctx` under the
+same rule as vLLM's; unset, ds4 uses its own default (32768).
+`LLMMAN_DS4_ARGS` appends anything else, such as `--ssd-streaming` for a
+model larger than memory, or `--batched-session 4`. ds4 has no container
+image, so it runs from `PATH` under every `--runtime`. A failed load is
+not retried with a smaller context. `llmman ps` shows `ds4 (local)`.
 
 ## MLX (macOS)
 

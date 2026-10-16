@@ -1407,6 +1407,30 @@ fn a_loads_window_is_the_one_its_own_engine_was_given() {
         loaded_context_window(Engine::Mlx, Some(8_192), Some(8_192), None, true),
         None
     );
+    // ds4 gets --ctx under vLLM's rule.
+    assert_eq!(
+        loaded_context_window(Engine::Ds4, Some(65_536), Some(1_048_576), None, true),
+        Some(65_536)
+    );
+    assert_eq!(
+        loaded_context_window(Engine::Ds4, Some(262_144), Some(1_048_576), None, false),
+        None
+    );
+}
+
+/// ds4-server has no `/health`; it only listens once loaded.
+#[test]
+fn only_ds4_is_probed_somewhere_other_than_health() {
+    assert_eq!(Engine::Ds4.ready_path(), "/v1/models");
+    for engine in [
+        Engine::LlamaServer,
+        Engine::Vllm,
+        Engine::VllmOmni,
+        Engine::Sglang,
+        Engine::Mlx,
+    ] {
+        assert_eq!(engine.ready_path(), "/health");
+    }
 }
 
 /// The loaded window, not the daemon-wide default, is what a pair is
@@ -2066,6 +2090,7 @@ async fn the_engine_label_names_the_engine_not_the_runtime() {
         (Engine::VllmOmni, "vllm-omni"),
         (Engine::Sglang, "sglang"),
         (Engine::Mlx, "mlx"),
+        (Engine::Ds4, "ds4"),
     ] {
         assert_eq!(
             running_model_fixture_with_engine(engine, None).engine_label(),
@@ -2095,6 +2120,10 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
             "mlx-model".into(),
             running_model_fixture_with_engine(Engine::Mlx, Some("/cache/mlx-model/abcd")),
         );
+        mgr.running.insert(
+            "ds4-model".into(),
+            running_model_fixture_with_engine(Engine::Ds4, None),
+        );
     }
 
     assert_eq!(
@@ -2104,6 +2133,10 @@ async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() 
     assert_eq!(
         backend_wire_model(&state, &Target::Local(0), "vllm-model").await,
         "vllm-model"
+    );
+    assert_eq!(
+        backend_wire_model(&state, &Target::Local(0), "ds4-model").await,
+        "ds4-model"
     );
     // sglang: the colon-free --served-model-name (see sglang_served_model_name).
     assert_eq!(
