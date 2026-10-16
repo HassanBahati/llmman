@@ -57,12 +57,12 @@ mod usage;
 mod webui;
 
 use backend::{
-    find_free_port, gguf_engine_from_env, gguf_goes_to_ds4, safetensors_engine_from_env,
-    sglang_serve_args_from_env, sglang_served_model_name, spawn_ds4_server, spawn_llama_server,
-    spawn_mlx_server, spawn_sglang_server, spawn_vllm_omni_server, spawn_vllm_server,
-    tail_child_output, use_mlx_for_safetensors, vllm_max_model_len, vllm_omni_serve_args_from_env,
-    vllm_serve_args_from_env, wait_for_ready, GgufEngine, OutputTail, SafetensorsEngine,
-    POLL_INTERVAL,
+    ds4_context_length, find_free_port, gguf_engine_from_env, gguf_goes_to_ds4,
+    safetensors_engine_from_env, sglang_serve_args_from_env, sglang_served_model_name,
+    spawn_ds4_server, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
+    spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
+    vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
+    GgufEngine, OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
@@ -356,7 +356,7 @@ struct RunningModel {
     /// [`loaded_context_window`], which resolves it per engine. `None`
     /// only where the backend was left to pick its own (`Engine::Mlx`,
     /// a vLLM with no explicit length, a GGUF whose header names no
-    /// trained context).
+    /// trained context). `Engine::Ds4` records the window ds4 reports.
     ///
     /// Read by `hybrid::local_budget`, which would otherwise budget a
     /// pair against the daemon-wide default — many times this window
@@ -2120,7 +2120,12 @@ async fn resolve_target(
         let safetensors_engine = safetensors_engine_from_env();
         let ds4 = gguf_goes_to_ds4(gguf_engine_from_env(), embedding_ctx.is_some(), decision);
         // May fetch llama.cpp if startup could not (runtime::Lazy).
-        let ociman = state.0.runtime.ociman().await?;
+        // Skipped for ds4, which uses neither llama.cpp nor a container.
+        let ociman = if ds4 {
+            None
+        } else {
+            state.0.runtime.ociman().await?
+        };
         process = match (&model_path, ociman) {
             // ds4 has no container image, so it runs from PATH under any
             // runtime. Not OOM-retryable: those fallbacks are
@@ -2346,13 +2351,20 @@ async fn resolve_target(
         Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni | Engine::Ds4 => None,
     };
     // `ctx_size` carries any shrink the retry loop above applied.
-    let context_window = loaded_context_window(
+    let configured_window = loaded_context_window(
         process.engine(),
         ctx_size,
         trained_ctx,
         num_parallel,
         state.0.ctx_size_explicit,
     );
+    // ds4 reports its window, including the default it uses without --ctx.
+    let context_window = match process.engine() {
+        Engine::Ds4 => ds4_context_length(&state.0.client, port)
+            .await
+            .or(configured_window),
+        _ => configured_window,
+    };
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
