@@ -2118,7 +2118,12 @@ async fn resolve_target(
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
-        let ds4 = gguf_goes_to_ds4(gguf_engine_from_env(), embedding_ctx.is_some(), decision);
+        let ds4 = gguf_goes_to_ds4(
+            gguf_engine_from_env(),
+            &model_path,
+            embedding_ctx.is_some(),
+            decision,
+        );
         // May fetch llama.cpp if startup could not (runtime::Lazy).
         // Skipped for ds4, which uses neither llama.cpp nor a container.
         let ociman = if ds4 {

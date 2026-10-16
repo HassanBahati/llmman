@@ -98,11 +98,17 @@ pub(super) fn gguf_engine_from_env() -> GgufEngine {
     )
 }
 
-/// Whether a GGUF load goes to `ds4-server` under `engine`. Embedding
-/// and decision models stay on llama-server: ds4 has no
-/// `/v1/embeddings` or `/v1/systemone`.
-pub(super) fn gguf_goes_to_ds4(engine: GgufEngine, embedding: bool, decision: bool) -> bool {
-    engine == GgufEngine::Ds4 && !embedding && !decision
+/// Whether `model` goes to `ds4-server` under `engine`: only a
+/// [`ModelPath::Gguf`], so every other format keeps its own engine and
+/// runtime. Embedding and decision models stay on llama-server: ds4 has
+/// no `/v1/embeddings` or `/v1/systemone`.
+pub(super) fn gguf_goes_to_ds4(
+    engine: GgufEngine,
+    model: &ModelPath,
+    embedding: bool,
+    decision: bool,
+) -> bool {
+    engine == GgufEngine::Ds4 && matches!(model, ModelPath::Gguf(..)) && !embedding && !decision
 }
 
 /// `parse` on the environment variable `var`, warning once through
@@ -649,7 +655,8 @@ pub(super) fn ds4_server_args(
 
 /// Spawns the `ds4-server` on `PATH` with `--chdir` set to the directory
 /// of the binary it resolves to, so a symlink into a ds4 checkout finds
-/// its kernels. A single process, so `kill_on_drop` alone stops it.
+/// its kernels. The model paths are made absolute, since ds4 opens them
+/// after that `chdir`. A single process, so `kill_on_drop` alone stops it.
 pub(super) async fn spawn_ds4_server(
     model: &Path,
     vision: Option<&Path>,
@@ -667,9 +674,14 @@ pub(super) async fn spawn_ds4_server(
     let dir = resolved
         .parent()
         .with_context(|| format!("{} has no parent directory", resolved.display()))?;
+    let absolute =
+        |p: &Path| std::fs::canonicalize(p).with_context(|| format!("resolve {}", p.display()));
+    let model = absolute(model)?;
+    let vision = vision.map(absolute).transpose()?;
     let mut args = ds4_server_args(
         model.to_str().context("non-UTF-8 model path")?,
         vision
+            .as_deref()
             .map(|p| p.to_str().context("non-UTF-8 mmproj path"))
             .transpose()?,
         dir.to_str().context("non-UTF-8 ds4-server path")?,
@@ -680,6 +692,28 @@ pub(super) async fn spawn_ds4_server(
     let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args).kill_on_drop(true);
     spawn_piped(cmd, &resolved, "ds4-server")
+}
+
+/// The context window a running ds4-server reports in `GET /v1/models`:
+/// its `--ctx`, or its default.
+pub(super) async fn ds4_context_length(client: &Client, port: u16) -> Option<u32> {
+    let body: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    ds4_models_context_length(&body)
+}
+
+/// `data[0].context_length` of a ds4 `/v1/models` body, if positive.
+/// Every entry is an alias of the one loaded model, so they share it.
+fn ds4_models_context_length(body: &serde_json::Value) -> Option<u32> {
+    let n = body.get("data")?.get(0)?.get("context_length")?.as_u64()?;
+    u32::try_from(n).ok().filter(|n| *n > 0)
 }
 
 /// Longest [`vllm_has_omni_plugin`] waits before assuming yes.
@@ -1146,10 +1180,18 @@ mod tests {
 
     #[test]
     fn only_generation_ggufs_go_to_ds4() {
-        assert!(gguf_goes_to_ds4(GgufEngine::Ds4, false, false));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, true, false));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, false, true));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Auto, false, false));
+        let gguf = ModelPath::Gguf(PathBuf::from("/m/ds4.gguf"), None);
+        assert!(gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, false));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, true, false));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, true));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Auto, &gguf, false, false));
+        // Other formats keep their own engine and container runtime.
+        for other in [
+            ModelPath::SafeTensors(PathBuf::from("/m/st")),
+            ModelPath::Omni(PathBuf::from("/m/omni")),
+        ] {
+            assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &other, false, false));
+        }
     }
 
     #[test]
@@ -1182,6 +1224,23 @@ mod tests {
         assert_eq!(
             &args[8..],
             ["--vision", "/m/encoder.gguf", "--ctx", "65536"]
+        );
+    }
+
+    #[test]
+    fn ds4_models_context_length_reads_the_first_alias() {
+        let body = serde_json::json!({"object": "list", "data": [
+            {"id": "deepseek-v4-flash", "context_length": 32768},
+            {"id": "deepseek-v4-pro", "context_length": 32768},
+        ]});
+        assert_eq!(ds4_models_context_length(&body), Some(32_768));
+        assert_eq!(
+            ds4_models_context_length(&serde_json::json!({"data": []})),
+            None
+        );
+        assert_eq!(
+            ds4_models_context_length(&serde_json::json!({"data": [{"context_length": 0}]})),
+            None
         );
     }
 
