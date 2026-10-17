@@ -57,11 +57,12 @@ mod usage;
 mod webui;
 
 use backend::{
-    find_free_port, safetensors_engine_from_env, sglang_serve_args_from_env,
-    sglang_served_model_name, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
+    ds4_context_length, find_free_port, gguf_engine_from_env, gguf_goes_to_ds4,
+    safetensors_engine_from_env, sglang_serve_args_from_env, sglang_served_model_name,
+    spawn_ds4_server, spawn_llama_server, spawn_mlx_server, spawn_sglang_server,
     spawn_vllm_omni_server, spawn_vllm_server, tail_child_output, use_mlx_for_safetensors,
     vllm_max_model_len, vllm_omni_serve_args_from_env, vllm_serve_args_from_env, wait_for_ready,
-    OutputTail, SafetensorsEngine, POLL_INTERVAL,
+    GgufEngine, OutputTail, SafetensorsEngine, POLL_INTERVAL,
 };
 pub use backend::{GPU_VISIBLE_DEVICE_VARS, LLAMA_CPP_ENV_PASSTHROUGH_VARS};
 use config::{
@@ -124,6 +125,8 @@ Environment Variables:
       LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
+      LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 for ds4-server on PATH (default: llama-server)
+      LLMMAN_DS4_ARGS                Extra whitespace-separated arguments appended to every ds4-server launch (e.g. \"--ssd-streaming\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
@@ -353,7 +356,7 @@ struct RunningModel {
     /// [`loaded_context_window`], which resolves it per engine. `None`
     /// only where the backend was left to pick its own (`Engine::Mlx`,
     /// a vLLM with no explicit length, a GGUF whose header names no
-    /// trained context).
+    /// trained context). `Engine::Ds4` records the window ds4 reports.
     ///
     /// Read by `hybrid::local_budget`, which would otherwise budget a
     /// pair against the daemon-wide default — many times this window
@@ -425,6 +428,9 @@ enum Engine {
     /// `"model"` field than every other one (handled by
     /// [`backend_wire_model`]), not anything here.
     Mlx,
+    /// `ds4-server` ([antirez/ds4](https://github.com/antirez/ds4)) for a
+    /// [`ModelPath::Gguf`] load [`gguf_goes_to_ds4`] accepts.
+    Ds4,
 }
 
 impl Engine {
@@ -437,6 +443,17 @@ impl Engine {
             Engine::VllmOmni => "vllm-omni",
             Engine::Sglang => "sglang",
             Engine::Mlx => "mlx",
+            Engine::Ds4 => "ds4",
+        }
+    }
+
+    /// The path `wait_for_ready` polls for a 2xx. ds4-server has no
+    /// `/health`, but only listens once its model is loaded, so its
+    /// `/v1/models` answering means ready.
+    fn ready_path(self) -> &'static str {
+        match self {
+            Engine::Ds4 => "/v1/models",
+            _ => "/health",
         }
     }
 }
@@ -508,7 +525,8 @@ impl Drop for ModelProcess {
             // so the plain default `kill_on_drop` SIGKILL to just this
             // one pid is already sufficient; nothing extra to do here.
             ModelProcess::Local(Engine::Mlx, _, _) => {}
-            ModelProcess::Local(Engine::LlamaServer, _, _) => {}
+            // Single processes, like mlx_lm.server above.
+            ModelProcess::Local(Engine::LlamaServer | Engine::Ds4, _, _) => {}
         }
     }
 }
@@ -2100,9 +2118,29 @@ async fn resolve_target(
         let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
         // Per load, like use_mlx_for_safetensors, which it gates.
         let safetensors_engine = safetensors_engine_from_env();
+        let ds4 = gguf_goes_to_ds4(
+            gguf_engine_from_env(),
+            &model_path,
+            embedding_ctx.is_some(),
+            decision,
+        );
         // May fetch llama.cpp if startup could not (runtime::Lazy).
-        let ociman = state.0.runtime.ociman().await?;
+        // Skipped for ds4, which uses neither llama.cpp nor a container.
+        let ociman = if ds4 {
+            None
+        } else {
+            state.0.runtime.ociman().await?
+        };
         process = match (&model_path, ociman) {
+            // ds4 has no container image, so it runs from PATH under any
+            // runtime. Not OOM-retryable: those fallbacks are
+            // llama-server flags.
+            (ModelPath::Gguf(path, mmproj), _) if ds4 => {
+                let (child, tail) =
+                    spawn_ds4_server(path, mmproj.as_deref(), port, max_model_len).await?;
+                stderr_tail = Some(tail);
+                ModelProcess::Local(Engine::Ds4, child, None)
+            }
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => {
                 let mut child = crate::container::spawn(
                     ociman,
@@ -2315,16 +2353,23 @@ async fn resolve_target(
     let backend_model_path = match process.engine() {
         Engine::Mlx => model_path.path().to_str().map(|s| s.to_string()),
         Engine::Sglang => Some(sglang_served_model_name(model_ref)),
-        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni => None,
+        Engine::LlamaServer | Engine::Vllm | Engine::VllmOmni | Engine::Ds4 => None,
     };
     // `ctx_size` carries any shrink the retry loop above applied.
-    let context_window = loaded_context_window(
+    let configured_window = loaded_context_window(
         process.engine(),
         ctx_size,
         trained_ctx,
         num_parallel,
         state.0.ctx_size_explicit,
     );
+    // ds4 reports its window, including the default it uses without --ctx.
+    let context_window = match process.engine() {
+        Engine::Ds4 => ds4_context_length(&state.0.client, port)
+            .await
+            .or(configured_window),
+        _ => configured_window,
+    };
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
@@ -2378,7 +2423,9 @@ fn loaded_context_window(
             trained_ctx.map(|trained| trained / num_parallel.unwrap_or(1))
         }
         Engine::LlamaServer => ctx_size,
-        Engine::Vllm | Engine::Sglang => vllm_max_model_len(ctx_size, ctx_size_explicit),
+        Engine::Vllm | Engine::Sglang | Engine::Ds4 => {
+            vllm_max_model_len(ctx_size, ctx_size_explicit)
+        }
         // `vllm_omni_serve_args` passes no `--max-model-len` at all, so
         // the Omni engine's window is its own, like MLX's.
         Engine::VllmOmni | Engine::Mlx => None,
@@ -4151,6 +4198,12 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         eprintln!(
             "[llmman] safetensors models go to {engine} ({})",
             backend::SAFETENSORS_ENGINE_VAR
+        );
+    }
+    if gguf_engine_from_env() == GgufEngine::Ds4 {
+        eprintln!(
+            "[llmman] GGUF models go to ds4-server ({})",
+            backend::GGUF_ENGINE_VAR
         );
     }
 

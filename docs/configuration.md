@@ -357,7 +357,7 @@ setting may not behave identically.
 | `LLMMAN_PEER_API_KEY` | The key `llmman serve` presents to its [aggregation](aggregation.md) peers, overriding `[aggregation] api_key`. Defaults to the first of its own keys, so a pool sharing one key set needs nothing more. |
 | `LLMMAN_TLS_CERT` / `LLMMAN_TLS_KEY` | PEM certificate chain and private key; set both and `llmman serve` terminates TLS itself (rustls). Set `LLMMAN_HOST=https://...` too, so the CLI in the same environment connects accordingly. |
 | `LLMMAN_TLS_CA` | A PEM bundle of extra roots to trust, for a private CA: the daemon uses it to reach peers, and the CLI to reach the daemon. |
-| `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM/SGLang when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. |
+| `LLMMAN_CONTEXT_LENGTH` | Context size for llama-server/vLLM/SGLang/ds4 when set. Defaults to `262144` (256k) for llama-server, capped to each model's trained context; backend-specific forwarding is below. |
 | `LLMMAN_HYBRID_LOCAL_BYTES` | Largest request body, in bytes, that a [hybrid model pair](providers.md#hybrid-model-pairs) serves locally; anything larger goes to the hosted half. `0` disables the size rule; a request the local half then refuses as over its context is still retried on the hosted half. Set, it is never overridden by a load; unset, the budget is four bytes per token of the window the local half loaded with, falling back to the daemon's context size until then. |
 | `LLMMAN_KEEP_ALIVE` | The daemon-wide default `keep_alive` (how long an idle, unused model stays loaded before being unloaded). Defaults to 5 minutes. Overridden per-request by `/api/chat`/`/api/generate`'s own `keep_alive` field. |
 | `LLMMAN_MAX_LOADED_MODELS` | Caps how many models this daemon keeps loaded at once, as one flat daemon-wide total (llmman has no per-model memory estimate to size an automatic per-GPU figure against). Once at the cap, the least-recently-used idle model is evicted to make room; if every loaded model is busy, the request gets a `503` instead. Defaults to `0` (unbounded, today's behavior, unchanged). |
@@ -370,6 +370,8 @@ setting may not behave identically.
 | `LLMMAN_VLLM_ARGS` | Extra arguments appended to every `vllm serve` llmman starts (plain and `--omni`, local or in a container), split on whitespace — no quoting, so an argument cannot contain a space. For the engine's own knobs llmman has no flag for: `--dtype bfloat16 --enforce-eager`, `--tp 2`, `--quantization awq`. They come after llmman's own `--served-model-name`/`--max-model-len`, so on vLLM's argparse a repeated flag here wins. |
 | `LLMMAN_MLX_LM_VERSION` | Exact [`mlx-lm`](https://pypi.org/project/mlx-lm/) release llmman installs into its own environment on macOS (`0.31.3`), overriding the repo-root `MLX_LM_RELEASE` pin. |
 | `LLMMAN_SGLANG_ARGS` | The same for every `sglang serve` / `sglang.launch_server` llmman starts: `--disable-cuda-graph`, `--tp 2`, `--quantization mlx_q4`, ... |
+| `LLMMAN_GGUF_ENGINE` | Which engine serves GGUF models: `ds4` (case-insensitive) for the `ds4-server` on `PATH`, under every `--runtime`; embedding and decision models stay on llama-server. Unset (or empty) is llama-server. Any other value is reported once and ignored. See [backends.md](backends.md#ds4). |
+| `LLMMAN_DS4_ARGS` | The same as `LLMMAN_VLLM_ARGS`, for every `ds4-server` llmman starts: `--ssd-streaming`, `--batched-session 4`, ... |
 | `LLMMAN_PEERS` | Comma-separated peer daemons (`[scheme://]host[:port]`) to pool hardware with, overriding `[aggregation]` in `llmman.conf`. Set but empty takes this daemon out of its aggregation. See [aggregation.md](aggregation.md). |
 | `LLMMAN_REGISTRY_MIRRORS` | Comma-separated mirrors (`[scheme://]host[:port][/path]`) to try before Docker Hub for a `docker.io/...` pull, overriding `[registries."docker.io"]` in `llmman.conf`; set but empty removes Hub's mirrors. Hub only, like dockerd's `--registry-mirror`; other registries take theirs from `llmman.conf`. See [registry mirrors](#registry-mirrors). |
 | `LLMMAN_ORIGINS` | A comma-separated list of extra allowed CORS origins for the HTTP API. A single `*` anywhere in an entry matches any substring (`http://host:*` for any port, `https://*.example.com` for any subdomain, a bare `*` for everything), same as Ollama. Always includes every scheme/port on `localhost`/`127.0.0.1`/`0.0.0.0`/`[::1]` regardless of this variable. |
@@ -401,6 +403,7 @@ setting may not behave identically.
 | `vllm serve --omni` | Not forwarded: a diffusion pipeline has no context window. | — |
 | `sglang` | Positive values are passed as `--context-length`, the same rule as vLLM's; oversized values are rejected by SGLang. `0` is not forwarded. | Uses the model's `config.json`. |
 | `mlx_lm.server` | Not currently forwarded. | Uses `mlx_lm.server` defaults. |
+| `ds4-server` | Positive values are passed as `--ctx`, the same rule as vLLM's. `0` is not forwarded. | Uses ds4's own default. |
 
 GPU device-selection variables `llmman serve` forwards to every
 `llama-server` it spawns (local or container):

@@ -1,5 +1,6 @@
 //! The backends `ensure_model` spawns: llama-server (local or in a
-//! container), vLLM and vLLM-Omni, SGLang, and `mlx_lm.server`. Spawning,
+//! container), vLLM and vLLM-Omni, SGLang, `mlx_lm.server`, and
+//! `ds4-server`. Spawning,
 //! the stderr tail that turns a failed load into an error message,
 //! readiness polling, and where the `llama-server` binary itself comes
 //! from.
@@ -51,15 +52,83 @@ pub(super) fn parse_safetensors_engine(value: Option<&str>) -> Option<Safetensor
 /// is reported once and treated as `Auto`.
 pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let raw = std::env::var(SAFETENSORS_ENGINE_VAR).ok();
-    parse_safetensors_engine(raw.as_deref()).unwrap_or_else(|| {
-        WARNED.call_once(|| {
+    engine_from_env(
+        SAFETENSORS_ENGINE_VAR,
+        "one of vllm/sglang",
+        &WARNED,
+        parse_safetensors_engine,
+        SafetensorsEngine::Auto,
+    )
+}
+
+/// `LLMMAN_GGUF_ENGINE`: which engine serves a [`ModelPath::Gguf`] load
+/// (see [`gguf_goes_to_ds4`]). `Auto` (unset) is llama-server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GgufEngine {
+    Auto,
+    /// `ds4-server` — see [`spawn_ds4_server`].
+    Ds4,
+}
+
+pub(super) const GGUF_ENGINE_VAR: &str = "LLMMAN_GGUF_ENGINE";
+
+/// `ds4` (any case); unset or empty is `Auto`; anything else `None`, for
+/// the caller to warn about.
+pub(super) fn parse_gguf_engine(value: Option<&str>) -> Option<GgufEngine> {
+    let value = value.map(str::trim).unwrap_or_default();
+    if value.is_empty() {
+        return Some(GgufEngine::Auto);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "ds4" => Some(GgufEngine::Ds4),
+        _ => None,
+    }
+}
+
+/// [`parse_gguf_engine`] on the environment; an unrecognized value is
+/// reported once and treated as `Auto`.
+pub(super) fn gguf_engine_from_env() -> GgufEngine {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    engine_from_env(
+        GGUF_ENGINE_VAR,
+        "ds4",
+        &WARNED,
+        parse_gguf_engine,
+        GgufEngine::Auto,
+    )
+}
+
+/// Whether `model` goes to `ds4-server` under `engine`: only a
+/// [`ModelPath::Gguf`], so every other format keeps its own engine and
+/// runtime. Embedding and decision models stay on llama-server: ds4 has
+/// no `/v1/embeddings` or `/v1/systemone`.
+pub(super) fn gguf_goes_to_ds4(
+    engine: GgufEngine,
+    model: &ModelPath,
+    embedding: bool,
+    decision: bool,
+) -> bool {
+    engine == GgufEngine::Ds4 && matches!(model, ModelPath::Gguf(..)) && !embedding && !decision
+}
+
+/// `parse` on the environment variable `var`, warning once through
+/// `warned` and falling back to `auto` when it returns `None`.
+fn engine_from_env<T>(
+    var: &str,
+    choices: &str,
+    warned: &std::sync::Once,
+    parse: fn(Option<&str>) -> Option<T>,
+    auto: T,
+) -> T {
+    let raw = std::env::var(var).ok();
+    parse(raw.as_deref()).unwrap_or_else(|| {
+        warned.call_once(|| {
             eprintln!(
-                "[llmman] warning: {SAFETENSORS_ENGINE_VAR}={:?} is not one of vllm/sglang; ignoring it",
+                "[llmman] warning: {var}={:?} is not {choices}; ignoring it",
                 raw.unwrap_or_default()
             );
         });
-        SafetensorsEngine::Auto
+        auto
     })
 }
 
@@ -296,6 +365,9 @@ pub(super) const VLLM_ARGS_VAR: &str = "LLMMAN_VLLM_ARGS";
 
 /// The same for `sglang serve` / `sglang.launch_server`.
 pub(super) const SGLANG_ARGS_VAR: &str = "LLMMAN_SGLANG_ARGS";
+
+/// The same for `ds4-server`.
+pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
 /// Splits an `LLMMAN_*_ARGS` value on whitespace, like `LLMMAN_SHELL` (no
 /// quoting). Appended after llmman's own flags, so a repeated flag wins
@@ -549,6 +621,101 @@ pub(super) async fn spawn_sglang_server(
     spawn_piped(grouped_command(&sglang, args), &sglang, "sglang")
 }
 
+/// argv after `ds4-server`. ds4 resolves its `metal/*.metal` kernel
+/// sources against the working directory, which `--chdir` sets.
+/// `--vision` takes the encoder GGUF llama-server calls `--mmproj`.
+/// `ctx` is [`vllm_max_model_len`]'s value; `None` leaves ds4's default.
+pub(super) fn ds4_server_args(
+    model: &str,
+    vision: Option<&str>,
+    chdir: &str,
+    port: u16,
+    ctx: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-m".into(),
+        model.into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "--chdir".into(),
+        chdir.into(),
+    ];
+    if let Some(vision) = vision {
+        args.push("--vision".into());
+        args.push(vision.into());
+    }
+    if let Some(n) = ctx {
+        args.push("--ctx".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
+/// Spawns the `ds4-server` on `PATH` with `--chdir` set to the directory
+/// of the binary it resolves to, so a symlink into a ds4 checkout finds
+/// its kernels. The model paths are made absolute, since ds4 opens them
+/// after that `chdir`. A single process, so `kill_on_drop` alone stops it.
+pub(super) async fn spawn_ds4_server(
+    model: &Path,
+    vision: Option<&Path>,
+    port: u16,
+    ctx: Option<u32>,
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
+    let ds4 = which_binary("ds4-server").map_err(|e| {
+        anyhow!(
+            "{e} (build it from https://github.com/antirez/ds4 with `make` and put ds4-server \
+             on PATH, or unset {GGUF_ENGINE_VAR} to serve this model with llama-server)"
+        )
+    })?;
+    let resolved =
+        std::fs::canonicalize(&ds4).with_context(|| format!("resolve {}", ds4.display()))?;
+    let dir = resolved
+        .parent()
+        .with_context(|| format!("{} has no parent directory", resolved.display()))?;
+    let absolute =
+        |p: &Path| std::fs::canonicalize(p).with_context(|| format!("resolve {}", p.display()));
+    let model = absolute(model)?;
+    let vision = vision.map(absolute).transpose()?;
+    let mut args = ds4_server_args(
+        model.to_str().context("non-UTF-8 model path")?,
+        vision
+            .as_deref()
+            .map(|p| p.to_str().context("non-UTF-8 mmproj path"))
+            .transpose()?,
+        dir.to_str().context("non-UTF-8 ds4-server path")?,
+        port,
+        ctx,
+    );
+    args.extend(extra_args_from_env(DS4_ARGS_VAR));
+    let mut cmd = tokio::process::Command::new(&resolved);
+    cmd.args(args).kill_on_drop(true);
+    spawn_piped(cmd, &resolved, "ds4-server")
+}
+
+/// The context window a running ds4-server reports in `GET /v1/models`:
+/// its `--ctx`, or its default.
+pub(super) async fn ds4_context_length(client: &Client, port: u16) -> Option<u32> {
+    let body: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    ds4_models_context_length(&body)
+}
+
+/// `data[0].context_length` of a ds4 `/v1/models` body, if positive.
+/// Every entry is an alias of the one loaded model, so they share it.
+fn ds4_models_context_length(body: &serde_json::Value) -> Option<u32> {
+    let n = body.get("data")?.get(0)?.get("context_length")?.as_u64()?;
+    u32::try_from(n).ok().filter(|n| *n > 0)
+}
+
 /// Longest [`vllm_has_omni_plugin`] waits before assuming yes.
 const OMNI_PLUGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -686,27 +853,27 @@ fn parse_load_timeout(value: &str) -> Option<Option<Duration>> {
     })
 }
 
-/// Poll interval between `/health` checks in [`wait_for_ready`].
+/// Poll interval between readiness checks in [`wait_for_ready`].
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How long one `/health` request in [`wait_for_ready`] may take. Longer
+/// How long one readiness request in [`wait_for_ready`] may take. Longer
 /// than [`POLL_INTERVAL`]: SGLang's `/health` runs a one-token generation,
 /// which on CPU takes about as long as the interval — bounded by it, every
 /// poll timed out and the load never became ready (seen in CI).
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Polls `process`'s `/health` endpoint until ready, bailing out early
-/// if `process` itself exits first (so a crash-on-startup doesn't hang
-/// the caller for the whole deadline). `stderr_tail`, when given (every
-/// piped child — see `ensure_model`), includes the crash reason in the
-/// error.
+/// Polls `process`'s readiness endpoint ([`Engine::ready_path`]) until
+/// ready, bailing out early if `process` itself exits first (so a
+/// crash-on-startup doesn't hang the caller for the whole deadline).
+/// `stderr_tail`, when given (every piped child — see `ensure_model`),
+/// includes the crash reason in the error.
 pub(super) async fn wait_for_ready(
     client: &Client,
     port: u16,
     process: &mut ModelProcess,
     stderr_tail: Option<&OutputTail>,
 ) -> anyhow::Result<()> {
-    let url = format!("http://127.0.0.1:{port}/health");
+    let url = format!("http://127.0.0.1:{port}{}", process.engine().ready_path());
     // `None` = wait forever (LLMMAN_LOAD_TIMEOUT of 0 or negative, or a
     // value so large that adding it to `Instant::now()` would overflow
     // — `checked_add`, not `+`, so a huge-but-validly-parsed timeout
@@ -734,13 +901,14 @@ pub(super) async fn wait_for_ready(
             });
         }
         // Bound the request by HEALTH_TIMEOUT, not the full remaining
-        // deadline — otherwise a /health that connects but then stalls
+        // deadline — otherwise a probe that connects but then stalls
         // could occupy up to the whole deadline (or forever, if unset)
         // without rechecking process liveness or the deadline.
         let bound = remaining.map_or(HEALTH_TIMEOUT, |r| r.min(HEALTH_TIMEOUT));
         let attempt_start = Instant::now();
         if let Ok(resp) = client.get(&url).timeout(bound).send().await {
-            // llama-server/vllm: 200 once loaded. mlx_lm.server: 200 as
+            // llama-server/vllm: 200 once loaded. ds4-server only
+            // listens once loaded. mlx_lm.server: 200 as
             // soon as its listener is up, not once a model is loaded
             // (see spawn_mlx_server) — an accepted, documented gap for
             // that one engine only.
@@ -750,7 +918,7 @@ pub(super) async fn wait_for_ready(
         }
         // Only the unused remainder of one POLL_INTERVAL — not another
         // full one on top of whatever the attempt above already took —
-        // so a consistently-stalling /health still gets rechecked every
+        // so a consistently-stalling probe still gets rechecked every
         // POLL_INTERVAL, not every 2x that. Still never past the
         // overall deadline either.
         let sleep_for = POLL_INTERVAL.saturating_sub(attempt_start.elapsed());
@@ -996,6 +1164,84 @@ mod tests {
         // Unknown names are reported by the caller, not silently mapped.
         assert_eq!(parse_safetensors_engine(Some("mlx")), None);
         assert_eq!(parse_safetensors_engine(Some("tgi")), None);
+    }
+
+    #[test]
+    fn parse_gguf_engine_accepts_ds4_or_nothing() {
+        assert_eq!(parse_gguf_engine(None), Some(GgufEngine::Auto));
+        assert_eq!(parse_gguf_engine(Some("")), Some(GgufEngine::Auto));
+        assert_eq!(parse_gguf_engine(Some("  ")), Some(GgufEngine::Auto));
+        assert_eq!(parse_gguf_engine(Some("ds4")), Some(GgufEngine::Ds4));
+        assert_eq!(parse_gguf_engine(Some(" DS4 ")), Some(GgufEngine::Ds4));
+        // Unknown names are reported by the caller, not silently mapped.
+        assert_eq!(parse_gguf_engine(Some("llama-server")), None);
+        assert_eq!(parse_gguf_engine(Some("ds4-server")), None);
+    }
+
+    #[test]
+    fn only_generation_ggufs_go_to_ds4() {
+        let gguf = ModelPath::Gguf(PathBuf::from("/m/ds4.gguf"), None);
+        assert!(gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, false));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, true, false));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, true));
+        assert!(!gguf_goes_to_ds4(GgufEngine::Auto, &gguf, false, false));
+        // Other formats keep their own engine and container runtime.
+        for other in [
+            ModelPath::SafeTensors(PathBuf::from("/m/st")),
+            ModelPath::Omni(PathBuf::from("/m/omni")),
+        ] {
+            assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &other, false, false));
+        }
+    }
+
+    #[test]
+    fn ds4_server_args_load_the_gguf_on_llmmans_port_from_the_ds4_checkout() {
+        let args = ds4_server_args("/m/ds4.gguf", None, "/opt/ds4", 41234, None);
+        assert_eq!(
+            args,
+            [
+                "-m",
+                "/m/ds4.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "41234",
+                "--chdir",
+                "/opt/ds4"
+            ]
+        );
+    }
+
+    #[test]
+    fn ds4_server_args_pass_the_mmproj_as_vision_and_an_explicit_ctx() {
+        let args = ds4_server_args(
+            "/m/ds4.gguf",
+            Some("/m/encoder.gguf"),
+            "/opt/ds4",
+            41234,
+            Some(65_536),
+        );
+        assert_eq!(
+            &args[8..],
+            ["--vision", "/m/encoder.gguf", "--ctx", "65536"]
+        );
+    }
+
+    #[test]
+    fn ds4_models_context_length_reads_the_first_alias() {
+        let body = serde_json::json!({"object": "list", "data": [
+            {"id": "deepseek-v4-flash", "context_length": 32768},
+            {"id": "deepseek-v4-pro", "context_length": 32768},
+        ]});
+        assert_eq!(ds4_models_context_length(&body), Some(32_768));
+        assert_eq!(
+            ds4_models_context_length(&serde_json::json!({"data": []})),
+            None
+        );
+        assert_eq!(
+            ds4_models_context_length(&serde_json::json!({"data": [{"context_length": 0}]})),
+            None
+        );
     }
 
     #[test]

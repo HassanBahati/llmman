@@ -386,7 +386,7 @@ pub(crate) fn record_scheduling_rejection() {
 /// One loaded model's live state, for `llmman_model_up`.
 pub(crate) struct ModelState {
     pub(crate) model: String,
-    /// `llama-server`, `vllm`, `vllm-omni`, `sglang` or `mlx` — see
+    /// `llama-server`, `vllm`, `vllm-omni`, `sglang`, `mlx` or `ds4` — see
     /// `cmd::serve::Engine`.
     pub(crate) engine: &'static str,
     /// Whether the backend process is still alive right now

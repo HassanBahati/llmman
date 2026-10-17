@@ -250,7 +250,9 @@ safetensors by
 [`sglang`](https://github.com/sgl-project/sglang) with
 `LLMMAN_SAFETENSORS_ENGINE=sglang`, or by
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on macOS
-(installed for you when the daemon starts). Tool
+(installed for you when the daemon starts). DeepSeek V4 Flash and the
+other GGUFs [ds4](https://github.com/antirez/ds4) publishes can be
+served by its `ds4-server` instead, with `LLMMAN_GGUF_ENGINE=ds4`. Tool
 calling, vision, structured output, embeddings (GGUF) and the Responses
 API (what Codex speaks) all work; there is a [web UI](docs/webui.md) at
 `/` (chat with any local or hosted model, generate images, video and
