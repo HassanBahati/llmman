@@ -371,8 +371,8 @@ pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
 /// Splits an `LLMMAN_*_ARGS` value on whitespace, like `LLMMAN_SHELL` (no
 /// quoting). Appended after llmman's own flags, so a repeated flag wins
-/// on an argparse engine, except a local engine's `--host` (see
-/// [`force_loopback_host`]).
+/// on an argparse engine, except `--port` and `--host` (see
+/// [`append_extra_args`]).
 pub(super) fn split_extra_args(value: Option<&str>) -> Vec<String> {
     value
         .unwrap_or_default()
@@ -386,30 +386,30 @@ fn extra_args_from_env(var: &str) -> Vec<String> {
     split_extra_args(std::env::var(var).ok().as_deref())
 }
 
-/// Appends `--host 127.0.0.1` after a local engine's `LLMMAN_*_ARGS`.
-/// vllm, sglang and ds4-server keep the last `--host`, so the engine binds
-/// loopback however the extra args spell it (argparse takes abbreviations).
-fn force_loopback_host(args: &mut Vec<String>) {
-    args.extend(["--host".into(), "127.0.0.1".into()]);
+/// Appends `extra` (a split `LLMMAN_*_ARGS`), then `--port port --host
+/// host`. vllm, sglang and ds4-server keep each flag's last value, so
+/// llmman's win however `extra` spells them (argparse takes abbreviations).
+fn append_extra_args(args: &mut Vec<String>, extra: Vec<String>, host: &str, port: u16) {
+    args.extend(extra);
+    args.extend([
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        host.into(),
+    ]);
 }
 
-/// argv after the `vllm` binary, shared with `container::spawn_engine`
-/// (which passes its `/models` mount and `0.0.0.0`) and kept separate so
-/// context forwarding is testable.
+/// argv after the `vllm` binary, without `--port`/`--host` (see
+/// [`vllm_serve_args_from_env`]). Kept separate so context forwarding is
+/// testable.
 pub(super) fn vllm_serve_args(
     model_dir: &str,
-    host: &str,
-    port: u16,
     model_name: &str,
     max_model_len: Option<u32>,
 ) -> Vec<String> {
     let mut args = vec![
         "serve".into(),
         model_dir.into(),
-        "--port".into(),
-        port.to_string(),
-        "--host".into(),
-        host.into(),
         // Register the model under the same name used in API requests so
         // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
         "--served-model-name".into(),
@@ -422,7 +422,9 @@ pub(super) fn vllm_serve_args(
     args
 }
 
-/// [`vllm_serve_args`] plus `LLMMAN_VLLM_ARGS`.
+/// [`vllm_serve_args`] plus `LLMMAN_VLLM_ARGS`, `--port` and `--host` (see
+/// [`append_extra_args`]). Shared with `container::spawn_engine`, which
+/// passes its `/models` mount and `0.0.0.0`.
 pub(super) fn vllm_serve_args_from_env(
     model_dir: &str,
     host: &str,
@@ -430,8 +432,8 @@ pub(super) fn vllm_serve_args_from_env(
     model_name: &str,
     max_model_len: Option<u32>,
 ) -> Vec<String> {
-    let mut args = vllm_serve_args(model_dir, host, port, model_name, max_model_len);
-    args.extend(extra_args_from_env(VLLM_ARGS_VAR));
+    let mut args = vllm_serve_args(model_dir, model_name, max_model_len);
+    append_extra_args(&mut args, extra_args_from_env(VLLM_ARGS_VAR), host, port);
     args
 }
 
@@ -453,14 +455,13 @@ pub(super) async fn spawn_vllm_server(
     max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
-    let mut args = vllm_serve_args_from_env(
+    let args = vllm_serve_args_from_env(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
         max_model_len,
     );
-    force_loopback_host(&mut args);
     let mut cmd = grouped_command(&vllm, args);
     crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
     cmd.spawn()
@@ -483,13 +484,11 @@ const VLLM_OMNI_GUARDRAILS_VAR: &str = "LLMMAN_VLLM_OMNI_GUARDRAILS";
 /// (10 minutes) does not give up first.
 fn vllm_omni_serve_args(
     model_dir: &str,
-    host: &str,
-    port: u16,
     model_name: &str,
     guardrails: bool,
     init_timeout: Duration,
 ) -> Vec<String> {
-    let mut args = vllm_serve_args(model_dir, host, port, model_name, None);
+    let mut args = vllm_serve_args(model_dir, model_name, None);
     args.push("--omni".into());
     if !guardrails {
         args.push("--no-guardrails".into());
@@ -499,8 +498,9 @@ fn vllm_omni_serve_args(
     args
 }
 
-/// [`vllm_omni_serve_args`] from the environment, plus `LLMMAN_VLLM_ARGS`;
-/// an unbounded `LLMMAN_LOAD_TIMEOUT` becomes a day.
+/// [`vllm_omni_serve_args`] from the environment, plus `LLMMAN_VLLM_ARGS`,
+/// `--port` and `--host` (see [`append_extra_args`]); an unbounded
+/// `LLMMAN_LOAD_TIMEOUT` becomes a day.
 pub(super) fn vllm_omni_serve_args_from_env(
     model_dir: &str,
     host: &str,
@@ -509,9 +509,8 @@ pub(super) fn vllm_omni_serve_args_from_env(
 ) -> Vec<String> {
     let guardrails = crate::env_flag_set(VLLM_OMNI_GUARDRAILS_VAR);
     let init_timeout = load_timeout_from_env().unwrap_or(Duration::from_secs(24 * 3600));
-    let mut args =
-        vllm_omni_serve_args(model_dir, host, port, model_name, guardrails, init_timeout);
-    args.extend(extra_args_from_env(VLLM_ARGS_VAR));
+    let mut args = vllm_omni_serve_args(model_dir, model_name, guardrails, init_timeout);
+    append_extra_args(&mut args, extra_args_from_env(VLLM_ARGS_VAR), host, port);
     args
 }
 
@@ -530,13 +529,12 @@ pub(super) async fn spawn_vllm_omni_server(
             vllm.display()
         );
     }
-    let mut args = vllm_omni_serve_args_from_env(
+    let args = vllm_omni_serve_args_from_env(
         model_dir.to_str().context("non-UTF-8 model path")?,
         "127.0.0.1",
         port,
         model_name,
     );
-    force_loopback_host(&mut args);
     spawn_piped(grouped_command(&vllm, args), &vllm, "vllm --omni")
 }
 
@@ -571,18 +569,12 @@ pub(super) fn sglang_served_model_name(model_ref: &str) -> String {
 /// fed by the [`vllm_max_model_len`] rule.
 pub(super) fn sglang_serve_args(
     model_dir: &str,
-    host: &str,
-    port: u16,
     model_name: &str,
     context_length: Option<u32>,
 ) -> Vec<String> {
     let mut args = vec![
         "--model-path".into(),
         model_dir.into(),
-        "--port".into(),
-        port.to_string(),
-        "--host".into(),
-        host.into(),
         "--served-model-name".into(),
         sglang_served_model_name(model_name),
     ];
@@ -593,7 +585,8 @@ pub(super) fn sglang_serve_args(
     args
 }
 
-/// [`sglang_serve_args`] plus `LLMMAN_SGLANG_ARGS`.
+/// [`sglang_serve_args`] plus `LLMMAN_SGLANG_ARGS`, `--port` and `--host`
+/// (see [`append_extra_args`]).
 pub(super) fn sglang_serve_args_from_env(
     model_dir: &str,
     host: &str,
@@ -601,8 +594,8 @@ pub(super) fn sglang_serve_args_from_env(
     model_name: &str,
     context_length: Option<u32>,
 ) -> Vec<String> {
-    let mut args = sglang_serve_args(model_dir, host, port, model_name, context_length);
-    args.extend(extra_args_from_env(SGLANG_ARGS_VAR));
+    let mut args = sglang_serve_args(model_dir, model_name, context_length);
+    append_extra_args(&mut args, extra_args_from_env(SGLANG_ARGS_VAR), host, port);
     args
 }
 
@@ -628,7 +621,6 @@ pub(super) async fn spawn_sglang_server(
         model_name,
         context_length,
     ));
-    force_loopback_host(&mut args);
     spawn_piped(grouped_command(&sglang, args), &sglang, "sglang")
 }
 
@@ -640,19 +632,9 @@ pub(super) fn ds4_server_args(
     model: &str,
     vision: Option<&str>,
     chdir: &str,
-    port: u16,
     ctx: Option<u32>,
 ) -> Vec<String> {
-    let mut args = vec![
-        "-m".into(),
-        model.into(),
-        "--host".into(),
-        "127.0.0.1".into(),
-        "--port".into(),
-        port.to_string(),
-        "--chdir".into(),
-        chdir.into(),
-    ];
+    let mut args = vec!["-m".into(), model.into(), "--chdir".into(), chdir.into()];
     if let Some(vision) = vision {
         args.push("--vision".into());
         args.push(vision.into());
@@ -661,6 +643,25 @@ pub(super) fn ds4_server_args(
         args.push("--ctx".into());
         args.push(n.to_string());
     }
+    args
+}
+
+/// [`ds4_server_args`] plus `LLMMAN_DS4_ARGS`, `--port` and `--host
+/// 127.0.0.1` (see [`append_extra_args`]).
+pub(super) fn ds4_server_args_from_env(
+    model: &str,
+    vision: Option<&str>,
+    chdir: &str,
+    port: u16,
+    ctx: Option<u32>,
+) -> Vec<String> {
+    let mut args = ds4_server_args(model, vision, chdir, ctx);
+    append_extra_args(
+        &mut args,
+        extra_args_from_env(DS4_ARGS_VAR),
+        "127.0.0.1",
+        port,
+    );
     args
 }
 
@@ -689,7 +690,7 @@ pub(super) async fn spawn_ds4_server(
         |p: &Path| std::fs::canonicalize(p).with_context(|| format!("resolve {}", p.display()));
     let model = absolute(model)?;
     let vision = vision.map(absolute).transpose()?;
-    let mut args = ds4_server_args(
+    let args = ds4_server_args_from_env(
         model.to_str().context("non-UTF-8 model path")?,
         vision
             .as_deref()
@@ -699,8 +700,6 @@ pub(super) async fn spawn_ds4_server(
         port,
         ctx,
     );
-    args.extend(extra_args_from_env(DS4_ARGS_VAR));
-    force_loopback_host(&mut args);
     let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(args).kill_on_drop(true);
     spawn_piped(cmd, &resolved, "ds4-server")
@@ -1085,13 +1084,7 @@ mod tests {
             (Some(4096), Some("4096")),
             (None, None),
         ] {
-            let args = vllm_serve_args(
-                "/models/qwen",
-                "127.0.0.1",
-                8000,
-                "qwen3.5:0.8b",
-                max_model_len,
-            );
+            let args = vllm_serve_args("/models/qwen", "qwen3.5:0.8b", max_model_len);
             let pos = args.iter().position(|arg| arg == "--max-model-len");
 
             match expected {
@@ -1104,38 +1097,100 @@ mod tests {
         }
     }
 
-    /// Local and container `vllm serve` argv differ only in dir and host.
+    /// Whatever `LLMMAN_*_ARGS` holds, every builder ends with llmman's
+    /// `--port` and `--host`.
     #[test]
-    fn vllm_serve_args_differ_between_local_and_container_only_in_dir_and_host() {
-        let local = vllm_serve_args("/cache/abc/model", "127.0.0.1", 8000, "m", Some(4096));
-        let container = vllm_serve_args("/models", "0.0.0.0", 8000, "m", Some(4096));
-        assert_eq!(local[0], "serve");
-        assert_eq!(local[1], "/cache/abc/model");
-        assert_eq!(container[1], "/models");
-        let host = |args: &[String]| {
-            let i = args.iter().position(|a| a == "--host").unwrap();
-            args[i + 1].clone()
+    fn every_builder_ends_with_llmmans_port_and_host() {
+        let tail = |args: Vec<String>| args[args.len() - 4..].to_vec();
+        fn expect(host: &str) -> Vec<&str> {
+            vec!["--port", "41234", "--host", host]
+        }
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            assert_eq!(
+                tail(vllm_serve_args_from_env("/m", host, 41234, "m", Some(4096))),
+                expect(host)
+            );
+            assert_eq!(
+                tail(vllm_omni_serve_args_from_env("/m", host, 41234, "m")),
+                expect(host)
+            );
+            assert_eq!(
+                tail(sglang_serve_args_from_env(
+                    "/m",
+                    host,
+                    41234,
+                    "m",
+                    Some(4096)
+                )),
+                expect(host)
+            );
+        }
+        assert_eq!(
+            tail(ds4_server_args_from_env(
+                "/m.gguf", None, "/opt/ds4", 41234, None
+            )),
+            expect("127.0.0.1")
+        );
+    }
+
+    /// Local and container argv differ only in the model dir and the final
+    /// `--host`.
+    #[test]
+    fn local_and_container_argv_differ_only_in_dir_and_host() {
+        fn without_dir_and_host(mut args: Vec<String>) -> Vec<String> {
+            args.remove(1);
+            args.pop();
+            args
+        }
+        let pair = |build: &dyn Fn(&str, &str) -> Vec<String>| {
+            let local = build("/cache/abc/model", "127.0.0.1");
+            let container = build("/models", "0.0.0.0");
+            assert_eq!(
+                (local[1].as_str(), container[1].as_str()),
+                ("/cache/abc/model", "/models")
+            );
+            assert_eq!(without_dir_and_host(local), without_dir_and_host(container));
         };
-        assert_eq!(host(&local), "127.0.0.1");
-        assert_eq!(host(&container), "0.0.0.0");
-        let rest = |args: &[String]| {
-            let i = args.iter().position(|a| a == "--host").unwrap();
-            [&args[2..i], &args[i + 2..]].concat()
-        };
-        assert_eq!(rest(&local), rest(&container));
+        pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096)));
+        pair(&|dir, host| vllm_omni_serve_args_from_env(dir, host, 8000, "m"));
+        pair(&|dir, host| sglang_serve_args_from_env(dir, host, 30000, "m", Some(4096)));
+    }
+
+    #[test]
+    fn llmmans_port_and_host_follow_the_extra_args() {
+        let mut args = Vec::new();
+        append_extra_args(
+            &mut args,
+            split_extra_args(Some("--por 1 --hos 127.0.0.1 --tp 2")),
+            "0.0.0.0",
+            41234,
+        );
+        assert_eq!(
+            args,
+            [
+                "--por",
+                "1",
+                "--hos",
+                "127.0.0.1",
+                "--tp",
+                "2",
+                "--port",
+                "41234",
+                "--host",
+                "0.0.0.0"
+            ]
+        );
     }
 
     #[test]
     fn vllm_omni_serve_args_add_omni_and_disable_guardrails_by_default() {
         let args = vllm_omni_serve_args(
             "/models",
-            "0.0.0.0",
-            8000,
             "nvidia/Cosmos3-Edge",
             false,
             Duration::from_secs(600),
         );
-        // vllm-omni's own recipe: `vllm serve <model> --omni --host --port`
+        // vllm-omni's own recipe: `vllm serve <model> --omni`
         assert_eq!(args[0], "serve");
         assert_eq!(args[1], "/models");
         assert!(args.contains(&"--omni".to_string()));
@@ -1153,7 +1208,7 @@ mod tests {
 
     #[test]
     fn vllm_omni_serve_args_keep_guardrails_when_asked() {
-        let args = vllm_omni_serve_args("/m", "127.0.0.1", 8000, "m", true, Duration::from_secs(1));
+        let args = vllm_omni_serve_args("/m", "m", true, Duration::from_secs(1));
         assert!(args.contains(&"--omni".to_string()));
         assert!(!args.contains(&"--no-guardrails".to_string()));
     }
@@ -1218,21 +1273,9 @@ mod tests {
     }
 
     #[test]
-    fn ds4_server_args_load_the_gguf_on_llmmans_port_from_the_ds4_checkout() {
-        let args = ds4_server_args("/m/ds4.gguf", None, "/opt/ds4", 41234, None);
-        assert_eq!(
-            args,
-            [
-                "-m",
-                "/m/ds4.gguf",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "41234",
-                "--chdir",
-                "/opt/ds4"
-            ]
-        );
+    fn ds4_server_args_load_the_gguf_from_the_ds4_checkout() {
+        let args = ds4_server_args("/m/ds4.gguf", None, "/opt/ds4", None);
+        assert_eq!(args, ["-m", "/m/ds4.gguf", "--chdir", "/opt/ds4"]);
     }
 
     #[test]
@@ -1241,11 +1284,10 @@ mod tests {
             "/m/ds4.gguf",
             Some("/m/encoder.gguf"),
             "/opt/ds4",
-            41234,
             Some(65_536),
         );
         assert_eq!(
-            &args[8..],
+            &args[4..],
             ["--vision", "/m/encoder.gguf", "--ctx", "65536"]
         );
     }
@@ -1268,16 +1310,6 @@ mod tests {
     }
 
     #[test]
-    fn force_loopback_host_follows_any_extra_args_host() {
-        let mut args = split_extra_args(Some("--hos 0.0.0.0 --tp 2"));
-        force_loopback_host(&mut args);
-        assert_eq!(
-            args,
-            ["--hos", "0.0.0.0", "--tp", "2", "--host", "127.0.0.1"]
-        );
-    }
-
-    #[test]
     fn split_extra_args_splits_on_whitespace_only() {
         assert_eq!(split_extra_args(None), Vec::<String>::new());
         assert_eq!(split_extra_args(Some("")), Vec::<String>::new());
@@ -1295,8 +1327,8 @@ mod tests {
 
     #[test]
     fn sglang_serve_args_speak_sglangs_flag_names() {
-        let args = sglang_serve_args("/models", "0.0.0.0", 30000, "qwen3.5:0.8b", Some(4096));
-        // SGLang's own recipe: `--model-path <dir> --host --port`, no
+        let args = sglang_serve_args("/models", "qwen3.5:0.8b", Some(4096));
+        // SGLang's own recipe: `--model-path <dir>`, no
         // positional model and no `serve` subcommand here (the launcher
         // prefix differs between a local `sglang serve` and the image's
         // `python3 -m sglang.launch_server`).
@@ -1306,8 +1338,6 @@ mod tests {
             let i = args.iter().position(|a| a == flag).unwrap();
             args[i + 1].clone()
         };
-        assert_eq!(value("--host"), "0.0.0.0");
-        assert_eq!(value("--port"), "30000");
         // `:` is SGLang's LoRA-adapter separator (see sglang_served_model_name).
         assert_eq!(value("--served-model-name"), "qwen3.5-0.8b");
         assert_eq!(value("--context-length"), "4096");
@@ -1328,29 +1358,8 @@ mod tests {
 
     #[test]
     fn sglang_serve_args_leave_context_length_to_the_model_when_unset() {
-        let args = sglang_serve_args("/models", "127.0.0.1", 30000, "m", None);
+        let args = sglang_serve_args("/models", "m", None);
         assert!(!args.contains(&"--context-length".to_string()));
-    }
-
-    /// Local and container SGLang argv differ only in dir and host, like
-    /// vLLM's.
-    #[test]
-    fn sglang_serve_args_differ_between_local_and_container_only_in_dir_and_host() {
-        let local = sglang_serve_args("/cache/abc/model", "127.0.0.1", 30000, "m", Some(4096));
-        let container = sglang_serve_args("/models", "0.0.0.0", 30000, "m", Some(4096));
-        assert_eq!(local[1], "/cache/abc/model");
-        assert_eq!(container[1], "/models");
-        let host = |args: &[String]| {
-            let i = args.iter().position(|a| a == "--host").unwrap();
-            args[i + 1].clone()
-        };
-        assert_eq!(host(&local), "127.0.0.1");
-        assert_eq!(host(&container), "0.0.0.0");
-        let rest = |args: &[String]| {
-            let i = args.iter().position(|a| a == "--host").unwrap();
-            [&args[2..i], &args[i + 2..]].concat()
-        };
-        assert_eq!(rest(&local), rest(&container));
     }
 
     #[test]

@@ -123,10 +123,10 @@ Environment Variables:
       LLMMAN_NUM_PARALLEL            Maximum number of parallel requests per model (GGUF only)
       LLMMAN_MLX_LM_VERSION          Exact mlx-lm release to install on macOS (default: PyPI's current)
       LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
-      LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve` (e.g. \"--dtype bfloat16 --tp 2\")
-      LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch (e.g. \"--disable-cuda-graph\")
+      LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments appended to every `vllm serve`, before llmman's --port/--host (e.g. \"--dtype bfloat16 --tp 2\")
+      LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments appended to every sglang launch, before llmman's --port/--host (e.g. \"--disable-cuda-graph\")
       LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 for ds4-server on PATH (default: llama-server)
-      LLMMAN_DS4_ARGS                Extra whitespace-separated arguments appended to every ds4-server launch (e.g. \"--ssd-streaming\")
+      LLMMAN_DS4_ARGS                Extra whitespace-separated arguments appended to every ds4-server launch, before llmman's --port/--host (e.g. \"--ssd-streaming\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
