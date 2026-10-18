@@ -565,8 +565,8 @@ pub(super) fn sglang_served_model_name(model_ref: &str) -> String {
 
 /// argv after SGLang's launcher (`sglang serve` locally, `python3 -m
 /// sglang.launch_server` in the `lmsysorg/sglang` image): the same shape
-/// as [`vllm_serve_args`] in SGLang's spelling, with `--context-length`
-/// fed by the [`vllm_max_model_len`] rule.
+/// as [`vllm_serve_args`] in SGLang's spelling (no `--port`/`--host`), with
+/// `--context-length` fed by the [`vllm_max_model_len`] rule.
 pub(super) fn sglang_serve_args(
     model_dir: &str,
     model_name: &str,
@@ -624,7 +624,8 @@ pub(super) async fn spawn_sglang_server(
     spawn_piped(grouped_command(&sglang, args), &sglang, "sglang")
 }
 
-/// argv after `ds4-server`. ds4 resolves its `metal/*.metal` kernel
+/// argv after `ds4-server`, without `--port`/`--host` (see
+/// [`ds4_server_args_from_env`]). ds4 resolves its `metal/*.metal` kernel
 /// sources against the working directory, which `--chdir` sets.
 /// `--vision` takes the encoder GGUF llama-server calls `--mmproj`.
 /// `ctx` is [`vllm_max_model_len`]'s value; `None` leaves ds4's default.

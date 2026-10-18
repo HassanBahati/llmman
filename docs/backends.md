@@ -263,8 +263,8 @@ the DeepSeek V4 Flash builds ds4 recommends. Download one with ds4's
 `./download_model.sh ds4f-q2`, move the file into a directory of its own,
 and package it with `llmman build -t ds4f:q2 <dir>`.
 
-llmman runs `ds4-server -m <gguf> --host 127.0.0.1 --port <port> --chdir
-<dir>`, where `<dir>` is the directory of the binary `PATH`'s
+llmman runs `ds4-server -m <gguf> --chdir <dir> ... --port <port> --host
+127.0.0.1`, where `<dir>` is the directory of the binary `PATH`'s
 `ds4-server` resolves to; ds4 reads its Metal kernel sources relative to
 it. For a `ds4-server` copied out of the
 checkout, name the checkout with `LLMMAN_DS4_ARGS="--chdir
