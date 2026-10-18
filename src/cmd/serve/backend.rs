@@ -1033,6 +1033,34 @@ pub(super) async fn would_use_mlx(state: &AppState, model_ref: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::PoisonError;
+
+    /// Held by every test that sets or reads an `LLMMAN_*_ARGS` variable,
+    /// since the environment is process-wide.
+    static EXTRA_ARGS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Sets `var` for its lifetime, restoring the previous value on drop.
+    struct EnvVar {
+        var: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVar {
+        fn set(var: &'static str, value: &str) -> Self {
+            let previous = std::env::var(var).ok();
+            std::env::set_var(var, value);
+            Self { var, previous }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.var, value),
+                None => std::env::remove_var(self.var),
+            }
+        }
+    }
 
     #[test]
     fn parse_load_timeout_accepts_the_same_duration_syntax_as_keep_alive() {
@@ -1101,6 +1129,9 @@ mod tests {
     /// `--port` and `--host`.
     #[test]
     fn every_builder_ends_with_llmmans_port_and_host() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let tail = |args: Vec<String>| args[args.len() - 4..].to_vec();
         fn expect(host: &str) -> Vec<&str> {
             vec!["--port", "41234", "--host", host]
@@ -1137,6 +1168,9 @@ mod tests {
     /// `--host`.
     #[test]
     fn local_and_container_argv_differ_only_in_dir_and_host() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         fn without_dir_and_host(mut args: Vec<String>) -> Vec<String> {
             args.remove(1);
             args.pop();
@@ -1154,6 +1188,58 @@ mod tests {
         pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096)));
         pair(&|dir, host| vllm_omni_serve_args_from_env(dir, host, 8000, "m"));
         pair(&|dir, host| sglang_serve_args_from_env(dir, host, 30000, "m", Some(4096)));
+    }
+
+    /// Each builder puts its `LLMMAN_*_ARGS` before llmman's `--port` and
+    /// `--host`, so an extra-args `--port` is overridden.
+    #[test]
+    fn every_builder_puts_its_extra_args_before_llmmans_port_and_host() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _vars = [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR]
+            .map(|var| EnvVar::set(var, "--port 1 --tp 2"));
+        let tail = |args: Vec<String>| args[args.len() - 8..].to_vec();
+        let expected = [
+            "--port",
+            "1",
+            "--tp",
+            "2",
+            "--port",
+            "41234",
+            "--host",
+            "127.0.0.1",
+        ];
+        assert_eq!(
+            tail(vllm_serve_args_from_env(
+                "/m",
+                "127.0.0.1",
+                41234,
+                "m",
+                None
+            )),
+            expected
+        );
+        assert_eq!(
+            tail(vllm_omni_serve_args_from_env("/m", "127.0.0.1", 41234, "m")),
+            expected
+        );
+        assert_eq!(
+            tail(sglang_serve_args_from_env(
+                "/m",
+                "127.0.0.1",
+                41234,
+                "m",
+                None
+            )),
+            expected
+        );
+        assert_eq!(
+            tail(ds4_server_args_from_env(
+                "/m.gguf", None, "/opt/ds4", 41234, None
+            )),
+            expected
+        );
     }
 
     #[test]

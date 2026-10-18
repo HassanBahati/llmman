@@ -123,7 +123,7 @@ Plain `vllm` is CPU-only on macOS unless
 `LLMMAN_LOAD_TIMEOUT` (default 10 minutes) bounds a stalled load.
 `LLMMAN_VLLM_ARGS` appends anything else (`--dtype bfloat16 --tp 2`) to
 the `vllm serve` command line, local or in a container; llmman's own
-`--port` and `--host` still come last.
+`--port` and `--host` come last.
 
 ### In a container
 
@@ -212,7 +212,7 @@ llmman runs `sglang serve --model-path <dir> --served-model-name <ref>`
 on the model's directory; `LLMMAN_CONTEXT_LENGTH` is forwarded as
 `--context-length` and `LLMMAN_LOAD_TIMEOUT` bounds the load as for
 vLLM. `LLMMAN_SGLANG_ARGS` appends anything else (`--disable-cuda-graph
---tp 2`); llmman's own `--port` and `--host` still come last. Which
+--tp 2`); llmman's own `--port` and `--host` come last. Which
 device SGLang uses is its own autodetection and environment, which a
 local child inherits: `SGLANG_USE_CPU_ENGINE=1` for its CPU engine
 (Linux; x86_64 needs AVX-512), `SGLANG_USE_MLX=1` for its MLX runtime on
@@ -274,7 +274,7 @@ passed as `--vision`. `LLMMAN_CONTEXT_LENGTH` is forwarded as `--ctx` under the
 same rule as vLLM's; unset, ds4 uses its own default (32768).
 `LLMMAN_DS4_ARGS` appends anything else, such as `--ssd-streaming` for a
 model larger than memory, or `--batched-session 4`; llmman's own `--port`
-and `--host 127.0.0.1` still come last. ds4 has no container image, so it runs
+and `--host 127.0.0.1` come last. ds4 has no container image, so it runs
 from `PATH` under every `--runtime`. A failed load is not retried with a
 smaller context. `llmman ps` shows `ds4 (local)`.
 
