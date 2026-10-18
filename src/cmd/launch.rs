@@ -193,6 +193,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("docker-agent") {
         docker_agent::check_docker_agent_args(&args.extra_args)?;
     }
+    if name.eq_ignore_ascii_case("kimi") {
+        kimi::check_kimi_args(args.model.as_deref(), &args.extra_args)?;
+    }
     // Each launcher looks for its program only once it runs, which is
     // after the daemon has started and the model has been pulled: a
     // missing agent would otherwise cost a download first.
@@ -510,16 +513,13 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 
 /// Integrations `--provider` cannot drive, and why.
 ///
-/// `kimi::launch_kimi` only exports `OLLAMA_HOST`: it never passes a model,
-/// so Kimi picks its own and the provider-routed reference never reaches
-/// the daemon.
 /// Refusing is the same call the catalog filter makes — a
 /// combination llmman cannot actually drive is absent, not offered and
 /// then broken at the first request.
 const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
     (
         "kimi",
-        "it selects its own model rather than taking one from llmman",
+        "llmman has not verified it with a provider-routed model",
     ),
     // Its key variable feeds a native Google client, and llmman has not
     // verified that GEMINI_BASE_URL still redirects it here. Getting that
@@ -571,7 +571,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "opencode" | "codex" | "pi" | "omp"
+        "opencode" | "codex" | "pi" | "omp" | "kimi"
     )
 }
 
@@ -1004,7 +1004,7 @@ fn accepts_prompt(answer: &str) -> bool {
 
 /// Integrations that cannot carry a `--variant` to llmman, and why.
 const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
-    ("kimi", "it picks its own model"),
+    ("kimi", "llmman does not set its thinking yet"),
     ("openclaw", "it only takes settings at onboarding"),
     (
         "droid",
@@ -1121,9 +1121,8 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// context figure an integration is told: a local model's loaded one
 /// (see [`local_context_window`]), a `--provider` model's catalog one,
 /// or a pair's larger half (see [`pair_context_window`]); `None` when
-/// none of them is known. codex alone substitutes
-/// [`codex::CODEX_FALLBACK_CONTEXT_WINDOW`] for a `None`, because its catalog
-/// cannot omit the field.
+/// none of them is known. codex and kimi substitute a fallback for a
+/// `None`, because their configurations cannot omit the field.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,
@@ -1183,7 +1182,7 @@ fn launch(
         "aider" => aider::launch_aider(model, api_key, extra_args),
         "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
         "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args),
-        "kimi" => kimi::launch_kimi(extra_args),
+        "kimi" => kimi::launch_kimi(model, api_key, context_window, extra_args),
         "gemini" => gemini::launch_gemini(model, api_key, extra_args),
         "agy" => agy::launch_agy(model, api_key, extra_args),
         "hermes" => hermes::launch_hermes(model, vision, extra_args),
@@ -1844,6 +1843,7 @@ mod tests {
         // the trained context.
         assert!(declares_context_window("pi"));
         assert!(declares_context_window("omp"));
+        assert!(declares_context_window("kimi"));
         assert!(!declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
     }
