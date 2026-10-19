@@ -1,6 +1,12 @@
 //! `llmman launch kimi` (Kimi Code CLI).
 
-use super::{before_terminator, exec_with_env, find_on_path, has_flag, server};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use anyhow::Context;
+
+use super::{before_terminator, exec_with_env, find_on_path, has_flag, sandbox, server};
 
 /// The window used when llmman knows none: kimi's own with no model configured.
 const KIMI_FALLBACK_CONTEXT_WINDOW: u64 = 100_000;
@@ -10,9 +16,18 @@ const KIMI_RESERVED_CONTEXT_SIZE: u64 = 50_000;
 /// The least kimi accepts for `loop_control.reserved_context_size`.
 const KIMI_MIN_RESERVED_CONTEXT_SIZE: u64 = 1_000;
 
-/// kimi: with a model, an inline `--config` serving only that model from
-/// llmman's /v1. Without one, only OLLAMA_HOST, and kimi uses its own
-/// configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KimiCli {
+    /// The Python kimi-cli: takes the model as an inline `--config`.
+    Legacy,
+    /// Kimi Code: takes the model from `KIMI_MODEL_*`.
+    Code,
+}
+
+static KIMI_CLI: OnceLock<KimiCli> = OnceLock::new();
+
+/// kimi: with a model, passes it the way the installed CLI takes it;
+/// without one, kimi uses its own configuration.
 pub(super) fn launch_kimi(
     model: &str,
     api_key: &str,
@@ -25,14 +40,49 @@ pub(super) fn launch_kimi(
         return exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", server.as_str())]);
     }
     let base_url = format!("{server}/v1");
-    exec_with_env(
-        &bin,
-        &kimi_args(model, &base_url, context_window, extra_args),
-        &kimi_env(&base_url, api_key),
-    )
+    match kimi_cli(&bin)? {
+        KimiCli::Legacy => exec_with_env(
+            &bin,
+            &kimi_args(model, &base_url, context_window, extra_args),
+            &kimi_env(&base_url, api_key),
+        ),
+        KimiCli::Code => {
+            let env = kimi_code_env(model, &base_url, api_key, context_window);
+            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            exec_with_env(&bin, extra_args, &env)
+        }
+    }
 }
 
-/// llmman's `--config`, then the caller's arguments.
+/// An image-based `--sandbox` runs the image's kimi, which the host
+/// cannot probe, so it is taken to be Kimi Code.
+fn kimi_cli(bin: &Path) -> anyhow::Result<KimiCli> {
+    if let Some(cli) = KIMI_CLI.get() {
+        return Ok(*cli);
+    }
+    let cli = if sandbox::runs_from_image() {
+        KimiCli::Code
+    } else {
+        let output = Command::new(bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .with_context(|| format!("failed to run {} --version", bin.display()))?;
+        kimi_cli_from_version(&String::from_utf8_lossy(&output.stdout))
+    };
+    Ok(*KIMI_CLI.get_or_init(|| cli))
+}
+
+/// The Python kimi-cli prints `kimi, version 1.x`; Kimi Code, a bare version.
+fn kimi_cli_from_version(stdout: &str) -> KimiCli {
+    if stdout.trim_start().starts_with("kimi, version ") {
+        KimiCli::Legacy
+    } else {
+        KimiCli::Code
+    }
+}
+
 fn kimi_args(
     model: &str,
     base_url: &str,
@@ -49,15 +99,14 @@ fn kimi_args(
     .concat()
 }
 
-/// kimi's OpenAI provider prefers these to the configuration's values, so
-/// they are set to override inherited ones. This also keeps the key off
-/// the command line.
+/// The Python kimi-cli's OpenAI provider prefers these to the
+/// configuration's values, so they are set to override inherited ones.
+/// This also keeps the key off the command line.
 fn kimi_env<'a>(base_url: &'a str, api_key: &'a str) -> [(&'static str, &'a str); 2] {
     [("OPENAI_BASE_URL", base_url), ("OPENAI_API_KEY", api_key)]
 }
 
-/// The `--config` JSON selecting `model` from an OpenAI-compatible
-/// provider at `base_url`. Its key is empty: `OPENAI_API_KEY` supplies it.
+/// The provider's key is empty: `OPENAI_API_KEY` supplies it.
 fn kimi_config(model: &str, base_url: &str, context_window: Option<u64>) -> String {
     let window = context_window.unwrap_or(KIMI_FALLBACK_CONTEXT_WINDOW);
     serde_json::json!({
@@ -81,32 +130,57 @@ fn kimi_config(model: &str, base_url: &str, context_window: Option<u64>) -> Stri
     .to_string()
 }
 
-/// A quarter of `window`, within kimi's bounds. kimi compacts when the
-/// context plus this reserve fills the window, so its default would
-/// compact a small window at every step.
+/// kimi compacts when the context plus this reserve fills the window, so
+/// its default would compact a small window at every step.
 fn reserved_context_size(window: u64) -> u64 {
     (window / 4).clamp(KIMI_MIN_RESERVED_CONTEXT_SIZE, KIMI_RESERVED_CONTEXT_SIZE)
 }
 
-/// Rejects kimi's own `--config`, `--config-file` and `--model`/`-m`
-/// before a forwarded `--`, when llmman selects the model. `run` calls
-/// this before the daemon starts.
+/// Kimi Code prefers these to `default_model` in its config.
+fn kimi_code_env(
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+    context_window: Option<u64>,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("KIMI_MODEL_NAME", model.to_string()),
+        ("KIMI_MODEL_PROVIDER_TYPE", "openai".to_string()),
+        ("KIMI_MODEL_BASE_URL", base_url.to_string()),
+        ("KIMI_MODEL_API_KEY", api_key.to_string()),
+    ];
+    if let Some(window) = context_window {
+        env.push(("KIMI_MODEL_MAX_CONTEXT_SIZE", window.to_string()));
+    }
+    env
+}
+
+/// Detects the installed CLI and refuses arguments that would replace
+/// llmman's model or configuration.
 pub(super) fn check_kimi_args(model: Option<&str>, extra_args: &[String]) -> anyhow::Result<()> {
     let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
         return Ok(());
     };
+    let bin = find_on_path("kimi").ok_or_else(|| anyhow::anyhow!("kimi is not installed"))?;
+    check_args(kimi_cli(&bin)?, model, extra_args)
+}
+
+fn check_args(cli: KimiCli, model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let args = before_terminator(extra_args);
-    for flag in ["--config", "--config-file"] {
-        anyhow::ensure!(
-            !has_flag(args, flag, None),
-            "kimi's {flag} would replace the configuration llmman passes for model {model}; \
-             launch kimi without a model to use its own"
-        );
+    // Kimi Code has no `--config`, and rejects one itself.
+    if cli == KimiCli::Legacy {
+        for flag in ["--config", "--config-file"] {
+            anyhow::ensure!(
+                !has_flag(args, flag, None),
+                "kimi's {flag} would replace the configuration llmman passes for model {model}; \
+                 launch kimi without a model to use its own"
+            );
+        }
     }
     anyhow::ensure!(
-        !has_flag(args, "--model", Some("-m")),
-        "kimi's --model names a model outside the configuration llmman passes; select it \
-         with `llmman launch kimi --model <model>` instead"
+        !has_flag(args, "--model", None) && !args.iter().any(|a| a.starts_with("-m")),
+        "kimi's --model would replace the model llmman passes; select it with \
+         `llmman launch kimi --model <model>` instead"
     );
     Ok(())
 }
@@ -117,6 +191,16 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kimi_cli_from_version_tells_the_python_cli_from_kimi_code() {
+        assert_eq!(
+            kimi_cli_from_version("kimi, version 1.51.0\n"),
+            KimiCli::Legacy
+        );
+        assert_eq!(kimi_cli_from_version("2.2.0\n"), KimiCli::Code);
+        assert_eq!(kimi_cli_from_version(""), KimiCli::Code);
     }
 
     #[test]
@@ -173,18 +257,51 @@ mod tests {
     }
 
     #[test]
-    fn check_kimi_args_refuses_kimis_own_config_and_model_with_llmmans() {
+    fn kimi_code_env_selects_the_model_at_llmmans_endpoint() {
+        let env = kimi_code_env("m", "http://h/v1", "k", Some(32_768));
+        assert_eq!(
+            env,
+            [
+                ("KIMI_MODEL_NAME", "m".to_string()),
+                ("KIMI_MODEL_PROVIDER_TYPE", "openai".to_string()),
+                ("KIMI_MODEL_BASE_URL", "http://h/v1".to_string()),
+                ("KIMI_MODEL_API_KEY", "k".to_string()),
+                ("KIMI_MODEL_MAX_CONTEXT_SIZE", "32768".to_string()),
+            ]
+        );
+        let without = kimi_code_env("m", "http://h/v1", "k", None);
+        assert!(!without
+            .iter()
+            .any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
+    }
+
+    #[test]
+    fn check_args_refuses_the_python_clis_own_config_and_model() {
         let err = |a: &[&str]| {
-            check_kimi_args(Some("m"), &args(a))
+            check_args(KimiCli::Legacy, "m", &args(a))
                 .unwrap_err()
                 .to_string()
         };
         assert!(err(&["--config", "{}"]).contains("kimi's --config "));
         assert!(err(&["--config={}"]).contains("kimi's --config "));
         assert!(err(&["--config-file", "c.toml"]).contains("kimi's --config-file"));
-        assert!(err(&["--model", "x"]).contains("kimi's --model"));
-        assert!(err(&["-m", "x"]).contains("kimi's --model"));
-        assert!(err(&["-m=x"]).contains("kimi's --model"));
+        for model in [
+            &["--model", "x"][..],
+            &["--model=x"],
+            &["-m", "x"],
+            &["-m=x"],
+            &["-mx"],
+        ] {
+            assert!(err(model).contains("kimi's --model"), "{model:?}");
+        }
+    }
+
+    #[test]
+    fn check_args_refuses_kimi_codes_model_but_leaves_config_to_it() {
+        let code = |a: &[&str]| check_args(KimiCli::Code, "m", &args(a));
+        assert!(code(&["-mx"]).is_err());
+        assert!(code(&["--model", "x"]).is_err());
+        assert!(code(&["--config", "{}"]).is_ok());
     }
 
     #[test]
@@ -195,7 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn check_kimi_args_stops_at_a_forwarded_terminator() {
-        assert!(check_kimi_args(Some("m"), &args(&["--", "--model", "x"])).is_ok());
+    fn check_args_stops_at_a_forwarded_terminator() {
+        for cli in [KimiCli::Legacy, KimiCli::Code] {
+            assert!(check_args(cli, "m", &args(&["--", "--model", "x", "-mx"])).is_ok());
+        }
     }
 }
