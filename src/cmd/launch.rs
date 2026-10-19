@@ -1122,7 +1122,7 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 /// (see [`local_context_window`]), a `--provider` model's catalog one,
 /// or a pair's larger half (see [`pair_context_window`]); `None` when
 /// none of them is known. codex and kimi substitute a fallback for a
-/// `None`, because their configurations cannot omit the field.
+/// `None`.
 #[allow(clippy::too_many_arguments)]
 fn launch(
     name: &str,

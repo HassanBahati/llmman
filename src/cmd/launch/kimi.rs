@@ -8,12 +8,14 @@ use anyhow::Context;
 
 use super::{before_terminator, exec_with_env, find_on_path, has_flag, sandbox, server};
 
-/// The window used when llmman knows none: kimi's own with no model configured.
+/// The window used when llmman knows none: the Python kimi-cli's own with
+/// no model configured.
 const KIMI_FALLBACK_CONTEXT_WINDOW: u64 = 100_000;
 
-/// kimi's default `loop_control.reserved_context_size`.
+/// The Python kimi-cli's default `loop_control.reserved_context_size`.
 const KIMI_RESERVED_CONTEXT_SIZE: u64 = 50_000;
-/// The least kimi accepts for `loop_control.reserved_context_size`.
+/// The least the Python kimi-cli accepts for
+/// `loop_control.reserved_context_size`.
 const KIMI_MIN_RESERVED_CONTEXT_SIZE: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,17 +71,27 @@ fn kimi_cli(bin: &Path) -> anyhow::Result<KimiCli> {
             .stderr(Stdio::null())
             .output()
             .with_context(|| format!("failed to run {} --version", bin.display()))?;
-        kimi_cli_from_version(&String::from_utf8_lossy(&output.stdout))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        kimi_cli_from_version(&stdout).with_context(|| {
+            format!(
+                "cannot tell which kimi CLI {} is from its --version: {:?}",
+                bin.display(),
+                stdout.trim()
+            )
+        })?
     };
     Ok(*KIMI_CLI.get_or_init(|| cli))
 }
 
 /// The Python kimi-cli prints `kimi, version 1.x`; Kimi Code, a bare version.
-fn kimi_cli_from_version(stdout: &str) -> KimiCli {
-    if stdout.trim_start().starts_with("kimi, version ") {
-        KimiCli::Legacy
+fn kimi_cli_from_version(stdout: &str) -> Option<KimiCli> {
+    let stdout = stdout.trim_start();
+    if stdout.starts_with("kimi, version ") {
+        Some(KimiCli::Legacy)
+    } else if stdout.starts_with(|c: char| c.is_ascii_digit()) {
+        Some(KimiCli::Code)
     } else {
-        KimiCli::Code
+        None
     }
 }
 
@@ -130,8 +142,8 @@ fn kimi_config(model: &str, base_url: &str, context_window: Option<u64>) -> Stri
     .to_string()
 }
 
-/// kimi compacts when the context plus this reserve fills the window, so
-/// its default would compact a small window at every step.
+/// The Python kimi-cli compacts when the context plus this reserve fills
+/// the window, so its default would compact a small window at every step.
 fn reserved_context_size(window: u64) -> u64 {
     (window / 4).clamp(KIMI_MIN_RESERVED_CONTEXT_SIZE, KIMI_RESERVED_CONTEXT_SIZE)
 }
@@ -143,16 +155,14 @@ fn kimi_code_env(
     api_key: &str,
     context_window: Option<u64>,
 ) -> Vec<(&'static str, String)> {
-    let mut env = vec![
+    let window = context_window.unwrap_or(KIMI_FALLBACK_CONTEXT_WINDOW);
+    vec![
         ("KIMI_MODEL_NAME", model.to_string()),
         ("KIMI_MODEL_PROVIDER_TYPE", "openai".to_string()),
         ("KIMI_MODEL_BASE_URL", base_url.to_string()),
         ("KIMI_MODEL_API_KEY", api_key.to_string()),
-    ];
-    if let Some(window) = context_window {
-        env.push(("KIMI_MODEL_MAX_CONTEXT_SIZE", window.to_string()));
-    }
-    env
+        ("KIMI_MODEL_MAX_CONTEXT_SIZE", window.to_string()),
+    ]
 }
 
 /// Detects the installed CLI and refuses arguments that would replace
@@ -197,10 +207,11 @@ mod tests {
     fn kimi_cli_from_version_tells_the_python_cli_from_kimi_code() {
         assert_eq!(
             kimi_cli_from_version("kimi, version 1.51.0\n"),
-            KimiCli::Legacy
+            Some(KimiCli::Legacy)
         );
-        assert_eq!(kimi_cli_from_version("2.2.0\n"), KimiCli::Code);
-        assert_eq!(kimi_cli_from_version(""), KimiCli::Code);
+        assert_eq!(kimi_cli_from_version("2.2.0\n"), Some(KimiCli::Code));
+        assert_eq!(kimi_cli_from_version(""), None);
+        assert_eq!(kimi_cli_from_version("usage: kimi"), None);
     }
 
     #[test]
@@ -269,10 +280,11 @@ mod tests {
                 ("KIMI_MODEL_MAX_CONTEXT_SIZE", "32768".to_string()),
             ]
         );
-        let without = kimi_code_env("m", "http://h/v1", "k", None);
-        assert!(!without
-            .iter()
-            .any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
+        let fallback = kimi_code_env("m", "http://h/v1", "k", None);
+        assert!(fallback.contains(&(
+            "KIMI_MODEL_MAX_CONTEXT_SIZE",
+            KIMI_FALLBACK_CONTEXT_WINDOW.to_string()
+        )));
     }
 
     #[test]
