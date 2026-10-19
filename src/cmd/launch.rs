@@ -193,7 +193,8 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("docker-agent") {
         docker_agent::check_docker_agent_args(&args.extra_args)?;
     }
-    if name.eq_ignore_ascii_case("kimi") {
+    // Under `--provider` or an overflow pair, kimi is refused further on.
+    if name.eq_ignore_ascii_case("kimi") && provider.is_none() && overflow.is_none() {
         kimi::check_kimi_args(args.model.as_deref(), &args.extra_args)?;
     }
     // Each launcher looks for its program only once it runs, which is

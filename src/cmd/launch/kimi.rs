@@ -28,6 +28,10 @@ pub(super) enum KimiCli {
 
 static KIMI_CLI: OnceLock<KimiCli> = OnceLock::new();
 
+/// Kimi Code's alias for the model `KIMI_MODEL_*` defines. Undocumented:
+/// taken from its source.
+const KIMI_CODE_ENV_MODEL: &str = "__kimi_env_model__";
+
 /// kimi: with a model, passes it the way the installed CLI takes it;
 /// without one, kimi uses its own configuration.
 pub(super) fn launch_kimi(
@@ -51,7 +55,7 @@ pub(super) fn launch_kimi(
         KimiCli::Code => {
             let env = kimi_code_env(model, &base_url, api_key, context_window);
             let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            exec_with_env(&bin, extra_args, &env)
+            exec_with_env(&bin, &kimi_code_args(extra_args), &env)
         }
     }
 }
@@ -148,7 +152,17 @@ fn reserved_context_size(window: u64) -> u64 {
     (window / 4).clamp(KIMI_MIN_RESERVED_CONTEXT_SIZE, KIMI_RESERVED_CONTEXT_SIZE)
 }
 
-/// Kimi Code prefers these to `default_model` in its config.
+/// A resumed Kimi Code session keeps its own model unless `--model` names
+/// one, so llmman's is named explicitly.
+fn kimi_code_args(extra_args: &[String]) -> Vec<String> {
+    [
+        vec!["--model".to_string(), KIMI_CODE_ENV_MODEL.to_string()],
+        extra_args.to_vec(),
+    ]
+    .concat()
+}
+
+/// Kimi Code builds the [`KIMI_CODE_ENV_MODEL`] model from these.
 fn kimi_code_env(
     model: &str,
     base_url: &str,
@@ -265,6 +279,14 @@ mod tests {
         assert_eq!(reserved_context_size(262_144), KIMI_RESERVED_CONTEXT_SIZE);
         assert_eq!(reserved_context_size(32_768), 8_192);
         assert_eq!(reserved_context_size(2_048), KIMI_MIN_RESERVED_CONTEXT_SIZE);
+    }
+
+    #[test]
+    fn kimi_code_args_name_llmmans_model_for_a_resumed_session() {
+        assert_eq!(
+            kimi_code_args(&args(&["-r", "s", "-p", "hi"])),
+            args(&["--model", "__kimi_env_model__", "-r", "s", "-p", "hi"])
+        );
     }
 
     #[test]
