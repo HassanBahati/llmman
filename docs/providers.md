@@ -206,7 +206,7 @@ installed:
 | `agy` | Antigravity CLI (requires `--model`) | yes |
 | `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
 | `cline` | Cline (requires `--model`) | yes |
-| `kimi` | Kimi Code CLI | no: it picks its own model rather than taking llmman's |
+| `kimi` | Kimi Code CLI | no: llmman has not verified it with a provider-routed model |
 | `copilot` | GitHub Copilot CLI (`gh`) | no: it has no way to send a key |
 | `openclaw` | OpenClaw | no: it only takes a model during first-run onboarding |
 
