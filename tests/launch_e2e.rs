@@ -2773,6 +2773,18 @@ fn spawn_test_daemon(host: &str, env: &[(&str, &str)]) -> std::process::Child {
 /// cannot spare. `--think false --num-predict 32`: see `warm_model`.
 #[cfg(unix)]
 fn serve_safetensors_with_engine(engine: &str, model: &str, env: &[(&str, &str)]) {
+    serve_safetensors_with_engine_then(engine, model, env, |_| {});
+}
+
+/// [`serve_safetensors_with_engine`], then `after` with the daemon's host
+/// while the model is still loaded.
+#[cfg(unix)]
+fn serve_safetensors_with_engine_then(
+    engine: &str,
+    model: &str,
+    env: &[(&str, &str)],
+    after: fn(&str),
+) {
     let _ = Command::new(llmman_bin())
         .args(["stop", MODEL])
         .stdout(Stdio::null())
@@ -2847,6 +2859,7 @@ fn serve_safetensors_with_engine(engine: &str, model: &str, env: &[(&str, &str)]
             "{model} was not served by {engine} (LLMMAN_SAFETENSORS_ENGINE regression?) \
              — `llmman ps` row: {model_row:?}"
         );
+        after(&host);
     });
 
     terminate_daemon(&mut daemon);
@@ -2861,7 +2874,8 @@ fn serve_safetensors_with_engine(engine: &str, model: &str, env: &[(&str, &str)]
 /// installed. Platform flags (`--dtype bfloat16 --enforce-eager`,
 /// `--max-num-seqs 1`, `VLLM_*`) come from the CI step's environment as
 /// `LLMMAN_VLLM_ARGS`/`VLLM_*`; `LLMMAN_CONTEXT_LENGTH=1024` bounds the
-/// KV cache.
+/// KV cache. `--host 0.0.0.0` is appended to those flags, and the engine
+/// must still listen only on loopback.
 #[cfg(unix)]
 #[test]
 fn serve_vllm_safetensors_model() {
@@ -2873,7 +2887,58 @@ fn serve_vllm_safetensors_model() {
         eprintln!("skipping: vllm not on PATH — see ci.yml's \"Install vLLM (e2e)\" step");
         return;
     }
-    serve_safetensors_with_engine("vllm", VLLM_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+    let vllm_args = format!(
+        "{} --host 0.0.0.0",
+        std::env::var("LLMMAN_VLLM_ARGS").unwrap_or_default()
+    );
+    serve_safetensors_with_engine_then(
+        "vllm",
+        VLLM_MODEL,
+        &[
+            ("LLMMAN_CONTEXT_LENGTH", "1024"),
+            ("LLMMAN_VLLM_ARGS", &vllm_args),
+        ],
+        assert_engine_listens_only_on_loopback,
+    );
+}
+
+#[cfg(unix)]
+fn assert_engine_listens_only_on_loopback(host: &str) {
+    let ps: serde_json::Value = llmman::daemon::client()
+        .expect("HTTP client")
+        .get(format!("http://{host}/api/ps"))
+        .send()
+        .and_then(|resp| resp.error_for_status())
+        .and_then(|resp| resp.json())
+        .expect("GET /api/ps");
+    let models = ps["models"].as_array().expect("/api/ps models");
+    assert_eq!(models.len(), 1, "expected one loaded model: {ps}");
+    let port = u16::try_from(models[0]["port"].as_u64().expect("engine port")).unwrap();
+    let connect = |ip: std::net::IpAddr| {
+        std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))
+    };
+    connect(std::net::Ipv4Addr::LOCALHOST.into())
+        .unwrap_or_else(|e| panic!("engine is not listening on 127.0.0.1:{port}: {e}"));
+    let ip = non_loopback_ipv4()
+        .expect("no non-loopback IPv4 address to check the engine is not reachable on");
+    // Only a refusal shows nothing listens there; a timeout may be a firewall.
+    match connect(ip) {
+        Ok(_) => panic!(
+            "engine answers on {ip}:{port}: an LLMMAN_*_ARGS --host overrode llmman's loopback"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(e) => panic!("inconclusive: connecting to {ip}:{port} failed with {e}, not a refusal"),
+    }
+}
+
+/// This machine's address on its default route: the local end of a UDP
+/// socket "connected" to a documentation address, which sends nothing.
+#[cfg(unix)]
+fn non_loopback_ipv4() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
 
 /// `llmman serve`'s `sglang` backend end to end, wherever CI installs
