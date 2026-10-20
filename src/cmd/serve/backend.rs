@@ -369,21 +369,56 @@ pub(super) const SGLANG_ARGS_VAR: &str = "LLMMAN_SGLANG_ARGS";
 /// The same for `ds4-server`.
 pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
-/// Splits an `LLMMAN_*_ARGS` value on whitespace, like `LLMMAN_SHELL` (no
-/// quoting). Appended after llmman's own flags, so a repeated flag wins
-/// on an argparse engine, except `--port` and `--host` (see
-/// [`append_extra_args`]).
-pub(super) fn split_extra_args(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(String::from)
-        .collect()
+/// Splits an `LLMMAN_*_ARGS` value on whitespace. An argument that starts
+/// with `'` or `"` runs to the matching quote, so it can hold a space, and
+/// loses the quotes; any other quote, backslash or `#` is literal.
+/// Appended after llmman's own flags, so a repeated flag wins on an
+/// argparse engine, except `--port` and `--host` (see [`append_extra_args`]).
+pub(super) fn split_extra_args(value: Option<&str>) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut chars = value.unwrap_or_default().chars().enumerate().peekable();
+    loop {
+        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+        let Some(&(at, first)) = chars.peek() else {
+            return Ok(args);
+        };
+        let mut arg = String::new();
+        if first == '\'' || first == '"' {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some((_, c)) if c == first => break,
+                    Some((_, c)) => arg.push(c),
+                    // The position, not the argument: it may be a secret.
+                    None => {
+                        return Err(format!(
+                            "missing closing quote for the {first} at character {}",
+                            at + 1
+                        ))
+                    }
+                }
+            }
+        }
+        while let Some((_, c)) = chars.next_if(|(_, c)| !c.is_whitespace()) {
+            arg.push(c);
+        }
+        args.push(arg);
+    }
 }
 
-/// [`split_extra_args`] on the environment variable `var`.
+/// [`split_extra_args`] on the environment variable `var`; empty if it
+/// does not split, which [`check_extra_args_env`] refuses at startup.
 fn extra_args_from_env(var: &str) -> Vec<String> {
-    split_extra_args(std::env::var(var).ok().as_deref())
+    split_extra_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
+}
+
+pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
+    for var in [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR] {
+        if let Ok(value) = std::env::var(var) {
+            split_extra_args(Some(&value)).map_err(|e| anyhow!("{var}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Appends `extra` (a split `LLMMAN_*_ARGS`), then `--port port --host
@@ -1248,7 +1283,7 @@ mod tests {
         let mut args = Vec::new();
         append_extra_args(
             &mut args,
-            split_extra_args(Some("--por 1 --hos 127.0.0.1 --tp 2")),
+            split_extra_args(Some("--por 1 --hos 127.0.0.1 --tp 2")).unwrap(),
             "0.0.0.0",
             41234,
         );
@@ -1397,18 +1432,44 @@ mod tests {
     }
 
     #[test]
-    fn split_extra_args_splits_on_whitespace_only() {
-        assert_eq!(split_extra_args(None), Vec::<String>::new());
-        assert_eq!(split_extra_args(Some("")), Vec::<String>::new());
-        assert_eq!(split_extra_args(Some("   \t ")), Vec::<String>::new());
+    fn split_extra_args_splits_on_whitespace_and_leading_quotes() {
+        fn split(value: Option<&str>) -> Vec<String> {
+            split_extra_args(value).unwrap()
+        }
+        assert_eq!(split(None), Vec::<String>::new());
+        assert_eq!(split(Some("")), Vec::<String>::new());
+        assert_eq!(split(Some("   \t ")), Vec::<String>::new());
         assert_eq!(
-            split_extra_args(Some("  --dtype bfloat16\t--enforce-eager\n--tp 2 ")),
+            split(Some("  --dtype bfloat16\t--enforce-eager\n--tp 2 ")),
             ["--dtype", "bfloat16", "--enforce-eager", "--tp", "2"]
         );
-        // No shell quoting: a quoted value is passed with its quotes.
+        for quoted in ["'a b'", "\"a b\""] {
+            assert_eq!(
+                split(Some(&format!("--chat-template {quoted}"))),
+                ["--chat-template", "a b"]
+            );
+        }
         assert_eq!(
-            split_extra_args(Some("--chat-template 'a b'")),
-            ["--chat-template", "'a", "b'"]
+            split(Some(r#"--hf-overrides '{"a": 1}'"#)),
+            ["--hf-overrides", r#"{"a": 1}"#]
+        );
+        // Anything else passes as it did before quoting.
+        assert_eq!(
+            split(Some(
+                r#"--speculative-config {"method":"ngram"} C:\models #n --x="a b""#
+            )),
+            [
+                "--speculative-config",
+                r#"{"method":"ngram"}"#,
+                r"C:\models",
+                "#n",
+                "--x=\"a",
+                "b\""
+            ]
+        );
+        assert_eq!(
+            split_extra_args(Some("--api-key 'sk-secret")),
+            Err("missing closing quote for the ' at character 11".into())
         );
     }
 
