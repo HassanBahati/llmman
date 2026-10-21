@@ -172,7 +172,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25"
+          go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       # ── Rust toolchain ────────────────────────────────────────────────────
@@ -367,7 +367,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25"
+          go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust
@@ -626,7 +626,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25"
+          go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       # Not golangci-lint's formatter support: this names the files.
@@ -853,7 +853,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25"
+          go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       # targets: matches the build job's own Set up Rust step — needed
@@ -2258,7 +2258,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.25"
+          go-version-file: go-shim/go.mod
           cache-dependency-path: go-shim/go.sum
 
       - name: Set up Rust

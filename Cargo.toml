@@ -58,7 +58,7 @@ axum       = { version = "0.7", features = ["ws"] }
 # in the tree (reqwest's and the AWS SDK's); serve installs ring itself
 # rather than have this pull a preference of its own.
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
-rustls     = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls     = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tower-http = { version = "0.6", features = ["cors"] }
 # The pty behind that terminal: one crate for Unix ptys and Windows
 # ConPTY, and its default program is already "the user's login shell".

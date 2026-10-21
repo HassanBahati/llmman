@@ -89,7 +89,7 @@ To start `llmman serve` at every logon, see
 
 ```sh
 cargo binstall llmman   # prebuilt binary
-cargo install llmman    # build from source; needs Go 1.25+ (and LLVM on Windows) as well as Rust
+cargo install llmman    # build from source; needs Go 1.27.3+ (and LLVM on Windows) as well as Rust
 ```
 
 **Android** (the web UI over an on-device daemon, see [docs/android.md](docs/android.md)):

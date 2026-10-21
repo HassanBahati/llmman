@@ -420,7 +420,7 @@ fn main() {
     cmd.arg(".");
     let status = cmd
         .status()
-        .expect("Failed to invoke `go build` — is Go (1.22+) installed and on PATH?");
+        .expect("Failed to invoke `go build` — is Go (1.27.3+) installed and on PATH?");
 
     if !status.success() {
         panic!("Go shim build failed for tags={}", go_tags);

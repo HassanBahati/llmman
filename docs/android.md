@@ -53,7 +53,7 @@ WebView's IndexedDB, as in a browser.
 ## Building
 
 Needs, in addition to the [usual build tools](../README.md#install) (Rust,
-Go 1.25+): a JDK 17, the Android SDK with `platforms;android-35`,
+Go 1.27.3+): a JDK 17, the Android SDK with `platforms;android-35`,
 `build-tools;35.0.0` and `ndk;27.2.12479018` (Android Studio or
 `sdkmanager` installs them), `rustup target add aarch64-linux-android` and
 `cargo install cargo-ndk`.

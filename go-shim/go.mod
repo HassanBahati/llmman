@@ -1,6 +1,6 @@
 module github.com/llmman/go-shim
 
-go 1.25.7
+go 1.27.3
 
 require (
 	// Docker backend — containerd's OCI registry resolver (same transport moby uses)
