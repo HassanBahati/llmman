@@ -62,6 +62,14 @@ mod tests {
         }
     }
 
+    // The bundle's licenses are stripped from its scripts; their notices
+    // ship beside them (app/scripts/export-web.mjs).
+    #[test]
+    fn the_third_party_notices_ship_with_the_page() {
+        let notices = asset("THIRD-PARTY-NOTICES.txt").expect("THIRD-PARTY-NOTICES.txt");
+        assert_eq!(notices.content_type, "text/plain; charset=utf-8");
+    }
+
     #[test]
     fn a_path_outside_the_table_is_none() {
         for bad in [
@@ -70,11 +78,12 @@ mod tests {
             "../index.html",
             "index.html/",
             "INDEX.HTML",
-            "vendor",
+            "_expo",
+            "_expo/",
         ] {
             assert!(asset(bad).is_none(), "{bad:?}");
         }
-        assert!(asset("vendor/xterm.js").is_some());
+        assert!(ASSETS.iter().any(|(p, ..)| p.starts_with("_expo/")));
     }
 
     #[test]

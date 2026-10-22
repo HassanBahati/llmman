@@ -1,6 +1,8 @@
 //! The web UI's routes: `/` is the page, `/ui/*` its files, all from
 //! [`crate::webui`]. The page talks to the daemon over the same APIs every
-//! other client uses, plus `/llmman/shell` (see `super::shell`).
+//! other client uses, plus `/llmman/shell` (see `super::shell`). The UI
+//! routes by path, so the router's fallback answers a browser with the
+//! page too ([`handle_page`]).
 //!
 //! `LLMMAN_WEBUI_DIR=webui llmman serve` serves that directory from disk
 //! instead, uncompressed and uncached, for working on the UI.
@@ -10,7 +12,7 @@ use std::sync::LazyLock;
 
 use axum::body::Body;
 use axum::extract::Path as UrlPath;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::webui::{self, content_type, Asset};
@@ -39,21 +41,64 @@ static DEV_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 /// `GET /`: the page for a client that accepts HTML, else the liveness
 /// line scripts have always seen.
 pub(super) async fn handle_root(headers: HeaderMap) -> Response {
-    let wants_html = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("text/html"));
-    if !wants_html {
+    if !wants_html(&headers) {
         return "llmman is running".into_response();
     }
+    serve_index(&headers).await
+}
+
+/// The router's fallback: the page for a browser asking for one of the
+/// UI's own routes (`/models`, `/c/<id>`), so a reload or a link lands
+/// there; a 404 for everything else.
+pub(super) async fn handle_page(method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    if !is_page(&method, uri.path(), &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_index(&headers).await
+}
+
+/// First path segments the daemon's own routes live under. The fallback
+/// never answers inside them, so an unknown API path (a typo, a route of
+/// a newer daemon, `/metrics` while it is off) stays a 404 for its client
+/// rather than a page of HTML.
+const API_SEGMENTS: &[&str] = &[
+    "api", "v1", "llmman", "ui", "gemini", "audio", "props", "metrics",
+];
+
+/// Whether a request is a browser loading a page of the UI: a `GET` or
+/// `HEAD` that accepts HTML, outside every API prefix. `auth::require_key`
+/// exempts these too, as it does `/` and `/ui/*`. Never a path that opens
+/// with `//`: a browser reads `//host/…` as another site, and no route of
+/// the UI starts with an empty segment.
+pub(super) fn is_page(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    matches!(*method, Method::GET | Method::HEAD)
+        && wants_html(headers)
+        && !path.starts_with("//")
+        && !API_SEGMENTS.contains(&first)
+}
+
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.to_ascii_lowercase().contains("text/html"))
+}
+
+async fn serve_index(headers: &HeaderMap) -> Response {
     match DEV_DIR.as_ref() {
         Some(dir) => serve_from_disk(dir, "index.html").await,
-        None => serve_asset(&headers, webui::index()),
+        None => serve_asset(headers, webui::index()),
     }
 }
 
+/// `frame-ancestors` keeps another site from framing the page, `base-uri`
+/// from pointing its relative script URLs at another site.
+const CSP: &str = "frame-ancestors 'none'; base-uri 'self'";
+
 /// Every HTML reply is unframeable: a page that framed the UI would open
-/// its WebSocket to /llmman/shell from a trusted localhost origin.
+/// its WebSocket to /llmman/shell from a trusted localhost origin. Its
+/// `<base>` stays on its own origin too, whatever the address says.
 fn finish(mut response: Response) -> Response {
     let is_html = response
         .headers()
@@ -61,19 +106,17 @@ fn finish(mut response: Response) -> Response {
         .is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
     if is_html {
         let h = response.headers_mut();
-        h.insert(
-            header::CONTENT_SECURITY_POLICY,
-            "frame-ancestors 'none'".parse().unwrap(),
-        );
+        h.insert(header::CONTENT_SECURITY_POLICY, CSP.parse().unwrap());
         h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     }
     response
 }
 
-/// `GET /ui/*path`. No fallback to `index.html`: the UI has one page and
-/// routes with the fragment. Under `LLMMAN_WEBUI_DIR` only images (the
-/// mark build.rs downloads, never in the tree) fall back to the binary;
-/// a missing source file stays a 404 rather than a stale embedded copy.
+/// `GET /ui/*path`. A missing file is a 404, not the page: these are the
+/// page's own files, never one of its routes. Under `LLMMAN_WEBUI_DIR`
+/// only images (the mark build.rs downloads, never in the tree) fall
+/// back to the binary; a missing source file stays a 404 rather than a
+/// stale embedded copy.
 pub(super) async fn handle_asset(UrlPath(path): UrlPath<String>, headers: HeaderMap) -> Response {
     if let Some(dir) = DEV_DIR.as_ref() {
         let response = serve_from_disk(dir, &path).await;
@@ -219,11 +262,129 @@ mod tests {
         // The page must reference its own assets under ui/ relatively, so
         // a gateway prefix works (docs/compose.md).
         assert!(html.contains("<!doctype html>"), "{html}");
-        assert!(html.contains("ui/app.js"), "{html}");
+        assert!(html.contains("\"ui/_expo/static/js/"), "{html}");
         assert!(
-            !html.contains("\"/ui/"),
+            !html.contains("\"/ui/") && !html.contains("src=\"/") && !html.contains("href=\"/"),
             "asset paths must be relative: {html}"
         );
+    }
+
+    /// The UI routes by path, so a browser reloading one of its routes
+    /// gets the page; an API path, or a client not asking for HTML, gets
+    /// the 404 it always did.
+    #[tokio::test]
+    async fn unrouted_page_paths_are_the_web_ui_for_browsers_only() {
+        let url = serve_router(test_state()).await;
+        let client = Client::builder().no_gzip().build().unwrap();
+        let html = |method, path: &str| {
+            client
+                .request(method, format!("{url}{path}"))
+                .header("accept", "text/html,application/xhtml+xml")
+        };
+        let root = html(reqwest::Method::GET, "/").send().await.unwrap();
+        let etag = root.headers()["etag"].clone();
+        let index = root.bytes().await.unwrap();
+
+        for path in ["/models", "/c/abc123", "/settings/keys?tab=1"] {
+            let page = html(reqwest::Method::GET, path).send().await.unwrap();
+            assert_eq!(page.status(), StatusCode::OK, "{path}");
+            assert_eq!(page.headers()["etag"], etag, "{path}");
+            assert_eq!(page.headers()["content-encoding"], "gzip", "{path}");
+            assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
+            assert_eq!(
+                page.headers()["content-security-policy"],
+                "frame-ancestors 'none'; base-uri 'self'",
+                "{path}"
+            );
+            assert_eq!(page.bytes().await.unwrap(), index, "{path}");
+        }
+        // What a nested link loads: index.html names its files as `ui/…`
+        // under the <base> its loader sets, which is `/` here.
+        let page = html(reqwest::Method::GET, "/c/abc123")
+            .send()
+            .await
+            .unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(&page.bytes().await.unwrap()[..]),
+            &mut text,
+        )
+        .unwrap();
+        let assets: Vec<&str> = text.split('"').filter(|s| s.starts_with("ui/")).collect();
+        assert!(assets.iter().any(|a| a.ends_with(".js")), "{text}");
+        for asset in assets {
+            let r = client.get(format!("{url}/{asset}")).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{asset}");
+        }
+        let head = html(reqwest::Method::HEAD, "/models").send().await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        // Media types are case-insensitive.
+        let upper = client
+            .get(format!("{url}/models"))
+            .header("accept", "Text/HTML")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upper.status(), StatusCode::OK);
+        let cached = html(reqwest::Method::GET, "/models")
+            .header("if-none-match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+
+        for path in [
+            "/api/nope",
+            "/v1/nope",
+            "/llmman/nope",
+            "/ui/nope.js",
+            "/gemini",
+            "/audio/nope",
+            "/metrics",
+            "//api/tags",
+            // Another site to a browser: never the page.
+            "//evil.example/c/x",
+            "///evil.example/models",
+        ] {
+            let r = html(reqwest::Method::GET, path).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let post = html(reqwest::Method::POST, "/models").send().await.unwrap();
+        assert_eq!(post.status(), StatusCode::NOT_FOUND);
+        let curl = client.get(format!("{url}/models")).send().await.unwrap();
+        assert_eq!(curl.status(), StatusCode::NOT_FOUND);
+        let json = client
+            .get(format!("{url}/models"))
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every embedded file is served at its own path, the export's route
+    /// chunks (`[id]-<hash>.js`) included: a browser sends the brackets
+    /// as they are.
+    #[tokio::test]
+    async fn every_web_ui_file_is_served_at_its_path() {
+        let url = serve_router(test_state()).await;
+        let client = Client::builder().no_gzip().build().unwrap();
+        assert!(webui::ASSETS.iter().any(|(p, ..)| p.contains('[')));
+        for (path, content_type, etag, _) in webui::ASSETS {
+            let r = client.get(format!("{url}/ui/{path}")).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(r.headers()["content-type"], *content_type, "{path}");
+            assert_eq!(r.headers()["etag"], *etag, "{path}");
+        }
+    }
+
+    /// The export's file names are hashed, so tests find theirs by kind.
+    fn asset_path(suffix: &str) -> String {
+        let (path, ..) = webui::ASSETS
+            .iter()
+            .find(|(p, ..)| p.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no web UI file ends with {suffix}"));
+        format!("/ui/{path}")
     }
 
     /// Assets come gzipped with a content ETag; a matching `If-None-Match`
@@ -232,11 +393,8 @@ mod tests {
     async fn web_ui_assets_are_gzipped_and_revalidate_by_etag() {
         let url = serve_router(test_state()).await;
         let client = Client::builder().no_gzip().build().unwrap();
-        let first = client
-            .get(format!("{url}/ui/app.css"))
-            .send()
-            .await
-            .unwrap();
+        let css = asset_path(".css");
+        let first = client.get(format!("{url}{css}")).send().await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(first.headers()["content-encoding"], "gzip");
         assert_eq!(first.headers()["content-type"], "text/css; charset=utf-8");
@@ -248,7 +406,7 @@ mod tests {
 
         for tag in [etag.clone(), format!("W/{etag}"), "*".to_string()] {
             let again = client
-                .get(format!("{url}/ui/app.css"))
+                .get(format!("{url}{css}"))
                 .header("if-none-match", &tag)
                 .send()
                 .await
@@ -267,18 +425,14 @@ mod tests {
             assert_eq!(page.headers()["x-frame-options"], "DENY", "{path}");
             assert_eq!(
                 page.headers()["content-security-policy"],
-                "frame-ancestors 'none'",
+                "frame-ancestors 'none'; base-uri 'self'",
                 "{path}"
             );
         }
-        let css = client
-            .get(format!("{url}/ui/app.css"))
-            .send()
-            .await
-            .unwrap();
+        let css = client.get(format!("{url}{css}")).send().await.unwrap();
         assert!(!css.headers().contains_key("x-frame-options"));
 
-        for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/vendor"] {
+        for missing in ["/ui/nope.js", "/ui/../Cargo.toml", "/ui/_expo"] {
             let r = client.get(format!("{url}{missing}")).send().await.unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{missing}");
         }
