@@ -7,7 +7,7 @@ already exists for the model format it finds, and runs it unmodified.
 |--------------|---------|---------------------|
 | GGUF | `llama-server` in a container | `--runtime docker` / `podman` (Linux only; what `auto` tries first): the `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for your GPU |
 | GGUF | [`llama-server`](https://github.com/ggml-org/llama.cpp) | `--runtime bin`: a prebuilt upstream release matching your OS/arch/GPU, downloaded and cached; `--runtime path`: the one on your `PATH` |
-| GGUF (ds4's own) | [`ds4-server`](https://github.com/antirez/ds4) | Your `PATH`, with `LLMMAN_GGUF_ENGINE=ds4` |
+| GGUF (ds4's own) | [`ds4-server`](https://github.com/antirez/ds4) | Your `PATH`: DeepSeek V4.1 GGUFs when it is there, every GGUF with `LLMMAN_GGUF_ENGINE=ds4` |
 | safetensors | `vllm` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-openai`, `rocm/vllm` or `vllm/vllm-openai-cpu` image for your GPU and architecture |
 | safetensors | [`vllm`](https://github.com/vllm-project/vllm) | Your `PATH` (every non-container runtime) |
 | safetensors | `sglang` in a container | `--runtime docker` / `podman` (Linux only) with `LLMMAN_SAFETENSORS_ENGINE=sglang`: the `lmsysorg/sglang` image for your GPU |
@@ -243,9 +243,13 @@ which runs with `--ipc=host` like vLLM's.
 
 ## ds4
 
-`LLMMAN_GGUF_ENGINE=ds4` sends GGUF models to
-[ds4](https://github.com/antirez/ds4)'s `ds4-server` instead of
-llama-server. ds4 is a native engine for DeepSeek V4 Flash and a few other
+With [ds4](https://github.com/antirez/ds4)'s `ds4-server` on `PATH`,
+DeepSeek V4.1 GGUFs (`general.architecture` `deepseek41`) go to it
+instead of llama-server. DeepSeek V4 (`deepseek4`) stays on llama-server,
+which loads llama.cpp's own V4 GGUFs; ds4 loads only the ones it
+publishes. `LLMMAN_GGUF_ENGINE=ds4` sends every GGUF to ds4-server, and
+`LLMMAN_GGUF_ENGINE=llama-server` none.
+ds4 is a native engine for DeepSeek V4 Flash and a few other
 models on Metal, CUDA and ROCm. It is not a general GGUF runner: it loads
 only the GGUFs the ds4 project publishes. ds4 has no release binaries.
 Build it with the `make` target for your GPU, then put `ds4-server` on

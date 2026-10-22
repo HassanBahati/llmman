@@ -125,7 +125,7 @@ Environment Variables:
       LLMMAN_SAFETENSORS_ENGINE      Engine for safetensors models: vllm or sglang (default: mlx_lm.server on macOS, installed at startup; else vllm)
       LLMMAN_VLLM_ARGS               Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every `vllm serve`, before llmman's --port/--host (e.g. \"--dtype bfloat16 --tp 2\")
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every sglang launch, before llmman's --port/--host (e.g. \"--disable-cuda-graph\")
-      LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 for ds4-server on PATH (default: llama-server)
+      LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 or llama-server (default: ds4-server on PATH for DeepSeek V4.1, else llama-server)
       LLMMAN_DS4_ARGS                Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every ds4-server launch, before llmman's --port/--host (e.g. \"--ssd-streaming\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
@@ -2200,8 +2200,10 @@ async fn resolve_target(
     let ds4 = gguf_goes_to_ds4(
         gguf_engine_from_env(),
         &model_path,
+        gguf_info.as_ref().and_then(|info| info.architecture()),
         embedding_ctx.is_some(),
         decision,
+        backend::ds4_server_on_path,
     );
     let load_ctx = ctx_for_load(opts.ctx, &model_path, ds4);
     // A model loaded with another window goes first, and its slot is this
@@ -4501,11 +4503,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             backend::SAFETENSORS_ENGINE_VAR
         );
     }
-    if gguf_engine_from_env() == GgufEngine::Ds4 {
-        eprintln!(
+    match gguf_engine_from_env() {
+        GgufEngine::Ds4 => eprintln!(
             "[llmman] GGUF models go to ds4-server ({})",
             backend::GGUF_ENGINE_VAR
-        );
+        ),
+        GgufEngine::LlamaServer => eprintln!(
+            "[llmman] GGUF models go to llama-server ({})",
+            backend::GGUF_ENGINE_VAR
+        ),
+        GgufEngine::Auto if backend::ds4_server_on_path() => {
+            eprintln!("[llmman] DeepSeek V4.1 GGUFs go to ds4-server (on PATH)")
+        }
+        GgufEngine::Auto => {}
     }
 
     // Before anything binds, so a misconfiguration fails at exec.

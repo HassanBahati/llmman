@@ -62,18 +62,21 @@ pub(super) fn safetensors_engine_from_env() -> SafetensorsEngine {
 }
 
 /// `LLMMAN_GGUF_ENGINE`: which engine serves a [`ModelPath::Gguf`] load
-/// (see [`gguf_goes_to_ds4`]). `Auto` (unset) is llama-server.
+/// (see [`gguf_goes_to_ds4`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GgufEngine {
+    /// `ds4-server` for a [`DS4_ARCHITECTURES`] model when `ds4-server`
+    /// is on `PATH`, llama-server otherwise.
     Auto,
-    /// `ds4-server` — see [`spawn_ds4_server`].
+    /// `ds4-server` for every generation GGUF — see [`spawn_ds4_server`].
     Ds4,
+    LlamaServer,
 }
 
 pub(super) const GGUF_ENGINE_VAR: &str = "LLMMAN_GGUF_ENGINE";
 
-/// `ds4` (any case); unset or empty is `Auto`; anything else `None`, for
-/// the caller to warn about.
+/// `ds4` or `llama-server` (any case); unset or empty is `Auto`; anything
+/// else `None`, for the caller to warn about.
 pub(super) fn parse_gguf_engine(value: Option<&str>) -> Option<GgufEngine> {
     let value = value.map(str::trim).unwrap_or_default();
     if value.is_empty() {
@@ -81,6 +84,7 @@ pub(super) fn parse_gguf_engine(value: Option<&str>) -> Option<GgufEngine> {
     }
     match value.to_ascii_lowercase().as_str() {
         "ds4" => Some(GgufEngine::Ds4),
+        "llama-server" => Some(GgufEngine::LlamaServer),
         _ => None,
     }
 }
@@ -91,24 +95,44 @@ pub(super) fn gguf_engine_from_env() -> GgufEngine {
     static WARNED: std::sync::Once = std::sync::Once::new();
     engine_from_env(
         GGUF_ENGINE_VAR,
-        "ds4",
+        "one of ds4/llama-server",
         &WARNED,
         parse_gguf_engine,
         GgufEngine::Auto,
     )
 }
 
-/// Whether `model` goes to `ds4-server` under `engine`: only a
-/// [`ModelPath::Gguf`], so every other format keeps its own engine and
-/// runtime. Embedding and decision models stay on llama-server: ds4 has
-/// no `/v1/embeddings` or `/v1/systemone`.
+/// The `general.architecture`s [`GgufEngine::Auto`] sends to ds4-server.
+/// Not `deepseek4`: llama.cpp loads its own V4 GGUFs, which ds4 rejects.
+pub(super) const DS4_ARCHITECTURES: &[&str] = &["deepseek41"];
+
+pub(super) fn ds4_server_on_path() -> bool {
+    crate::find_on_path("ds4-server").is_some()
+}
+
+/// Whether `model`, of GGUF architecture `arch`, goes to `ds4-server`
+/// under `engine`: only a [`ModelPath::Gguf`], so every other format
+/// keeps its own engine and runtime. Embedding and decision models stay
+/// on llama-server: ds4 has no `/v1/embeddings` or `/v1/systemone`.
+/// `ds4_on_path` is called only for an `Auto` [`DS4_ARCHITECTURES`] model.
 pub(super) fn gguf_goes_to_ds4(
     engine: GgufEngine,
     model: &ModelPath,
+    arch: Option<&str>,
     embedding: bool,
     decision: bool,
+    ds4_on_path: impl FnOnce() -> bool,
 ) -> bool {
-    engine == GgufEngine::Ds4 && matches!(model, ModelPath::Gguf(..)) && !embedding && !decision
+    if !matches!(model, ModelPath::Gguf(..)) || embedding || decision {
+        return false;
+    }
+    match engine {
+        GgufEngine::Ds4 => true,
+        GgufEngine::LlamaServer => false,
+        GgufEngine::Auto => {
+            arch.is_some_and(|arch| DS4_ARCHITECTURES.contains(&arch)) && ds4_on_path()
+        }
+    }
 }
 
 /// `parse` on the environment variable `var`, warning once through
@@ -1367,31 +1391,83 @@ mod tests {
     }
 
     #[test]
-    fn parse_gguf_engine_accepts_ds4_or_nothing() {
+    fn parse_gguf_engine_accepts_ds4_llama_server_or_nothing() {
         assert_eq!(parse_gguf_engine(None), Some(GgufEngine::Auto));
         assert_eq!(parse_gguf_engine(Some("")), Some(GgufEngine::Auto));
         assert_eq!(parse_gguf_engine(Some("  ")), Some(GgufEngine::Auto));
         assert_eq!(parse_gguf_engine(Some("ds4")), Some(GgufEngine::Ds4));
         assert_eq!(parse_gguf_engine(Some(" DS4 ")), Some(GgufEngine::Ds4));
+        assert_eq!(
+            parse_gguf_engine(Some("Llama-Server")),
+            Some(GgufEngine::LlamaServer)
+        );
         // Unknown names are reported by the caller, not silently mapped.
-        assert_eq!(parse_gguf_engine(Some("llama-server")), None);
+        assert_eq!(parse_gguf_engine(Some("llama")), None);
         assert_eq!(parse_gguf_engine(Some("ds4-server")), None);
     }
 
     #[test]
     fn only_generation_ggufs_go_to_ds4() {
         let gguf = ModelPath::Gguf(PathBuf::from("/m/ds4.gguf"), None);
-        assert!(gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, false));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, true, false));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &gguf, false, true));
-        assert!(!gguf_goes_to_ds4(GgufEngine::Auto, &gguf, false, false));
-        // Other formats keep their own engine and container runtime.
-        for other in [
-            ModelPath::SafeTensors(PathBuf::from("/m/st")),
-            ModelPath::Omni(PathBuf::from("/m/omni")),
-        ] {
-            assert!(!gguf_goes_to_ds4(GgufEngine::Ds4, &other, false, false));
+        let goes = |engine, model: &ModelPath, embedding, decision| {
+            gguf_goes_to_ds4(
+                engine,
+                model,
+                Some("deepseek41"),
+                embedding,
+                decision,
+                || true,
+            )
+        };
+        for engine in [GgufEngine::Ds4, GgufEngine::Auto] {
+            assert!(goes(engine, &gguf, false, false));
+            assert!(!goes(engine, &gguf, true, false));
+            assert!(!goes(engine, &gguf, false, true));
+            // Other formats keep their own engine and container runtime.
+            for other in [
+                ModelPath::SafeTensors(PathBuf::from("/m/st")),
+                ModelPath::Omni(PathBuf::from("/m/omni")),
+            ] {
+                assert!(!goes(engine, &other, false, false));
+            }
         }
+        assert!(!goes(GgufEngine::LlamaServer, &gguf, false, false));
+    }
+
+    #[test]
+    fn auto_sends_only_deepseek_v41_ggufs_to_a_ds4_server_on_path() {
+        let gguf = ModelPath::Gguf(PathBuf::from("/m/model.gguf"), None);
+        let auto = |arch, on_path| {
+            gguf_goes_to_ds4(GgufEngine::Auto, &gguf, arch, false, false, || on_path)
+        };
+        assert!(auto(Some("deepseek41"), true));
+        assert!(!auto(Some("deepseek41"), false));
+        for arch in [
+            Some("deepseek4"),
+            Some("deepseek2"),
+            Some("glm-dsa"),
+            Some("llama"),
+            None,
+        ] {
+            assert!(!auto(arch, true), "{arch:?}");
+        }
+        // `ds4` sends any architecture; neither call checks PATH.
+        assert!(gguf_goes_to_ds4(
+            GgufEngine::Ds4,
+            &gguf,
+            Some("llama"),
+            false,
+            false,
+            || unreachable!()
+        ));
+        assert!(!gguf_goes_to_ds4(
+            GgufEngine::Auto,
+            &gguf,
+            Some("llama"),
+            false,
+            false,
+            || unreachable!()
+        ));
     }
 
     #[test]
