@@ -43,8 +43,9 @@ pub(super) struct Policy {
 }
 
 impl Policy {
-    pub(super) fn from_env() -> Self {
-        let setting = ShellSetting::parse(std::env::var("LLMMAN_SHELL").ok().as_deref());
+    pub(super) fn from_env() -> anyhow::Result<Self> {
+        let setting = ShellSetting::parse(std::env::var("LLMMAN_SHELL").ok().as_deref())
+            .map_err(|e| anyhow::anyhow!("LLMMAN_SHELL: {e}"))?;
         let disabled = if setting == ShellSetting::Off {
             Some("LLMMAN_SHELL is off".to_string())
         } else if !crate::daemon::reachable_only_locally() {
@@ -62,14 +63,14 @@ impl Policy {
         let bind = crate::daemon::bind_addr();
         let host = bind.rsplit_once(':').map_or(bind.as_str(), |(h, _)| h);
         origins.extend([format!("http://{host}:*"), format!("https://{host}:*")]);
-        Self {
+        Ok(Self {
             disabled,
             origins,
             command: match setting {
                 ShellSetting::Command(argv) => argv,
                 _ => Vec::new(),
             },
-        }
+        })
     }
 
     /// Whether a page at `origin` (or a client with no page) may open one.
@@ -108,20 +109,21 @@ enum ShellSetting {
     Default,
     /// `0`/`false`/`no`/`off`.
     Off,
-    /// Anything else, split on whitespace.
+    /// Anything else, split by [`super::backend::split_extra_args`].
     Command(Vec<String>),
 }
 
 impl ShellSetting {
-    fn parse(value: Option<&str>) -> Self {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-            return Self::Default;
+            return Ok(Self::Default);
         };
-        match raw.to_ascii_lowercase().as_str() {
+        Ok(match raw.to_ascii_lowercase().as_str() {
             "0" | "false" | "no" | "off" => Self::Off,
             "1" | "true" | "yes" | "on" => Self::Default,
-            _ => Self::Command(raw.split_whitespace().map(str::to_string).collect()),
-        }
+            // Untrimmed, so an error's character position is the variable's.
+            _ => Self::Command(super::backend::split_extra_args(value)?),
+        })
     }
 }
 
@@ -384,7 +386,7 @@ mod tests {
     #[test]
     fn llmman_shell_env_spellings() {
         for v in ["0", "false", "NO", " off "] {
-            assert_eq!(ShellSetting::parse(Some(v)), ShellSetting::Off, "{v:?}");
+            assert_eq!(ShellSetting::parse(Some(v)), Ok(ShellSetting::Off), "{v:?}");
         }
         for v in [
             None,
@@ -394,15 +396,28 @@ mod tests {
             Some("true"),
             Some("ON"),
         ] {
-            assert_eq!(ShellSetting::parse(v), ShellSetting::Default, "{v:?}");
+            assert_eq!(ShellSetting::parse(v), Ok(ShellSetting::Default), "{v:?}");
         }
+        let command = |argv: &[&str]| {
+            Ok(ShellSetting::Command(
+                argv.iter().map(|a| a.to_string()).collect(),
+            ))
+        };
         assert_eq!(
             ShellSetting::parse(Some("  tmux new -A  -s llmman ")),
-            ShellSetting::Command(
-                ["tmux", "new", "-A", "-s", "llmman"]
-                    .map(str::to_string)
-                    .to_vec()
-            )
+            command(&["tmux", "new", "-A", "-s", "llmman"])
+        );
+        assert_eq!(
+            ShellSetting::parse(Some("sh -c 'exec tmux new -A'")),
+            command(&["sh", "-c", "exec tmux new -A"])
+        );
+        assert_eq!(
+            ShellSetting::parse(Some(r#""C:\Program Files\Git\bin\bash.exe" -l"#)),
+            command(&[r"C:\Program Files\Git\bin\bash.exe", "-l"])
+        );
+        assert_eq!(
+            ShellSetting::parse(Some("  sh -c 'exec tmux")),
+            Err("missing closing quote for the ' at character 9".into())
         );
     }
 }
