@@ -38,7 +38,8 @@
 //! engine on `PATH`; for mlx, Apple Silicon macOS too) isn't met. The
 //! vllm and sglang ones run a daemon of their own on a fresh port (the
 //! engine choice is daemon-wide environment) — see
-//! `serve_safetensors_with_engine`.
+//! `serve_with_engine`. So does [`serve_ds4_gguf_model`], for
+//! `ds4-server`.
 //!
 //! `llmman serve` is a process-wide singleton bound to a single loopback
 //! port (127.0.0.1:17434 by default, or wherever `LLMMAN_HOST` points —
@@ -2667,12 +2668,12 @@ const VLLM_MODEL: &str = "qwen3.5:0.8b-safetensors";
 const SGLANG_MODEL: &str = "hf.co/HuggingFaceTB/SmolLM2-135M-Instruct";
 
 /// A cold ~1.7GB pull plus the daemon's 15m load deadline (see
-/// `serve_safetensors_with_engine`).
+/// `serve_with_engine`).
 #[cfg(unix)]
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// A loopback port nothing is listening on right now, for a test's own
-/// daemon (see [`serve_safetensors_with_engine`]).
+/// daemon (see [`serve_with_engine`]).
 #[cfg(unix)]
 fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -2764,22 +2765,16 @@ fn spawn_test_daemon(host: &str, env: &[(&str, &str)]) -> std::process::Child {
 }
 
 /// `llmman run <model>` against a daemon of its own (fresh port,
-/// `LLMMAN_SAFETENSORS_ENGINE=<engine>` plus `env`), asserting `llmman ps`
-/// reports `<engine> (local)` — the engine asked for, not the one the
-/// daemon would pick alone (mlx on macOS, vllm on Linux; either could
-/// answer the prompt and mask a selection regression). The daemon is
-/// torn down afterwards. The shared daemon's [`MODEL`] is unloaded first:
-/// its 256k context is several GiB a CPU engine start on a 16GB runner
+/// `<engine_var>=<engine>` plus `env`), asserting `llmman ps` reports
+/// `<engine> (local)`: the daemon's default engine could also answer
+/// the prompt and mask a selection regression. Then `after` with the
+/// daemon's host while the model is still loaded. The daemon is torn
+/// down afterwards. The shared daemon's [`MODEL`] is unloaded first: its
+/// 256k context is several GiB a CPU engine start on a 16GB runner
 /// cannot spare. `--think false --num-predict 32`: see `warm_model`.
 #[cfg(unix)]
-fn serve_safetensors_with_engine(engine: &str, model: &str, env: &[(&str, &str)]) {
-    serve_safetensors_with_engine_then(engine, model, env, |_| {});
-}
-
-/// [`serve_safetensors_with_engine`], then `after` with the daemon's host
-/// while the model is still loaded.
-#[cfg(unix)]
-fn serve_safetensors_with_engine_then(
+fn serve_with_engine(
+    engine_var: &str,
     engine: &str,
     model: &str,
     env: &[(&str, &str)],
@@ -2794,10 +2789,7 @@ fn serve_safetensors_with_engine_then(
     let host = format!("127.0.0.1:{}", free_loopback_port());
     // 15m: what vllm-plugin's e2e allows a CPU `vllm serve` to become
     // healthy in; llmman's 10m default gave up first on slow runners.
-    let mut daemon_env = vec![
-        ("LLMMAN_SAFETENSORS_ENGINE", engine),
-        ("LLMMAN_LOAD_TIMEOUT", "15m"),
-    ];
+    let mut daemon_env = vec![(engine_var, engine), ("LLMMAN_LOAD_TIMEOUT", "15m")];
     daemon_env.extend_from_slice(env);
     let mut daemon = spawn_test_daemon(&host, &daemon_env);
     eprintln!("[test] {engine}: daemon pid {} on {host}", daemon.id());
@@ -2812,11 +2804,7 @@ fn serve_safetensors_with_engine_then(
             .arg("--num-predict")
             .arg("32")
             .arg(PROMPT);
-        let output = spawn_with_timeout(
-            cmd,
-            ENGINE_TIMEOUT,
-            &format!("llmman run ({engine} safetensors)"),
-        );
+        let output = spawn_with_timeout(cmd, ENGINE_TIMEOUT, &format!("llmman run ({engine})"));
         assert!(
             output.status.success(),
             "llmman run {model} {PROMPT:?} via {engine} failed (status: {:?})\n\
@@ -2856,7 +2844,7 @@ fn serve_safetensors_with_engine_then(
         let expected = format!("{engine} (local)");
         assert!(
             model_row.contains(&expected),
-            "{model} was not served by {engine} (LLMMAN_SAFETENSORS_ENGINE regression?) \
+            "{model} was not served by {engine} ({engine_var} regression?) \
              — `llmman ps` row: {model_row:?}"
         );
         after(&host);
@@ -2891,7 +2879,8 @@ fn serve_vllm_safetensors_model() {
         "{} --host 0.0.0.0",
         std::env::var("LLMMAN_VLLM_ARGS").unwrap_or_default()
     );
-    serve_safetensors_with_engine_then(
+    serve_with_engine(
+        "LLMMAN_SAFETENSORS_ENGINE",
         "vllm",
         VLLM_MODEL,
         &[
@@ -2946,6 +2935,8 @@ fn non_loopback_ipv4() -> Option<std::net::IpAddr> {
 /// variables (`SGLANG_USE_CPU_ENGINE`/`SGLANG_USE_MLX`,
 /// `LLMMAN_SGLANG_ARGS=--disable-cuda-graph`) come from the CI step.
 /// Skips on x86_64 without AVX-512 ([`host_can_run_sglang_cpu_kernels`]).
+/// `--host 0.0.0.0` is appended to `LLMMAN_SGLANG_ARGS`, and the engine
+/// must still listen only on loopback.
 #[cfg(unix)]
 #[test]
 fn serve_sglang_safetensors_model() {
@@ -2964,7 +2955,69 @@ fn serve_sglang_safetensors_model() {
         );
         return;
     }
-    serve_safetensors_with_engine("sglang", SGLANG_MODEL, &[("LLMMAN_CONTEXT_LENGTH", "1024")]);
+    let sglang_args = format!(
+        "{} --host 0.0.0.0",
+        std::env::var("LLMMAN_SGLANG_ARGS").unwrap_or_default()
+    );
+    serve_with_engine(
+        "LLMMAN_SAFETENSORS_ENGINE",
+        "sglang",
+        SGLANG_MODEL,
+        &[
+            ("LLMMAN_CONTEXT_LENGTH", "1024"),
+            ("LLMMAN_SGLANG_ARGS", &sglang_args),
+        ],
+        assert_engine_listens_only_on_loopback,
+    );
+}
+
+/// `llmman serve`'s `ds4` backend end to end, on the ds4 model
+/// `LLMMAN_E2E_DS4_MODEL` names; it skips, rather than pulls, a model
+/// that is not already in the store. CI skips it: ds4-server needs Metal
+/// or CUDA and a ds4 GGUF too large for a runner. `--host 0.0.0.0` is
+/// appended to `LLMMAN_DS4_ARGS`, and the engine must still listen only
+/// on loopback.
+#[cfg(unix)]
+#[test]
+fn serve_ds4_gguf_model() {
+    eprintln!("[test] serve_ds4_gguf_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] serve_ds4_gguf_model: acquired SERIAL");
+
+    if !on_path("ds4-server") {
+        eprintln!("skipping: ds4-server not on PATH");
+        return;
+    }
+    let Some(model) = std::env::var("LLMMAN_E2E_DS4_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+    else {
+        eprintln!("skipping: LLMMAN_E2E_DS4_MODEL is not set to a ds4 model ref");
+        return;
+    };
+    // `llmman run` pulls a missing model; `show` only reads the local store,
+    // so a model that is not there skips instead of starting a huge download.
+    let in_store = Command::new(llmman_bin())
+        .args(["show", "--parameters", &model])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !in_store {
+        eprintln!("skipping: {model} is not in the local store; pull it first");
+        return;
+    }
+    let ds4_args = format!(
+        "{} --host 0.0.0.0",
+        std::env::var("LLMMAN_DS4_ARGS").unwrap_or_default()
+    );
+    serve_with_engine(
+        "LLMMAN_GGUF_ENGINE",
+        "ds4",
+        &model,
+        &[("LLMMAN_DS4_ARGS", &ds4_args)],
+        assert_engine_listens_only_on_loopback,
+    );
 }
 
 /// llmman never links against llama.cpp: `mediagen::ffi` dlopens the
