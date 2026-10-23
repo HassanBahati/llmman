@@ -437,6 +437,8 @@ fn extra_args_from_env(var: &str) -> Vec<String> {
     split_extra_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
 }
 
+/// Fails on the first `LLMMAN_*_ARGS` that [`split_extra_args`] rejects,
+/// naming the variable and the quote's position but not the value.
 pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
     for var in [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR] {
         if let Ok(value) = std::env::var(var) {
