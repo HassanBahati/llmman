@@ -399,7 +399,7 @@ pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 /// `#` is literal. `LLMMAN_*_ARGS` is appended after llmman's own flags, so
 /// a repeated flag wins on an argparse engine, except `--port` and
 /// `--host` (see [`append_extra_args`]).
-pub(super) fn split_extra_args(value: Option<&str>) -> Result<Vec<String>, String> {
+pub(super) fn split_quoted_args(value: Option<&str>) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let mut chars = value.unwrap_or_default().chars().enumerate().peekable();
     loop {
@@ -431,18 +431,18 @@ pub(super) fn split_extra_args(value: Option<&str>) -> Result<Vec<String>, Strin
     }
 }
 
-/// [`split_extra_args`] on the environment variable `var`; empty if it
+/// [`split_quoted_args`] on the environment variable `var`; empty if it
 /// does not split, which [`check_extra_args_env`] refuses at startup.
 fn extra_args_from_env(var: &str) -> Vec<String> {
-    split_extra_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
+    split_quoted_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
 }
 
-/// Fails on the first `LLMMAN_*_ARGS` that [`split_extra_args`] rejects,
+/// Fails on the first `LLMMAN_*_ARGS` that [`split_quoted_args`] rejects,
 /// naming the variable and the quote's position but not the value.
 pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
     for var in [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR] {
         if let Ok(value) = std::env::var(var) {
-            split_extra_args(Some(&value)).map_err(|e| anyhow!("{var}: {e}"))?;
+            split_quoted_args(Some(&value)).map_err(|e| anyhow!("{var}: {e}"))?;
         }
     }
     Ok(())
@@ -1310,7 +1310,7 @@ mod tests {
         let mut args = Vec::new();
         append_extra_args(
             &mut args,
-            split_extra_args(Some("--por 1 --hos 127.0.0.1 --tp 2")).unwrap(),
+            split_quoted_args(Some("--por 1 --hos 127.0.0.1 --tp 2")).unwrap(),
             "0.0.0.0",
             41234,
         );
@@ -1511,9 +1511,9 @@ mod tests {
     }
 
     #[test]
-    fn split_extra_args_splits_on_whitespace_and_leading_quotes() {
+    fn split_quoted_args_splits_on_whitespace_and_leading_quotes() {
         fn split(value: Option<&str>) -> Vec<String> {
-            split_extra_args(value).unwrap()
+            split_quoted_args(value).unwrap()
         }
         assert_eq!(split(None), Vec::<String>::new());
         assert_eq!(split(Some("")), Vec::<String>::new());
@@ -1547,7 +1547,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            split_extra_args(Some("--api-key 'sk-secret")),
+            split_quoted_args(Some("--api-key 'sk-secret")),
             Err("missing closing quote for the ' at character 11".into())
         );
     }
