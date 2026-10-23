@@ -393,11 +393,12 @@ pub(super) const SGLANG_ARGS_VAR: &str = "LLMMAN_SGLANG_ARGS";
 /// The same for `ds4-server`.
 pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
-/// Splits an `LLMMAN_*_ARGS` value on whitespace. An argument that starts
-/// with `'` or `"` runs to the matching quote, so it can hold a space, and
-/// loses the quotes; any other quote, backslash or `#` is literal.
-/// Appended after llmman's own flags, so a repeated flag wins on an
-/// argparse engine, except `--port` and `--host` (see [`append_extra_args`]).
+/// Splits an `LLMMAN_*_ARGS` or `LLMMAN_SHELL` value on whitespace. An
+/// argument that starts with `'` or `"` runs to the matching quote, so it
+/// can hold a space, and loses the quotes; any other quote, backslash or
+/// `#` is literal. `LLMMAN_*_ARGS` is appended after llmman's own flags, so
+/// a repeated flag wins on an argparse engine, except `--port` and
+/// `--host` (see [`append_extra_args`]).
 pub(super) fn split_extra_args(value: Option<&str>) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let mut chars = value.unwrap_or_default().chars().enumerate().peekable();

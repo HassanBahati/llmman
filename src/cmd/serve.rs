@@ -4356,6 +4356,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
     // Before the store is touched, so a bad value has no side effects.
     backend::check_extra_args_env()?;
+    let shell = shell::Policy::from_env()?;
     let llama_cpp_version = runtime::llama_cpp_pin(_args.llama_cpp_version.as_deref());
 
     // Settle `--runtime` and fetch its llama.cpp before anything binds,
@@ -4594,7 +4595,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         usage_log: crate::usage::enabled_from_env()
             .then(crate::usage::path)
             .transpose()?,
-        shell: shell::Policy::from_env(),
+        shell,
         auth,
         peer_key: crate::auth::peer_key(),
         client,
