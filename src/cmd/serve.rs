@@ -127,6 +127,7 @@ Environment Variables:
       LLMMAN_SGLANG_ARGS             Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every sglang launch, before llmman's --port/--host (e.g. \"--disable-cuda-graph\")
       LLMMAN_GGUF_ENGINE             Engine for GGUF generation models: ds4 or llama-server (default: ds4-server on PATH for DeepSeek V4.1, else llama-server)
       LLMMAN_DS4_ARGS                Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every ds4-server launch, before llmman's --port/--host (e.g. \"--ssd-streaming\")
+      LLMMAN_LLAMA_ARGS              Extra whitespace-separated arguments ('quote' one to keep its spaces) appended to every llama-server launch; --port/--host are refused (e.g. \"--slot-prompt-similarity 0.5\")
       LLMMAN_NOHISTORY               Do not record prompts for `llmman log`
       LLMMAN_NOUSAGE                 Do not record token usage and cost for `llmman usage`
       LLMMAN_NOPRUNE                 Do not prune model blobs on startup
@@ -2302,6 +2303,7 @@ async fn resolve_target(
     let mut split_mode_relaxed = false;
     let mut process;
     let mut port = find_free_port()?;
+    let llama_extra_args = backend::extra_args_from_env(backend::LLAMA_ARGS_VAR);
     loop {
         eprintln!("[llmman] loading {model_ref} on port {port}");
         // See backend_ctx_size's doc comment — the value actually
@@ -2330,6 +2332,7 @@ async fn resolve_target(
             // full precedence chain this `.or` implements.
             threads: opts.threads.or(state.0.threads),
             cpus: state.0.cpu_limit,
+            extra_args: &llama_extra_args,
         };
         // Every piped child gets an output tail for crash reasons; only
         // llama-server ones join the OOM retry loop below, whose

@@ -750,6 +750,9 @@ pub struct LlamaOptions<'a> {
     /// Snapshotted at startup together with `threads`, so the two
     /// always agree.
     pub cpus: Option<f64>,
+
+    /// The split `LLMMAN_LLAMA_ARGS`, after every flag above.
+    pub extra_args: &'a [String],
 }
 
 /// Callers must stop this gracefully (SIGTERM, not the default
@@ -833,6 +836,7 @@ fn llama_run_args(
         batch_size,
         threads,
         cpus,
+        extra_args,
     } = opts;
     let mut args = run_args(backend.engine_args(), port, passthrough_vars, cpus);
     args.push("-v".into());
@@ -899,6 +903,7 @@ fn llama_run_args(
         args.push("--threads".into());
         args.push(n.to_string());
     }
+    args.extend(extra_args.iter().cloned());
     args
 }
 
@@ -1706,6 +1711,7 @@ mod tests {
             batch_size: None,
             threads,
             cpus,
+            extra_args: &[],
         };
         let image = "ghcr.io/ggml-org/llama.cpp:server";
         let argv = |o| {
@@ -1729,6 +1735,37 @@ mod tests {
         assert!(
             !args.iter().any(|a| a == "--cpus" || a == "--threads"),
             "{args:?}"
+        );
+    }
+
+    #[test]
+    fn llama_container_ends_with_the_extra_args() {
+        let opts = LlamaOptions {
+            port: 8080,
+            ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
+            context_shift: true,
+            split_mode: None,
+            num_parallel: None,
+            embeddings: false,
+            batch_size: None,
+            threads: Some(2),
+            cpus: None,
+            extra_args: &["--slot-prompt-similarity".into(), "0.5".into()],
+        };
+        let args = llama_run_args(
+            GpuBackend::Cpu,
+            "ghcr.io/ggml-org/llama.cpp:server".into(),
+            "/cache/blobs",
+            "sha256-abc",
+            None,
+            &[],
+            opts,
+        );
+        assert_eq!(
+            args[args.len() - 4..],
+            ["--threads", "2", "--slot-prompt-similarity", "0.5"]
         );
     }
 

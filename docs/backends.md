@@ -79,6 +79,9 @@ runtimes (which `auto` prefers for that reason) have CUDA images.
 
 Context length, parallel slots, flash attention, KV-cache type and GPU
 split are environment variables; see [configuration.md](configuration.md).
+`LLMMAN_LLAMA_ARGS` appends anything else (`--slot-prompt-similarity
+0.5`) to the `llama-server` command line, local or in a container,
+except `--port` and `--host`, which llmman sets itself.
 
 ### In a container
 
