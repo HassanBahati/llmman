@@ -146,6 +146,7 @@ Environment Variables:
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
       LLAMA_ARG_THREADS              Thread count for llama-server (default: half the available CPUs above 8, else all of them)
+      LLMMAN_SHELL                   The web UI's Shell: off to remove it, or a command to run ('quote' an argument to keep its spaces) (default: the login shell)
 ";
 
 #[derive(Args, Debug)]
