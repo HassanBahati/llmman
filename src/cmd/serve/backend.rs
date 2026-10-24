@@ -245,6 +245,7 @@ pub(super) async fn spawn_llama_server(
         threads,
         // A local child shares the daemon's cgroup already.
         cpus: _,
+        extra_args,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -309,6 +310,7 @@ pub(super) async fn spawn_llama_server(
         let n = n.to_string();
         cmd.args(["-b", &n, "-ub", &n]);
     }
+    cmd.args(extra_args);
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
     for var in GPU_VISIBLE_DEVICE_VARS {
@@ -393,6 +395,10 @@ pub(super) const SGLANG_ARGS_VAR: &str = "LLMMAN_SGLANG_ARGS";
 /// The same for `ds4-server`.
 pub(super) const DS4_ARGS_VAR: &str = "LLMMAN_DS4_ARGS";
 
+/// The same for `llama-server`, without `--port`/`--host`
+/// ([`check_extra_args_env`]): llama-server deprecates repeating a flag.
+pub(super) const LLAMA_ARGS_VAR: &str = "LLMMAN_LLAMA_ARGS";
+
 /// Splits an `LLMMAN_*_ARGS` or `LLMMAN_SHELL` value on whitespace. An
 /// argument that starts with `'` or `"` runs to the matching quote, so it
 /// can hold a space, and loses the quotes; any other quote, backslash or
@@ -433,16 +439,22 @@ pub(super) fn split_quoted_args(value: Option<&str>) -> Result<Vec<String>, Stri
 
 /// [`split_quoted_args`] on the environment variable `var`; empty if it
 /// does not split, which [`check_extra_args_env`] refuses at startup.
-fn extra_args_from_env(var: &str) -> Vec<String> {
+pub(super) fn extra_args_from_env(var: &str) -> Vec<String> {
     split_quoted_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
 }
 
 /// Fails on the first `LLMMAN_*_ARGS` that [`split_quoted_args`] rejects,
-/// naming the variable and the quote's position but not the value.
+/// naming the variable and the quote's position but not the value, or on
+/// `--port`/`--host` in `LLMMAN_LLAMA_ARGS`.
 pub(super) fn check_extra_args_env() -> anyhow::Result<()> {
-    for var in [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR] {
+    for var in [VLLM_ARGS_VAR, SGLANG_ARGS_VAR, DS4_ARGS_VAR, LLAMA_ARGS_VAR] {
         if let Ok(value) = std::env::var(var) {
-            split_quoted_args(Some(&value)).map_err(|e| anyhow!("{var}: {e}"))?;
+            let args = split_quoted_args(Some(&value)).map_err(|e| anyhow!("{var}: {e}"))?;
+            if var == LLAMA_ARGS_VAR {
+                if let Some(flag) = args.iter().find(|a| *a == "--port" || *a == "--host") {
+                    anyhow::bail!("{var}: llmman sets {flag} itself");
+                }
+            }
         }
     }
     Ok(())
@@ -1550,6 +1562,27 @@ mod tests {
             split_quoted_args(Some("--api-key 'sk-secret")),
             Err("missing closing quote for the ' at character 11".into())
         );
+    }
+
+    #[test]
+    fn llama_args_may_not_set_the_port_or_host() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (value, refused) in [
+            ("--slot-prompt-similarity 0.5", None),
+            ("--threads 2 --host 0.0.0.0", Some("--host")),
+            ("--port 1", Some("--port")),
+        ] {
+            let _var = EnvVar::set(LLAMA_ARGS_VAR, value);
+            assert_eq!(
+                check_extra_args_env().map_err(|e| e.to_string()),
+                refused.map_or(Ok(()), |flag| Err(format!(
+                    "{LLAMA_ARGS_VAR}: llmman sets {flag} itself"
+                ))),
+                "{value}"
+            );
+        }
     }
 
     #[test]
