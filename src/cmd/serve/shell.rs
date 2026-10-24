@@ -109,7 +109,7 @@ enum ShellSetting {
     Default,
     /// `0`/`false`/`no`/`off`.
     Off,
-    /// Anything else, split by [`super::backend::split_extra_args`].
+    /// Anything else, split by [`super::backend::split_quoted_args`].
     Command(Vec<String>),
 }
 
@@ -122,7 +122,7 @@ impl ShellSetting {
             "0" | "false" | "no" | "off" => Self::Off,
             "1" | "true" | "yes" | "on" => Self::Default,
             // Untrimmed, so an error's character position is the variable's.
-            _ => Self::Command(super::backend::split_extra_args(value)?),
+            _ => Self::Command(super::backend::split_quoted_args(value)?),
         })
     }
 }

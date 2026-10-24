@@ -114,7 +114,9 @@ way:
    allowed: it already had a shell to run from.
 3. **`LLMMAN_SHELL=off`** removes it entirely for an operator who wants
    the UI without it. Any other value is the program to run instead of
-   the login shell (`LLMMAN_SHELL="tmux new -A -s llmman"`).
+   the login shell, split like `LLMMAN_VLLM_ARGS`, so a quoted argument
+   keeps its spaces (`LLMMAN_SHELL="tmux new -A -s llmman"`,
+   `LLMMAN_SHELL="sh -c 'exec tmux new -A -s llmman'"`).
 
 `GET /llmman/shell` without a WebSocket upgrade always answers `200` with
 `{"enabled": true}` or `{"enabled": false, "reason": "…"}`; only the
