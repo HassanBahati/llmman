@@ -1,7 +1,7 @@
 // The active llmman serve as the frame shows it: whether it answers (a
-// `/api/version` poll every 15 s, as llmman's web UI drives its status dot)
-// and which optional features it has (daemonFeatures.ts). Screens read it
-// with `useDaemon()`.
+// `/api/version` poll every 15 s, every 3 s while it doesn't, as llmman's
+// web UI drives its status dot) and which optional features it has
+// (daemonFeatures.ts). Screens read it with `useDaemon()`.
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -12,6 +12,7 @@ import { detectFeatures, type DaemonFeatures } from "@/lib/daemonFeatures";
 import { useServers } from "@/lib/ServersContext";
 
 export const POLL_MS = 15_000;
+export const UNREACHABLE_POLL_MS = 3_000;
 
 export interface DaemonState {
   /** Null until the first answer (or failure) for this server. */
@@ -75,10 +76,13 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     probe();
     void poll();
     const timer = setInterval(() => void poll(), POLL_MS);
+    // So a restarted llmman serve shows up quickly.
+    const unreachableTimer = setInterval(() => wasReachable === false && void poll(), UNREACHABLE_POLL_MS);
     pollNow.current = () => void poll(true);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      clearInterval(unreachableTimer);
       pollNow.current = null;
     };
   }, [client, tick]);
