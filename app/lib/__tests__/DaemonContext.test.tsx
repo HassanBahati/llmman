@@ -7,9 +7,9 @@ import { DaemonProvider, POLL_MS, UNREACHABLE_POLL_MS, useDaemon } from "../Daem
 const mockVersion = jest.fn();
 const mockClient = { version: mockVersion };
 jest.mock("@/lib/ServersContext", () => ({ useServers: () => ({ client: mockClient }) }));
-jest.mock("@/lib/daemonFeatures", () => ({
-  detectFeatures: async () => ({ shell: { enabled: true, endpoint: true } }),
-}));
+const mockDetect = jest.fn();
+jest.mock("@/lib/daemonFeatures", () => ({ detectFeatures: () => mockDetect() }));
+const shellOn = { shell: { enabled: true, endpoint: true } };
 
 const wrapper = ({ children }: { children: ReactNode }) => <DaemonProvider>{children}</DaemonProvider>;
 const answer = { version: "0.1.0", exe: "llmman", pid: 1 };
@@ -35,6 +35,8 @@ async function connected() {
 beforeEach(() => {
   jest.useFakeTimers();
   mockVersion.mockReset();
+  mockDetect.mockReset();
+  mockDetect.mockResolvedValue(shellOn);
 });
 const appState = AppState.currentState;
 afterEach(() => {
@@ -95,4 +97,38 @@ test("while reachable, only the 15 s poll runs", async () => {
     jest.advanceTimersByTime(POLL_MS - 1);
   });
   expect(mockVersion).toHaveBeenCalledTimes(1);
+});
+
+test("a slow poll while unreachable is not superseded by the next retry", async () => {
+  const { result } = await connected();
+  mockVersion.mockRejectedValueOnce(new Error("refused"));
+  await act(async () => result.current.checkReachable());
+
+  // llmman serve is back but takes longer than UNREACHABLE_POLL_MS to answer.
+  const slow = deferred<typeof answer>();
+  mockVersion.mockReturnValueOnce(slow.promise);
+  mockVersion.mockReturnValue(new Promise(() => {}));
+  await act(async () => {
+    jest.advanceTimersByTime(UNREACHABLE_POLL_MS * 2);
+  });
+  await act(async () => slow.resolve(answer));
+  expect(result.current.reachable).toBe(true);
+});
+
+test("an older feature probe answering late does not undo a newer one", async () => {
+  const first = deferred<typeof shellOn>();
+  mockDetect.mockReturnValueOnce(first.promise);
+  mockVersion.mockRejectedValueOnce(new Error("refused"));
+  const { result } = renderHook(() => useDaemon(), { wrapper });
+  await act(async () => {});
+  expect(result.current.reachable).toBe(false);
+
+  // Back within the first probe's timeout: the recovery probes again.
+  mockVersion.mockResolvedValueOnce(answer);
+  await act(async () => {
+    jest.advanceTimersByTime(UNREACHABLE_POLL_MS);
+  });
+  expect(result.current.features?.shell.enabled).toBe(true);
+  await act(async () => first.resolve({ shell: { enabled: false, endpoint: true } }));
+  expect(result.current.features?.shell.enabled).toBe(true);
 });

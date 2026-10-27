@@ -56,16 +56,25 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         ...patch,
       }));
     // Features: once per client, and again when the daemon comes back after
-    // being unreachable (it may have been restarted with other settings).
-    const probe = () =>
-      void detectFeatures(client, { timeoutMs: 8000 }).then((features) => !cancelled && update({ features }));
+    // being unreachable (it may have been restarted with other settings). A
+    // newer probe's answer wins over an older one's.
+    let latestProbe = 0;
+    const probe = () => {
+      const seq = ++latestProbe;
+      void detectFeatures(client, { timeoutMs: 8000 }).then(
+        (features) => !cancelled && seq === latestProbe && update({ features }),
+      );
+    };
     let wasReachable: boolean | null = null;
     let latest = 0;
+    let waiting = 0;
     const poll = async (pollInBackground = false) => {
       // Not while the app is in the background on a phone.
       if (!pollInBackground && AppState.currentState === "background") return;
       const seq = ++latest;
+      waiting++;
       const version = await client.version({ timeoutMs: 8000 }).catch(() => null);
+      waiting--;
       // A newer poll's answer wins over this older one's.
       if (cancelled || seq !== latest) return;
       const reachable = version !== null;
@@ -76,8 +85,11 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     probe();
     void poll();
     const timer = setInterval(() => void poll(), POLL_MS);
-    // So a restarted llmman serve shows up quickly.
-    const unreachableTimer = setInterval(() => wasReachable === false && void poll(), UNREACHABLE_POLL_MS);
+    // Not while a poll waits, so a slow answer still counts.
+    const unreachableTimer = setInterval(
+      () => wasReachable === false && waiting === 0 && void poll(),
+      UNREACHABLE_POLL_MS,
+    );
     pollNow.current = () => void poll(true);
     return () => {
       cancelled = true;
