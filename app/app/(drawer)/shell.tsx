@@ -29,7 +29,7 @@ export default function Shell() {
   const c = useTheme();
   const focused = useIsFocused();
   const { active, keyFor } = useServers();
-  const { features } = useDaemon();
+  const { features, reachable } = useDaemon();
   const shell = features?.shell ?? null;
   const colors = useMemo(() => terminalColors(c), [c]);
 
@@ -86,6 +86,7 @@ export default function Shell() {
       : session.state === "closed"
         ? { title: "Disconnected from llmman serve.", text: session.reason }
         : null;
+  const serverUnreachable = reachable === false;
 
   return (
     <View style={[styles.fill, { backgroundColor: colors.background }]}>
@@ -114,7 +115,12 @@ export default function Shell() {
         ) : null}
         {overlay ? (
           <View style={[StyleSheet.absoluteFill, styles.scrim]}>
-            <Overlay {...overlay} onRestart={restart} />
+            <Overlay
+              {...overlay}
+              {...(serverUnreachable ? { text: "Start llmman serve, then open a new shell." } : {})}
+              onRestart={restart}
+              restartDisabled={serverUnreachable}
+            />
           </View>
         ) : null}
       </View>
@@ -123,7 +129,17 @@ export default function Shell() {
   );
 }
 
-function Overlay({ title, text, onRestart }: { title: string; text?: string; onRestart?: () => void }) {
+function Overlay({
+  title,
+  text,
+  onRestart,
+  restartDisabled,
+}: {
+  title: string;
+  text?: string;
+  onRestart?: () => void;
+  restartDisabled?: boolean;
+}) {
   const c = useTheme();
   return (
     <View style={styles.center}>
@@ -134,7 +150,14 @@ function Overlay({ title, text, onRestart }: { title: string; text?: string; onR
         <Icon name={{ ios: "terminal", android: "terminal" }} color={c.textMuted} size={28} />
         <Text style={[styles.title, { color: c.text }]}>{title}</Text>
         {text ? <Text style={[styles.text, { color: c.textMuted }]}>{text}</Text> : null}
-        {onRestart ? <Button title="Open a new shell" onPress={onRestart} style={styles.button} /> : null}
+        {onRestart ? (
+          <Button
+            title="Open a new shell"
+            onPress={onRestart}
+            disabled={restartDisabled}
+            style={styles.button}
+          />
+        ) : null}
       </View>
     </View>
   );
