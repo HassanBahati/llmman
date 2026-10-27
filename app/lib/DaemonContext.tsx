@@ -35,6 +35,20 @@ interface Snapshot {
 
 const DaemonContext = createContext<DaemonState | null>(null);
 
+// Answers can arrive out of order: once one is accepted, older ones are dropped.
+function inOrder() {
+  let started = 0;
+  let accepted = 0;
+  return {
+    start: () => ++started,
+    accept: (seq: number) => {
+      if (seq < accepted) return false;
+      accepted = seq;
+      return true;
+    },
+  };
+}
+
 export function DaemonProvider({ children }: { children: ReactNode }) {
   const { client } = useServers();
   const [state, setState] = useState<Snapshot>({
@@ -56,27 +70,25 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         ...patch,
       }));
     // Features: once per client, and again when the daemon comes back after
-    // being unreachable (it may have been restarted with other settings). A
-    // newer probe's answer wins over an older one's.
-    let latestProbe = 0;
+    // being unreachable (it may have been restarted with other settings).
+    const probes = inOrder();
     const probe = () => {
-      const seq = ++latestProbe;
+      const seq = probes.start();
       void detectFeatures(client, { timeoutMs: 8000 }).then(
-        (features) => !cancelled && seq === latestProbe && update({ features }),
+        (features) => !cancelled && probes.accept(seq) && update({ features }),
       );
     };
     let wasReachable: boolean | null = null;
-    let latest = 0;
+    const polls = inOrder();
     let waiting = 0;
     const poll = async (pollInBackground = false) => {
       // Not while the app is in the background on a phone.
       if (!pollInBackground && AppState.currentState === "background") return;
-      const seq = ++latest;
+      const seq = polls.start();
       waiting++;
       const version = await client.version({ timeoutMs: 8000 }).catch(() => null);
       waiting--;
-      // A newer poll's answer wins over this older one's.
-      if (cancelled || seq !== latest) return;
+      if (cancelled || !polls.accept(seq)) return;
       const reachable = version !== null;
       if (reachable && wasReachable === false) probe();
       wasReachable = reachable;
@@ -85,7 +97,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     probe();
     void poll();
     const timer = setInterval(() => void poll(), POLL_MS);
-    // Not while a poll waits, so a slow answer still counts.
+    // Not while a poll waits, so retries don't pile up on a hanging network.
     const unreachableTimer = setInterval(
       () => wasReachable === false && waiting === 0 && void poll(),
       UNREACHABLE_POLL_MS,

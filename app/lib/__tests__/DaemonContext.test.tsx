@@ -104,7 +104,7 @@ test("a slow poll while unreachable is not superseded by the next retry", async 
   mockVersion.mockRejectedValueOnce(new Error("refused"));
   await act(async () => result.current.checkReachable());
 
-  // llmman serve is back but takes longer than UNREACHABLE_POLL_MS to answer.
+  // llmman serve is up again but answers slower than UNREACHABLE_POLL_MS.
   const slow = deferred<typeof answer>();
   mockVersion.mockReturnValueOnce(slow.promise);
   mockVersion.mockReturnValue(new Promise(() => {}));
@@ -123,7 +123,7 @@ test("an older feature probe answering late does not undo a newer one", async ()
   await act(async () => {});
   expect(result.current.reachable).toBe(false);
 
-  // Back within the first probe's timeout: the recovery probes again.
+  // llmman serve answers while the first probe still waits, so it probes again.
   mockVersion.mockResolvedValueOnce(answer);
   await act(async () => {
     jest.advanceTimersByTime(UNREACHABLE_POLL_MS);
@@ -131,4 +131,27 @@ test("an older feature probe answering late does not undo a newer one", async ()
   expect(result.current.features?.shell.enabled).toBe(true);
   await act(async () => first.resolve({ shell: { enabled: false, endpoint: true } }));
   expect(result.current.features?.shell.enabled).toBe(true);
+});
+
+test("a recovery poll answering after the 15 s poll started still counts", async () => {
+  const { result } = await connected();
+  mockVersion.mockRejectedValueOnce(new Error("refused"));
+  await act(async () => result.current.checkReachable());
+
+  // Retries at 3, 6 and 9 s are refused; the one at 12 s is slow.
+  const slow = deferred<typeof answer>();
+  mockVersion
+    .mockRejectedValueOnce(new Error("refused"))
+    .mockRejectedValueOnce(new Error("refused"))
+    .mockRejectedValueOnce(new Error("refused"))
+    .mockReturnValueOnce(slow.promise)
+    .mockReturnValue(new Promise(() => {}));
+  for (let t = 0; t < POLL_MS; t += UNREACHABLE_POLL_MS) {
+    await act(async () => {
+      jest.advanceTimersByTime(UNREACHABLE_POLL_MS);
+    });
+  }
+  expect(mockVersion).toHaveBeenCalledTimes(7);
+  await act(async () => slow.resolve(answer));
+  expect(result.current.reachable).toBe(true);
 });
