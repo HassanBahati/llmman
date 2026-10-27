@@ -3,7 +3,7 @@
 // and which optional features it has (daemonFeatures.ts). Screens read it
 // with `useDaemon()`.
 
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AppState } from "react-native";
 
@@ -21,6 +21,8 @@ export interface DaemonState {
   features: DaemonFeatures | null;
   /** Asks again now, e.g. after the key changed. */
   refresh(): void;
+  /** Polls now, even in the background; unlike refresh(), keeps features. */
+  checkReachable(): void;
 }
 
 interface Snapshot {
@@ -41,6 +43,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     features: null,
   });
   const [tick, setTick] = useState(0);
+  const pollNow = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (!client) return;
@@ -56,11 +59,14 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     const probe = () =>
       void detectFeatures(client, { timeoutMs: 8000 }).then((features) => !cancelled && update({ features }));
     let wasReachable: boolean | null = null;
-    const poll = async () => {
+    let latest = 0;
+    const poll = async (pollInBackground = false) => {
       // Not while the app is in the background on a phone.
-      if (AppState.currentState === "background") return;
+      if (!pollInBackground && AppState.currentState === "background") return;
+      const seq = ++latest;
       const version = await client.version({ timeoutMs: 8000 }).catch(() => null);
-      if (cancelled) return;
+      // A newer poll's answer wins over this older one's.
+      if (cancelled || seq !== latest) return;
       const reachable = version !== null;
       if (reachable && wasReachable === false) probe();
       wasReachable = reachable;
@@ -69,9 +75,11 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     probe();
     void poll();
     const timer = setInterval(() => void poll(), POLL_MS);
+    pollNow.current = () => void poll(true);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      pollNow.current = null;
     };
   }, [client, tick]);
 
@@ -82,6 +90,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       version: current?.version ?? null,
       features: current?.features ?? null,
       refresh: () => setTick((t) => t + 1),
+      checkReachable: () => pollNow.current?.(),
     }),
     [current],
   );

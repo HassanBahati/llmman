@@ -29,7 +29,7 @@ export default function Shell() {
   const c = useTheme();
   const focused = useIsFocused();
   const { active, keyFor } = useServers();
-  const { features, reachable } = useDaemon();
+  const { features, reachable, checkReachable } = useDaemon();
   const shell = features?.shell ?? null;
   const colors = useMemo(() => terminalColors(c), [c]);
 
@@ -98,7 +98,9 @@ export default function Shell() {
             colors={colors}
             visible={focused}
             onExit={(code) => setSession(() => ({ state: "exited", code }))}
-            onState={(st, reason) =>
+            onState={(st, reason) => {
+              // Otherwise the drawer waits for the next 15 s poll.
+              if (st === "closed") checkReachable();
               setSession((s) =>
                 st === "attached"
                   ? { state: "attached" }
@@ -106,8 +108,8 @@ export default function Shell() {
                     s.state === "exited"
                     ? s
                     : { state: "closed", ...(reason ? { reason } : {}) },
-              )
-            }
+              );
+            }}
             onSender={(fn) => {
               send.current = fn;
             }}
