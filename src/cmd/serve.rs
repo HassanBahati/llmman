@@ -367,8 +367,8 @@ struct RunningModel {
     /// A decision model: refuses what [`Task::refuse_decision`] says.
     decision: bool,
     /// `minimal` and `low` get a thinking budget (`openai::apply_effort_budget`):
-    /// llama-server, a template that thinks without levels, and no
-    /// `--reasoning-budget` of the user's.
+    /// llama-server, the model's own template, which thinks without levels,
+    /// and no `--reasoning-budget` of the user's.
     effort_budget: bool,
     /// Send llmman's budget message: the user set no `--reasoning-budget-message`.
     effort_budget_message: bool,
@@ -2600,17 +2600,25 @@ async fn resolve_target(
             .or(configured_window),
         _ => configured_window,
     };
+    // A container gets LLMMAN_LLAMA_ARGS but not this environment.
+    let inherited = |var| matches!(process, ModelProcess::Local(..)).then_some(var);
+    // The user's template replaces the one `thinks_without_levels` read.
+    let user_template = ["--chat-template", "--chat-template-file"]
+        .iter()
+        .zip(["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"])
+        .any(|(flag, env)| backend::llama_sets(&llama_extra_args, flag, inherited(env)));
     let effort_budget = thinks_without_levels
+        && !user_template
         && process.engine() == Engine::LlamaServer
         && !backend::llama_sets(
             &llama_extra_args,
             "--reasoning-budget",
-            "LLAMA_ARG_THINK_BUDGET",
+            inherited("LLAMA_ARG_THINK_BUDGET"),
         );
     let effort_budget_message = !backend::llama_sets(
         &llama_extra_args,
         "--reasoning-budget-message",
-        "LLAMA_ARG_THINK_BUDGET_MESSAGE",
+        inherited("LLAMA_ARG_THINK_BUDGET_MESSAGE"),
     );
 
     let mut mgr = state.0.manager.lock().await;

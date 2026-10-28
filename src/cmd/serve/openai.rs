@@ -435,24 +435,27 @@ fn apply_effort_budget(req: &mut serde_json::Value, message: bool) {
         .get("chat_template_kwargs")
         .and_then(|k| k.get("enable_thinking"))
         == Some(&serde_json::Value::Bool(false));
-    if thinking_off
-        || o.contains_key("reasoning_budget_tokens")
-        || o.contains_key("thinking_budget_tokens")
-    {
+    // llama-server reads a null field as unset.
+    let sent = |key: &str| o.get(key).is_some_and(|v| !v.is_null());
+    if thinking_off || sent("reasoning_budget_tokens") || sent("thinking_budget_tokens") {
         return;
     }
-    // The limit llama-server applies: the first of these it is sent.
+    let send_message = message && !sent("reasoning_budget_message");
+    // The limit llama-server applies: the first of these it is sent, truncated.
     let limit = ["n_predict", "max_completion_tokens", "max_tokens"]
         .iter()
         .find_map(|key| o.get(*key).filter(|v| !v.is_null()))
-        .and_then(|v| v.as_u64())
-        .filter(|n| *n > 0);
+        .and_then(|v| v.as_f64())
+        .filter(|n| *n >= 1.0)
+        .map(|n| n as u64);
     let cap = u64::from(cap);
     let budget = limit.map_or(cap, |limit| (limit / share).clamp(1, cap));
     o.insert("reasoning_budget_tokens".into(), budget.into());
-    if message {
-        o.entry("reasoning_budget_message")
-            .or_insert_with(|| EFFORT_BUDGET_MESSAGE.into());
+    if send_message {
+        o.insert(
+            "reasoning_budget_message".into(),
+            EFFORT_BUDGET_MESSAGE.into(),
+        );
     }
 }
 
@@ -2539,6 +2542,8 @@ mod tests {
         assert_eq!(low(serde_json::json!({ "max_tokens": 100_000 })), 2048);
         assert_eq!(low(serde_json::json!({})), 2048);
         assert_eq!(low(serde_json::json!({ "max_tokens": 1 })), 1);
+        assert_eq!(low(serde_json::json!({ "max_tokens": 120.0 })), 30);
+        assert_eq!(low(serde_json::json!({ "max_tokens": 0.5 })), 2048);
         assert_eq!(low(serde_json::json!({ "max_tokens": 0 })), 2048);
         assert_eq!(
             low(serde_json::json!({ "n_predict": 400, "max_tokens": 120 })),
@@ -2559,6 +2564,18 @@ mod tests {
                 "reasoning_budget_message": "mine"
             }))["reasoning_budget_message"],
             "mine"
+        );
+        assert_eq!(
+            budget(serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "max_tokens": 120,
+                "reasoning_budget_tokens": null, "thinking_budget_tokens": null,
+                "reasoning_budget_message": null
+            })),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "max_tokens": 120,
+                "reasoning_budget_tokens": 30, "thinking_budget_tokens": null,
+                "reasoning_budget_message": EFFORT_BUDGET_MESSAGE
+            })
         );
         // The user set a server-wide message.
         let mut own_message = serde_json::json!({ "model": "m", "reasoning_effort": "low" });

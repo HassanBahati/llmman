@@ -444,12 +444,12 @@ pub(super) fn extra_args_from_env(var: &str) -> Vec<String> {
 }
 
 /// Whether the user set llama-server's `flag`: in `extra` (a split
-/// `LLMMAN_LLAMA_ARGS`), or as `env`, which llama-server inherits.
-pub(super) fn llama_sets(extra: &[String], flag: &str, env: &str) -> bool {
+/// `LLMMAN_LLAMA_ARGS`), or as `env` when llama-server inherits it.
+pub(super) fn llama_sets(extra: &[String], flag: &str, env: Option<&str>) -> bool {
     extra.iter().any(|a| {
         a.strip_prefix(flag)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
-    }) || std::env::var_os(env).is_some()
+    }) || env.is_some_and(|env| std::env::var_os(env).is_some())
 }
 
 /// Fails on the first `LLMMAN_*_ARGS` that [`split_quoted_args`] rejects,
@@ -1602,7 +1602,7 @@ mod tests {
         const ENV: &str = "LLMMAN_TEST_LLAMA_SETS";
         let sets = |value: &str| {
             let args = split_quoted_args(Some(value)).unwrap();
-            llama_sets(&args, "--reasoning-budget", ENV)
+            llama_sets(&args, "--reasoning-budget", Some(ENV))
         };
         assert!(sets("--reasoning-budget 64"));
         assert!(sets("--threads 2 --reasoning-budget=64"));
@@ -1610,6 +1610,8 @@ mod tests {
         assert!(!sets(""));
         let _var = EnvVar::set(ENV, "64");
         assert!(sets(""));
+        // A llama-server that does not inherit the environment.
+        assert!(!llama_sets(&[], "--reasoning-budget", None));
     }
 
     #[test]
