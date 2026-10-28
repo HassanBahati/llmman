@@ -178,6 +178,17 @@ describe("ApiClient.request", () => {
     expect(isAbort(err)).toBe(true);
   });
 
+  it("with a timeout too, does not send a request whose signal is already aborted", async () => {
+    const { fetch, calls } = fakeFetch(() => response('{"version":"0.1.0"}'));
+    const controller = new AbortController();
+    controller.abort();
+    const err = await new ApiClient({ url: URL }, fetch)
+      .version({ signal: controller.signal, timeoutMs: 1000 })
+      .catch((e) => e);
+    expect(isAbort(err)).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
   it("rejects a 200 that is not llmman as a protocol error", async () => {
     const { fetch } = fakeFetch(() => response("<html>router login</html>", { contentType: "text/html" }));
     const err = await new ApiClient({ url: URL }, fetch).version().catch((e) => e);
