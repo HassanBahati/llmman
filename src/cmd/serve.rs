@@ -366,6 +366,12 @@ struct RunningModel {
     context_window: Option<u32>,
     /// A decision model: refuses what [`Task::refuse_decision`] says.
     decision: bool,
+    /// `minimal` and `low` get a thinking budget (`openai::apply_effort_budget`):
+    /// llama-server, the model's own template, which thinks without levels,
+    /// and no `--reasoning-budget` of the user's.
+    effort_budget: bool,
+    /// Send llmman's budget message: the user set no `--reasoning-budget-message`.
+    effort_budget_message: bool,
     /// The GGUF header's trained context, if any: what `num_ctx` is cut to.
     trained_ctx: Option<u32>,
     /// Set while [`retire_for_context`] waits on this model: nothing new joins.
@@ -2249,6 +2255,12 @@ async fn resolve_target(
     let embedding_ctx = gguf_info.as_ref().and_then(embedding_model_ctx);
     // Refused before anything is evicted or spawned.
     let decision = gguf_info.as_ref().is_some_and(|info| info.is_decision());
+    let thinks_without_levels = gguf_info
+        .as_ref()
+        .and_then(|info| info.str("tokenizer.chat_template"))
+        .is_some_and(|template| {
+            crate::chat_template::thinking_controls(template).thinks_without_levels()
+        });
     if decision {
         if let Some(refusal) = task.refuse_decision(model_ref) {
             return Err(refusal);
@@ -2588,6 +2600,26 @@ async fn resolve_target(
             .or(configured_window),
         _ => configured_window,
     };
+    // A container gets LLMMAN_LLAMA_ARGS but not this environment.
+    let inherited = |var| matches!(process, ModelProcess::Local(..)).then_some(var);
+    // The user's template replaces the one `thinks_without_levels` read.
+    let user_template = ["--chat-template", "--chat-template-file"]
+        .iter()
+        .zip(["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"])
+        .any(|(flag, env)| backend::llama_sets(&llama_extra_args, flag, inherited(env)));
+    let effort_budget = thinks_without_levels
+        && !user_template
+        && process.engine() == Engine::LlamaServer
+        && !backend::llama_sets(
+            &llama_extra_args,
+            "--reasoning-budget",
+            inherited("LLAMA_ARG_THINK_BUDGET"),
+        );
+    let effort_budget_message = !backend::llama_sets(
+        &llama_extra_args,
+        "--reasoning-budget-message",
+        inherited("LLAMA_ARG_THINK_BUDGET_MESSAGE"),
+    );
 
     let mut mgr = state.0.manager.lock().await;
     mgr.running.insert(
@@ -2606,6 +2638,8 @@ async fn resolve_target(
             // 1, not 0 — see this function's own doc comment.
             in_flight: 1,
             decision,
+            effort_budget,
+            effort_budget_message,
             trained_ctx,
             retiring: Default::default(),
         },

@@ -3,9 +3,8 @@
 // to the conversation's own route after the first message.
 
 import * as Haptics from "expo-haptics";
-import { router } from "expo-router";
+import { router, Stack } from "expo-router";
 import { useIsFocused } from "expo-router/react-navigation";
-import { Drawer } from "expo-router/drawer";
 import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -28,7 +27,7 @@ import { hostLabel } from "@/api/serverUrl";
 import { KindToggle } from "@/components/chat/KindToggle";
 import { MessageView } from "@/components/chat/MessageView";
 import { Icon } from "@/components/Icon";
-import { HeaderActions, ModelTitle, useWide } from "@/components/shell/Header";
+import { ModelTitle, usePageSides, useWide } from "@/components/shell/Header";
 import {
   editFrom,
   openConversation,
@@ -87,8 +86,10 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
   const shell = useRef<View>(null);
   const [top, setTop] = useState(0);
   const keyboardShown = useKeyboardShown();
-  // The composer (as wide as the message column at most) clears the notch in landscape.
-  const side = Math.max(spacing.md, insets.left, insets.right);
+  // Each part keeps to the safe area at the sides, with its own gap at least.
+  const sides = usePageSides(spacing.md);
+  const emptySides = usePageSides(spacing.xl);
+  const listSides = usePageSides(spacing.lg);
   // The web's textarea does not grow by itself: it follows its content's height.
   const [inputHeight, setInputHeight] = useState(0);
   const { client: activeClient, active, servers, activate } = useServers();
@@ -252,14 +253,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
     submit();
   };
 
-  const header = (
-    <Drawer.Screen
-      options={{
-        headerTitle: () => <ModelTitle conversation={id} />,
-        headerRight: () => <HeaderActions />,
-      }}
-    />
-  );
+  const header = <Stack.Screen options={{ headerTitle: () => <ModelTitle conversation={id} /> }} />;
 
   if (missing) {
     return (
@@ -346,7 +340,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={top}>
         {messages.length === 0 ? (
           // Not the inverted list's empty view: Android inverts that on both axes.
-          <View style={styles.empty}>
+          <View style={[styles.empty, emptySides]}>
             <Image
               source={require("@/assets/llmman-mark.png")}
               style={styles.mark}
@@ -385,7 +379,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
             inverted
             data={reversed}
             keyExtractor={(_, i) => String(messages.length - 1 - i)}
-            contentContainerStyle={[styles.list, readable]}
+            contentContainerStyle={[styles.list, listSides, readable]}
             keyboardDismissMode="interactive"
             keyboardShouldPersistTaps="handled"
             renderItem={({ item, index }) => {
@@ -417,13 +411,13 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
         )}
 
         {elsewhere && !known ? (
-          <View style={[styles.gone, { paddingHorizontal: side }]} accessibilityLiveRegion="polite">
+          <View style={[styles.gone, sides]} accessibilityLiveRegion="polite">
             <Text style={{ color: c.textMuted, fontSize: font.small + 1, flexShrink: 1 }}>
               This chat was with {hostLabel(conv!.server)}, which is not one of your servers here
             </Text>
           </View>
         ) : gone ? (
-          <View style={[styles.gone, { paddingHorizontal: side }]} accessibilityLiveRegion="polite">
+          <View style={[styles.gone, sides]} accessibilityLiveRegion="polite">
             <Text style={{ color: c.textMuted, fontSize: font.small + 1, flexShrink: 1 }}>
               {models.displayName(model)} is no longer available; pick a model
             </Text>
@@ -439,7 +433,7 @@ export function ChatScreen({ id, onSent }: { id: string; onSent?: () => void }) 
         ) : null}
         <View
           style={{
-            paddingHorizontal: side,
+            ...sides,
             paddingTop: spacing.xs,
             // The keyboard covers the home indicator area while it is up.
             paddingBottom: keyboardShown ? spacing.sm : Math.max(insets.bottom, spacing.md),
@@ -542,12 +536,11 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   list: { paddingHorizontal: spacing.lg, paddingVertical: spacing.lg, gap: spacing.xl, flexGrow: 1 },
-  // Only horizontal padding: in landscape with the keyboard up it must shrink to nothing.
+  // No vertical padding (emptySides at the sides): in landscape with the keyboard up it must shrink to nothing.
   empty: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
-    paddingHorizontal: spacing.xl,
     gap: spacing.lg,
     overflow: "hidden",
   },

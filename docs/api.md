@@ -149,6 +149,16 @@ A local `/v1/chat/completions` with `reasoning_effort` also gets the
 `reasoning_effort`), so it works on llama-server builds that do not read
 `reasoning_effort` themselves. The caller's own kwargs are kept.
 
+On a llama-server model whose template thinks but takes no
+`reasoning_effort` level (Qwen3, Qwen3.5, Gemma 4), `minimal` and `low`
+also get a `reasoning_budget_tokens` of an eighth or a quarter of the
+token limit (at most 1024 or 2048, also the budget without a limit) and
+a `reasoning_budget_message` that closes it, so thinking cannot use up
+`max_tokens`. A budget from the caller or from `--reasoning-budget` in
+`LLMMAN_LLAMA_ARGS`, or a `--chat-template[-file]` there, means llmman
+adds neither; a message from the caller or `--reasoning-budget-message`
+replaces llmman's.
+
 A streamed `/v1/chat/completions` or `/v1/completions` to an `openai`-wire
 provider (Cohere aside) or a non-llama.cpp backend goes upstream with
 `stream_options.include_usage` for [`llmman usage`](commands.md); a
