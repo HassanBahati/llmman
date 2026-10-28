@@ -120,6 +120,40 @@ describe("ApiClient.request", () => {
     expect(err.kind).toBe("timeout");
   });
 
+  it("times out a body that never finishes", async () => {
+    // The headers arrive; the body stalls until the request is aborted.
+    const fetch = async (_url: string, init?: { signal?: AbortSignal }) => ({
+      ...response(""),
+      text: () =>
+        new Promise<string>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new TypeError("aborted")));
+        }),
+    });
+    const p = new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+  });
+
+  it("does not count the key prompt against the timeout", async () => {
+    let key = "";
+    const keySource = {
+      get: () => key,
+      ask: () =>
+        new Promise<boolean>((r) =>
+          setTimeout(() => {
+            key = "sk-1";
+            r(true);
+          }, 100),
+        ),
+    };
+    const { fetch } = fakeFetch((_url, init) =>
+      init.headers?.authorization ? response('{"version":"0.1.0"}') : llmman401(),
+    );
+    const version = await new ApiClient({ url: URL }, fetch, { keySource }).version({ timeoutMs: 50 });
+    expect(version.version).toBe("0.1.0");
+  });
+
   it("rethrows the caller's own abort as an AbortError", async () => {
     const controller = new AbortController();
     const fetch = (_url: string, init?: { signal?: AbortSignal }) =>
@@ -127,6 +161,18 @@ describe("ApiClient.request", () => {
         init?.signal?.addEventListener("abort", () => reject(new TypeError("cancelled")));
       });
     const p = new ApiClient({ url: URL }, fetch).version({ signal: controller.signal });
+    controller.abort();
+    const err = await p.catch((e) => e);
+    expect(isAbort(err)).toBe(true);
+  });
+
+  it("with a timeout too, rethrows the caller's own abort as an AbortError", async () => {
+    const controller = new AbortController();
+    const fetch = (_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new TypeError("cancelled")));
+      });
+    const p = new ApiClient({ url: URL }, fetch).version({ signal: controller.signal, timeoutMs: 1000 });
     controller.abort();
     const err = await p.catch((e) => e);
     expect(isAbort(err)).toBe(true);

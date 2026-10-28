@@ -119,7 +119,7 @@ export function wantsKey(r: ResponseLike): boolean {
 
 export interface RequestOptions {
   signal?: AbortSignal;
-  /** Milliseconds before the request is abandoned with a `timeout` error. */
+  /** Milliseconds to wait for the headers (and, in getJson, again for the body) before a `timeout` error. */
   timeoutMs?: number;
 }
 
@@ -369,7 +369,7 @@ export class ApiClient {
       const fetchImpl = this.fetchImpl;
       return await fetchImpl(this.urlFor(path), { ...init, headers, signal });
     } catch (e) {
-      if (timedOut) throw new ApiError(`no answer from ${this.url} in time`, 0, "timeout");
+      if (timedOut) throw this.timeoutError();
       if (outer?.aborted || isAbort(e)) throw abortError();
       const detail = e instanceof Error && e.message ? `: ${e.message}` : "";
       throw new ApiError(`could not reach ${this.url}${detail}`, 0, "network");
@@ -378,10 +378,28 @@ export class ApiClient {
     }
   }
 
+  private timeoutError(): ApiError {
+    return new ApiError(`no answer from ${this.url} in time`, 0, "timeout");
+  }
+
   async getJson<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-    const r = await this.request(path, {}, opts);
-    if (!r.ok) throw await errorFrom(r);
-    return parseJson<T>(await r.text());
+    if (!opts.timeoutMs) return readJson<T>(await this.request(path, {}, opts));
+    const requestController = new AbortController();
+    if (opts.signal?.aborted) requestController.abort();
+    opts.signal?.addEventListener("abort", () => requestController.abort(), { once: true });
+    const r = await this.request(path, {}, { ...opts, signal: requestController.signal });
+    let timedOut = false;
+    const bodyTimeout = setTimeout(() => {
+      timedOut = true;
+      requestController.abort();
+    }, opts.timeoutMs);
+    try {
+      return await readJson<T>(r);
+    } catch (e) {
+      throw timedOut ? this.timeoutError() : e;
+    } finally {
+      clearTimeout(bodyTimeout);
+    }
   }
 
   async postJson(path: string, body: unknown, opts: RequestOptions = {}): Promise<ResponseLike> {
@@ -577,6 +595,11 @@ interface ChatChunk {
     delta?: { content?: string; reasoning_content?: string; reasoning?: string; thinking?: string };
     finish_reason?: string | null;
   }[];
+}
+
+async function readJson<T>(r: ResponseLike): Promise<T> {
+  if (!r.ok) throw await errorFrom(r);
+  return parseJson<T>(await r.text());
 }
 
 export function parseJson<T>(text: string): T {

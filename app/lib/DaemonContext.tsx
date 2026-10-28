@@ -5,7 +5,7 @@
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { AppState } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import type { VersionInfo } from "@/api/client";
 import { detectFeatures, type DaemonFeatures } from "@/lib/daemonFeatures";
@@ -98,8 +98,9 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     void poll();
     const timer = setInterval(() => void poll(), POLL_MS);
     // Not while a poll waits, so retries don't pile up on a hanging network.
+    // On the web they go on in the background too; phone apps still skip them.
     const unreachableTimer = setInterval(
-      () => wasReachable === false && waiting === 0 && void poll(),
+      () => wasReachable === false && waiting === 0 && void poll(Platform.OS === "web"),
       UNREACHABLE_POLL_MS,
     );
     pollNow.current = () => void poll(true);
