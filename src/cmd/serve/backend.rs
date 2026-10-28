@@ -443,6 +443,15 @@ pub(super) fn extra_args_from_env(var: &str) -> Vec<String> {
     split_quoted_args(std::env::var(var).ok().as_deref()).unwrap_or_default()
 }
 
+/// Whether the user set llama-server's `flag`: in `extra` (a split
+/// `LLMMAN_LLAMA_ARGS`), or as `env`, which llama-server inherits.
+pub(super) fn llama_sets(extra: &[String], flag: &str, env: &str) -> bool {
+    extra.iter().any(|a| {
+        a.strip_prefix(flag)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+    }) || std::env::var_os(env).is_some()
+}
+
 /// Fails on the first `LLMMAN_*_ARGS` that [`split_quoted_args`] rejects,
 /// naming the variable and the quote's position but not the value, or on
 /// `--port`/`--host` in `LLMMAN_LLAMA_ARGS`.
@@ -1583,6 +1592,24 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn a_llama_flag_is_set_in_llama_args_or_the_environment() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        const ENV: &str = "LLMMAN_TEST_LLAMA_SETS";
+        let sets = |value: &str| {
+            let args = split_quoted_args(Some(value)).unwrap();
+            llama_sets(&args, "--reasoning-budget", ENV)
+        };
+        assert!(sets("--reasoning-budget 64"));
+        assert!(sets("--threads 2 --reasoning-budget=64"));
+        assert!(!sets("--reasoning-budget-message 'done' --threads 2"));
+        assert!(!sets(""));
+        let _var = EnvVar::set(ENV, "64");
+        assert!(sets(""));
     }
 
     #[test]

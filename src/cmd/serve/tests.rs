@@ -6637,6 +6637,70 @@ impl RoleStandin {
     }
 }
 
+/// A `low` `reasoning_effort` gets a thinking budget only on a model with
+/// `effort_budget` set, and other models get the request unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn low_effort_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
+    let standin = RoleStandin::new(None);
+    let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
+    let send = || {
+        post_with(
+            &base,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "qwen3:0.6b",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "max_tokens": 120,
+                "reasoning_effort": "low",
+            }),
+            serde_json::json!({}),
+        )
+    };
+    let last = || standin.seen.lock().unwrap().last().unwrap().clone();
+
+    send().await;
+    let sent = last();
+    assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
+    assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
+
+    let key = running_key(&state, "qwen3:0.6b");
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .effort_budget = true;
+    send().await;
+    let sent = last();
+    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
+    assert_eq!(
+        sent["reasoning_budget_message"],
+        "Okay, I have to answer now."
+    );
+    assert_eq!(
+        sent["chat_template_kwargs"],
+        serde_json::json!({ "enable_thinking": true, "reasoning_effort": "low" })
+    );
+
+    // The user set a server-wide --reasoning-budget-message.
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .effort_budget_message = false;
+    send().await;
+    let sent = last();
+    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
+    assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
+}
+
 const ALTERNATION_REFUSAL: &str = "Unable to generate parser for this template. Automatic parser \
      generation failed: Conversation roles must alternate user/assistant/user/assistant/...";
 

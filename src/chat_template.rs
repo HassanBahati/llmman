@@ -49,6 +49,11 @@ impl ThinkingControls {
         }
         choices
     }
+
+    /// Thinks, but a `reasoning_effort` level only switches it on.
+    pub fn thinks_without_levels(&self) -> bool {
+        self.thinks && self.efforts.is_empty()
+    }
 }
 
 /// Reads the thinking controls off `template`. Levels are the
@@ -286,6 +291,7 @@ mod tests {
             }
         );
         assert_eq!(controls.choices(), ["none", "low", "medium", "xhigh"]);
+        assert!(!controls.thinks_without_levels());
         // Minified to one line, the same.
         let one_line = QWEN3_8.replace('\n', "");
         assert_eq!(thinking_controls(&one_line), controls);
@@ -344,6 +350,7 @@ mod tests {
             thinking_controls(gpt_oss).efforts,
             DEFAULT_EFFORT_LEVELS.to_vec()
         );
+        assert!(!thinking_controls(gpt_oss).thinks_without_levels());
     }
 
     /// Qwen3.5, GLM-5, Gemma 4, Nemotron 3: `enable_thinking`, no levels.
@@ -354,6 +361,7 @@ mod tests {
         let controls = thinking_controls(gemma4);
         assert!(controls.enable_thinking && controls.efforts.is_empty());
         assert_eq!(controls.choices(), ["none", "thinking"]);
+        assert!(controls.thinks_without_levels());
     }
 
     /// Kimi K2.5, MiniMax M2.5: thinking with nothing a kwarg reads.
@@ -373,6 +381,7 @@ mod tests {
         let llama = "{# no thinking here #}{{- '<|start_header_id|>' + message['role'] }}";
         assert_eq!(thinking_controls(llama), ThinkingControls::default());
         assert!(thinking_controls(llama).choices().is_empty());
+        assert!(!thinking_controls(llama).thinks_without_levels());
         assert_eq!(thinking_controls(""), ThinkingControls::default());
     }
 

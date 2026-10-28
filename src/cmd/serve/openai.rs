@@ -397,6 +397,65 @@ fn apply_reasoning_effort(req: &mut serde_json::Value) {
     }
 }
 
+/// The levels [`apply_effort_budget`] bounds, and the token limit's
+/// divisor for each.
+const EFFORT_BUDGET_SHARES: [(&str, u64); 2] = [("minimal", 8), ("low", 4)];
+
+/// What llama-server writes to end thinking when the budget runs out.
+/// Without it, a small model cut off mid-thought keeps reasoning in its
+/// answer.
+const EFFORT_BUDGET_MESSAGE: &str = "Okay, I have to answer now.";
+
+/// Gives a `minimal` or `low` `reasoning_effort` a thinking budget, for a
+/// template where the level alone leaves thinking unbounded: a share of
+/// the token limit ([`EFFORT_BUDGET_SHARES`]), at least 1 (0 makes a small
+/// model reason in its answer), at most the level's [`THINKING_BUDGETS`].
+/// A caller's budget, or thinking switched off, is left alone; `message`
+/// adds [`EFFORT_BUDGET_MESSAGE`] unless the caller sent one.
+///
+/// [`THINKING_BUDGETS`]: super::anthropic::THINKING_BUDGETS
+fn apply_effort_budget(req: &mut serde_json::Value, message: bool) {
+    let Some(o) = req.as_object_mut() else {
+        return;
+    };
+    let Some(effort) = o.get("reasoning_effort").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let effort = effort.trim();
+    let Some(&(_, share)) = EFFORT_BUDGET_SHARES.iter().find(|(l, _)| *l == effort) else {
+        return;
+    };
+    let Some(&(_, cap)) = super::anthropic::THINKING_BUDGETS
+        .iter()
+        .find(|(l, _)| *l == effort)
+    else {
+        return;
+    };
+    let thinking_off = o
+        .get("chat_template_kwargs")
+        .and_then(|k| k.get("enable_thinking"))
+        == Some(&serde_json::Value::Bool(false));
+    if thinking_off
+        || o.contains_key("reasoning_budget_tokens")
+        || o.contains_key("thinking_budget_tokens")
+    {
+        return;
+    }
+    // The limit llama-server applies: the first of these it is sent.
+    let limit = ["n_predict", "max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|key| o.get(*key).filter(|v| !v.is_null()))
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0);
+    let cap = u64::from(cap);
+    let budget = limit.map_or(cap, |limit| (limit / share).clamp(1, cap));
+    o.insert("reasoning_budget_tokens".into(), budget.into());
+    if message {
+        o.entry("reasoning_budget_message")
+            .or_insert_with(|| EFFORT_BUDGET_MESSAGE.into());
+    }
+}
+
 /// Shared setup for every plain OpenAI-passthrough route: parse just
 /// enough of the request to find `model`, make sure it's loaded, rewrite
 /// `model` to its canonical name (see `ensure_model`), and open an
@@ -555,6 +614,14 @@ async fn proxy_openai_generation_to(
             apply_default_repeat_penalty(&mut req);
             if llama_path == CHAT_COMPLETIONS_ROUTE {
                 apply_reasoning_effort(&mut req);
+                if req.get("reasoning_effort").is_some() {
+                    let budget = local_model(state, &target, |m| {
+                        m.effort_budget.then_some(m.effort_budget_message)
+                    });
+                    if let Some(message) = budget.await.flatten() {
+                        apply_effort_budget(&mut req, message);
+                    }
+                }
                 consolidate_chat_system_messages(&mut req);
             }
         }
@@ -1087,17 +1154,24 @@ async fn handle_openai_media(
     forward_openai_request(state, headers, req, target, activity, override_, route).await
 }
 
-/// The engine behind a [`Target::Local`]; `None` for anything else, or a
-/// backend unloaded since `ensure_model` (the request then fails on its own).
+/// The engine behind a [`Target::Local`]; see [`local_model`].
 pub(super) async fn local_engine(state: &AppState, target: &Target) -> Option<Engine> {
+    local_model(state, target, |m| m.process.engine()).await
+}
+
+/// `read` of the loaded model behind a [`Target::Local`]; `None` for
+/// anything else, or a backend unloaded since `ensure_model` (the request
+/// then fails on its own).
+async fn local_model<T>(
+    state: &AppState,
+    target: &Target,
+    read: impl FnOnce(&super::RunningModel) -> T,
+) -> Option<T> {
     let Target::Local(port) = target else {
         return None;
     };
     let mgr = state.0.manager.lock().await;
-    mgr.running
-        .values()
-        .find(|m| m.port == *port)
-        .map(|m| m.process.engine())
+    mgr.running.values().find(|m| m.port == *port).map(read)
 }
 
 // -- vLLM-Omni media dialect --------------------------------------------------
@@ -2434,6 +2508,86 @@ mod tests {
         assert_eq!(with(absent.clone()), absent);
         let not_a_string = serde_json::json!({ "model": "m", "reasoning_effort": 3 });
         assert_eq!(with(not_a_string.clone()), not_a_string);
+    }
+
+    /// The budget's share, floor and cap; the caller's budget or message wins.
+    #[test]
+    fn apply_effort_budget_bounds_minimal_and_low() {
+        let budget = |req: serde_json::Value| {
+            let mut req = req;
+            apply_effort_budget(&mut req, true);
+            req
+        };
+        let low = |extra: serde_json::Value| {
+            let mut req = serde_json::json!({ "model": "m", "reasoning_effort": "low" });
+            req.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            budget(req)["reasoning_budget_tokens"].clone()
+        };
+        assert_eq!(
+            budget(serde_json::json!({
+                "model": "m", "reasoning_effort": "minimal", "max_tokens": 120
+            })),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "minimal", "max_tokens": 120,
+                "reasoning_budget_tokens": 15,
+                "reasoning_budget_message": EFFORT_BUDGET_MESSAGE
+            })
+        );
+        assert_eq!(low(serde_json::json!({ "max_tokens": 120 })), 30);
+        assert_eq!(low(serde_json::json!({ "max_tokens": 100_000 })), 2048);
+        assert_eq!(low(serde_json::json!({})), 2048);
+        assert_eq!(low(serde_json::json!({ "max_tokens": 1 })), 1);
+        assert_eq!(low(serde_json::json!({ "max_tokens": 0 })), 2048);
+        assert_eq!(
+            low(serde_json::json!({ "n_predict": 400, "max_tokens": 120 })),
+            100
+        );
+        assert_eq!(
+            low(serde_json::json!({ "max_completion_tokens": 400, "max_tokens": 120 })),
+            100
+        );
+        // No limit: llama-server's -1 wins over `max_tokens`.
+        assert_eq!(
+            low(serde_json::json!({ "n_predict": -1, "max_tokens": 120 })),
+            2048
+        );
+        assert_eq!(
+            budget(serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "max_tokens": 120,
+                "reasoning_budget_message": "mine"
+            }))["reasoning_budget_message"],
+            "mine"
+        );
+        // The user set a server-wide message.
+        let mut own_message = serde_json::json!({ "model": "m", "reasoning_effort": "low" });
+        apply_effort_budget(&mut own_message, false);
+        assert_eq!(
+            own_message,
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "reasoning_budget_tokens": 2048
+            })
+        );
+        for unchanged in [
+            serde_json::json!({ "model": "m", "max_tokens": 120 }),
+            serde_json::json!({ "model": "m", "reasoning_effort": "none" }),
+            serde_json::json!({ "model": "m", "reasoning_effort": "medium" }),
+            serde_json::json!({ "model": "m", "reasoning_effort": "high" }),
+            serde_json::json!({ "model": "m", "reasoning_effort": "LOW" }),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "low",
+                "chat_template_kwargs": { "enable_thinking": false }
+            }),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "reasoning_budget_tokens": -1
+            }),
+            serde_json::json!({
+                "model": "m", "reasoning_effort": "low", "thinking_budget_tokens": 64
+            }),
+        ] {
+            assert_eq!(budget(unchanged.clone()), unchanged);
+        }
     }
 
     /// Every part of `body`: `(name, filename, content-type, bytes)`.
