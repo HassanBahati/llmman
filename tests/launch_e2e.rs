@@ -2112,6 +2112,40 @@ fn launch_openclaw_with_model() {
     );
 }
 
+/// `reasoning_effort: "low"` on MODEL, whose template has only the
+/// thinking switch, leaves room for the answer (#703). Without a thinking
+/// budget, its thinking used all 120 tokens at temperature 0.
+#[test]
+fn low_reasoning_effort_leaves_room_for_the_answer() {
+    let _guard = lock_serial();
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    warm_model();
+
+    let reply: serde_json::Value = reqwest::blocking::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .expect("build client")
+        .post(format!("{}/v1/chat/completions", llmman::daemon::server()))
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "Summarize: the sky is blue." }],
+            "max_tokens": 120,
+            "temperature": 0,
+            "reasoning_effort": "low",
+        }))
+        .send()
+        .expect("send the request")
+        .json()
+        .expect("a JSON reply");
+    let choice = &reply["choices"][0];
+    assert_eq!(choice["finish_reason"], "stop", "{reply}");
+    let content = choice["message"]["content"].as_str().unwrap_or_default();
+    assert!(!content.trim().is_empty(), "{reply}");
+}
+
 #[test]
 fn launch_qwen_with_model() {
     eprintln!("[test] launch_qwen_with_model: acquiring SERIAL");

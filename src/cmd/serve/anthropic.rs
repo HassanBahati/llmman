@@ -49,7 +49,8 @@ pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Thinking budgets per `reasoning_effort` level (every one of
 /// `crate::chat_template::EFFORT_LEVELS`, in its order) for a model that
 /// thinks on a budget spent from `max_tokens`; see [`adaptive_thinker`].
-const THINKING_BUDGETS: [(&str, u32); 6] = [
+/// Also the cap in `openai::apply_effort_budget`.
+pub(super) const THINKING_BUDGETS: [(&str, u32); 6] = [
     ("minimal", 1024),
     ("low", 2048),
     ("medium", 8192),
