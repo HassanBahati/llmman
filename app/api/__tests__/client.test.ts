@@ -189,6 +189,26 @@ describe("ApiClient.request", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it.each([
+    ["answers", () => response('{"version":"0.1.0"}')],
+    ["fails", () => Promise.reject(new TypeError("Network request failed"))],
+  ])(
+    "with a timeout, removes its listener from the caller's signal once the request %s",
+    async (_, reply) => {
+      const controller = new AbortController();
+      const addSpy = jest.spyOn(controller.signal, "addEventListener");
+      const removeSpy = jest.spyOn(controller.signal, "removeEventListener");
+      await new ApiClient({ url: URL }, async () => reply())
+        .version({ signal: controller.signal, timeoutMs: 1000 })
+        .catch(() => {});
+      const addedListeners = addSpy.mock.calls.map(([, listener]) => listener);
+      expect(addedListeners.length).toBeGreaterThan(0);
+      for (const listener of addedListeners) {
+        expect(removeSpy).toHaveBeenCalledWith("abort", listener);
+      }
+    },
+  );
+
   it("rejects a 200 that is not llmman as a protocol error", async () => {
     const { fetch } = fakeFetch(() => response("<html>router login</html>", { contentType: "text/html" }));
     const err = await new ApiClient({ url: URL }, fetch).version().catch((e) => e);

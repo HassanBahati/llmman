@@ -385,20 +385,23 @@ export class ApiClient {
   async getJson<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     if (!opts.timeoutMs) return readJson<T>(await this.request(path, {}, opts));
     const requestController = new AbortController();
+    const onCallerAbort = () => requestController.abort();
     if (opts.signal?.aborted) requestController.abort();
-    opts.signal?.addEventListener("abort", () => requestController.abort(), { once: true });
-    const r = await this.request(path, {}, { ...opts, signal: requestController.signal });
+    opts.signal?.addEventListener("abort", onCallerAbort, { once: true });
     let timedOut = false;
-    const bodyTimeout = setTimeout(() => {
-      timedOut = true;
-      requestController.abort();
-    }, opts.timeoutMs);
+    let bodyTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      const r = await this.request(path, {}, { ...opts, signal: requestController.signal });
+      bodyTimeout = setTimeout(() => {
+        timedOut = true;
+        requestController.abort();
+      }, opts.timeoutMs);
       return await readJson<T>(r);
     } catch (e) {
       throw timedOut ? this.timeoutError() : e;
     } finally {
       clearTimeout(bodyTimeout);
+      opts.signal?.removeEventListener("abort", onCallerAbort);
     }
   }
 
