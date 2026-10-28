@@ -3,8 +3,10 @@
 
 import { router, useNavigation } from "expo-router";
 import { DrawerActions } from "expo-router/react-navigation";
-import { useRef } from "react";
-import { Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import type { NativeStackHeaderItem, NativeStackNavigationOptions } from "expo-router/native-stack";
+import { type ReactNode, useRef } from "react";
+import { Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Icon } from "@/components/Icon";
 import { useConversation } from "@/lib/chatStore";
@@ -63,6 +65,101 @@ export function MenuButton() {
       <Icon name={{ ios: "line.3.horizontal", android: "menu" }} color={c.text} />
     </Pressable>
   );
+}
+
+/**
+ * A page's padding at its sides, at least `gap`, for the safe area there: a
+ * notch in landscape, or the vertical bar a foldable iPhone keeps beside the
+ * page. Beside the sidebar only the right edge can be the screen's.
+ */
+export function usePageSides(gap = 0): { paddingLeft: number; paddingRight: number } {
+  const insets = useSafeAreaInsets();
+  const { docked } = useSidebar();
+  return { paddingLeft: Math.max(gap, docked ? 0 : insets.left), paddingRight: Math.max(gap, insets.right) };
+}
+
+/**
+ * A stack's header and page in the drawer, as every page has them. With
+ * `sides`, the page keeps to the safe area at its sides (usePageSides).
+ */
+export function useStackOptions({ sides }: { sides: boolean }): NativeStackNavigationOptions {
+  const c = useTheme();
+  const padding = usePageSides();
+  return {
+    headerStyle: { backgroundColor: c.background },
+    headerTintColor: c.text,
+    headerShadowVisible: false,
+    headerTitleStyle: { color: c.text },
+    contentStyle: { backgroundColor: c.background, ...(sides ? padding : {}) },
+  };
+}
+
+/** A native stack's header buttons: React views, or on iOS the system's own. */
+type HeaderButtons = {
+  headerLeft?: () => ReactNode;
+  headerRight?: () => ReactNode;
+  unstable_headerLeftItems?: () => NativeStackHeaderItem[];
+  unstable_headerRightItems?: () => NativeStackHeaderItem[];
+};
+
+/**
+ * A page header's left item: the menu button, or none while the sidebar is
+ * shown, so iOS draws no empty button where it would be. On iOS it is a
+ * system bar button, which a foldable iPhone held upright puts in the
+ * vertical bar beside the page, under the status bar.
+ */
+export function useMenuHeaderLeft(): HeaderButtons {
+  const { wide, docked, setCollapsed } = useSidebar();
+  if (docked) return {};
+  if (Platform.OS !== "ios") return { headerLeft: () => <MenuButton /> };
+  const item: NativeStackHeaderItem = {
+    type: "button",
+    label: wide ? "Show the sidebar" : "Conversations and settings",
+    icon: { type: "sfSymbol", name: "line.3.horizontal" },
+    onPress: () => (wide ? setCollapsed(false) : requestDrawerToggle()),
+  };
+  return { unstable_headerLeftItems: () => [item] };
+}
+
+/** A chat's header buttons: the menu, and New chat but beside the sidebar, which has its own. */
+export function useChatHeaderButtons(): HeaderButtons {
+  const menu = useMenuHeaderLeft();
+  const openChat = useOpenChat();
+  const { docked } = useSidebar();
+  if (docked) return menu;
+  if (Platform.OS === "web") {
+    // Inset as the drawer's header had them.
+    return {
+      headerLeft: () => (
+        <View style={{ marginLeft: spacing.sm }}>
+          <MenuButton />
+        </View>
+      ),
+      headerRight: () => (
+        <View style={{ marginRight: spacing.sm }}>
+          <HeaderActions />
+        </View>
+      ),
+    };
+  }
+  if (Platform.OS !== "ios") return { ...menu, headerRight: () => <HeaderActions /> };
+  const item: NativeStackHeaderItem = {
+    type: "button",
+    label: "New chat",
+    icon: { type: "sfSymbol", name: "square.and.pencil" },
+    onPress: () => openChat(),
+  };
+  return { ...menu, unstable_headerRightItems: () => [item] };
+}
+
+/** The chat stacks' options: the page's sides are the chat's own (ChatScreen). */
+export function useChatStackOptions(): NativeStackNavigationOptions {
+  return {
+    ...useStackOptions({ sides: false }),
+    headerTitleAlign: "center",
+    headerBackButtonDisplayMode: "minimal",
+    ...useChatHeaderButtons(),
+  };
 }
 
 export function ModelTitle({ conversation }: { conversation: string }) {
