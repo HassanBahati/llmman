@@ -19,6 +19,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
 use super::hybrid::send_with_hybrid_fallback;
+use super::openai::{effort_budget_for, effort_budget_tokens, EFFORT_BUDGET_MESSAGE};
 use super::refusal::wire_refusal;
 use super::sched::*;
 use super::stream::*;
@@ -1273,7 +1274,7 @@ async fn ollama_chat_to(
     // response chunk's own `model` field below (which must keep echoing
     // back `model` as-is).
     let wire_model = backend_wire_model(state, &target, &model).await;
-    let oai = OAIChatRequest {
+    let mut oai = OAIChatRequest {
         model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
@@ -1282,6 +1283,16 @@ async fn ollama_chat_to(
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
+    // Unlike `apply_effort_budget`, nothing to leave alone: Ollama has no
+    // budget fields, and a level always turns thinking on.
+    if let Some(effort) = req.think.as_ref().and_then(|t| t.as_str()) {
+        if let Some(message) = effort_budget_for(state, &target).await {
+            oai.reasoning_budget_tokens =
+                effort_budget_tokens(effort, oai.max_tokens.map(u64::from));
+            oai.reasoning_budget_message =
+                (message && oai.reasoning_budget_tokens.is_some()).then_some(EFFORT_BUDGET_MESSAGE);
+        }
+    }
     stream_ollama(
         req.stream,
         state.0.client.clone(),

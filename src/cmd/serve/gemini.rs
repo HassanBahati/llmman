@@ -745,6 +745,8 @@ fn gemini_oai_request(model: String, req: &GeminiRequest) -> Result<OAIChatReque
             .and_then(|value| u32::try_from(value).ok()),
         min_p: None,
         stream_options: Some(serde_json::json!({"include_usage": true})),
+        reasoning_budget_tokens: None,
+        reasoning_budget_message: None,
     })
 }
 

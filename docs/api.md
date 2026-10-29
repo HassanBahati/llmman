@@ -82,6 +82,10 @@ pooling model, `decision` for a decision model), `vision` with a projector,
 `tools` when the chat template renders a request's `tools`, and `thinking`
 when it handles reasoning.
 
+On `/api/chat`, `think: "minimal"` and `"low"` also get the thinking
+budget a local `/v1/chat/completions` gives those levels (see
+[OpenAI API notes](#openai-api-notes)), sized from `num_predict`.
+
 `/api/create` supports `from` (alias a model) and `files` (GGUFs uploaded
 via `/api/blobs/{digest}`, as `ollama create` does). Modelfile fields such
 as `system` or `quantize` are refused with a 400: the GGUF's own chat

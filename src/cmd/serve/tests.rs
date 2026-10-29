@@ -1,7 +1,9 @@
 use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
-use super::openai::{apply_default_repeat_penalty, decode_f32s, encode_f32s};
+use super::openai::{
+    apply_default_repeat_penalty, decode_f32s, encode_f32s, EFFORT_BUDGET_MESSAGE,
+};
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::responses::{
     consolidate_responses_instructions, filter_non_function_tools, remote_responses,
@@ -6699,6 +6701,56 @@ async fn low_effort_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
     let sent = last();
     assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
     assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
+}
+
+/// `/api/chat`'s `think: "low"` gets the budget `/v1/chat/completions`
+/// gives `low`, sized from `num_predict`; `think: true` names no level.
+#[tokio::test(flavor = "multi_thread")]
+async fn ollama_think_low_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
+    let standin = RoleStandin::new(None);
+    let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
+    let send = |think: serde_json::Value| {
+        post_with(
+            &base,
+            "/api/chat",
+            serde_json::json!({
+                "model": "qwen3:0.6b",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": false,
+                "think": think,
+                "options": { "num_predict": 120 },
+            }),
+            serde_json::json!({}),
+        )
+    };
+    let last = || standin.seen.lock().unwrap().last().unwrap().clone();
+
+    send(serde_json::json!("low")).await;
+    let sent = last();
+    assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
+
+    let key = running_key(&state, "qwen3:0.6b");
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .effort_budget = true;
+    send(serde_json::json!("low")).await;
+    let sent = last();
+    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
+    assert_eq!(sent["reasoning_budget_message"], EFFORT_BUDGET_MESSAGE);
+    assert_eq!(
+        sent["chat_template_kwargs"],
+        serde_json::json!({ "enable_thinking": true, "reasoning_effort": "low" })
+    );
+
+    send(serde_json::json!(true)).await;
+    let sent = last();
+    assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
 }
 
 const ALTERNATION_REFUSAL: &str = "Unable to generate parser for this template. Automatic parser \
