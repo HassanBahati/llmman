@@ -1,6 +1,15 @@
 /** @jest-environment node */
 
-import { ApiClient, ApiError, errorFrom, isAbort, lines, remoteRef, splitRemoteRef } from "../client";
+import {
+  ApiClient,
+  ApiError,
+  errorFrom,
+  isAbort,
+  lines,
+  remoteRef,
+  splitRemoteRef,
+  type FetchLike,
+} from "../client";
 import { chunked, fakeFetch, fixture, llmman401, response } from "@/test/fakeFetch";
 
 const URL = "http://10.0.0.5:17434";
@@ -120,6 +129,95 @@ describe("ApiClient.request", () => {
     expect(err.kind).toBe("timeout");
   });
 
+  it("times out a request whose fetch ignores the abort", async () => {
+    const fetch = () => new Promise<never>(() => {});
+    const p = new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+  });
+
+  it("with a timeout, request() removes its listener from the caller's signal when the request fails", async () => {
+    const controller = new AbortController();
+    const addSpy = jest.spyOn(controller.signal, "addEventListener");
+    const removeSpy = jest.spyOn(controller.signal, "removeEventListener");
+    const fetch = () => Promise.reject(new TypeError("Network request failed"));
+    await new ApiClient({ url: URL }, fetch)
+      .request("api/version", {}, { signal: controller.signal, timeoutMs: 1000 })
+      .catch(() => {});
+    const addedListeners = addSpy.mock.calls.map(([, listener]) => listener);
+    expect(addedListeners.length).toBeGreaterThan(0);
+    for (const listener of addedListeners) {
+      expect(removeSpy).toHaveBeenCalledWith("abort", listener);
+    }
+  });
+
+  it("times out a body that never finishes", async () => {
+    // The headers arrive; the body never settles, not even on abort (as Expo's native text()).
+    const fetch = async () => ({ ...response(""), text: () => new Promise<string>(() => {}) });
+    const p = new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+  });
+
+  it("times out a body that stalls until aborted, as on the web", async () => {
+    // The headers arrive; the body rejects only when the request is aborted.
+    let fetchSignal: AbortSignal | undefined;
+    const fetch = async (_url: string, init?: { signal?: AbortSignal }) => {
+      fetchSignal = init?.signal;
+      return {
+        ...response(""),
+        text: () =>
+          new Promise<string>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new TypeError("aborted")));
+          }),
+      };
+    };
+    const err = await new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+    // The abort reaches fetch, so the stalled connection is closed, not just abandoned.
+    expect(fetchSignal?.aborted).toBe(true);
+  });
+
+  it.each([
+    ["headers", async () => new Promise<never>(() => {})],
+    ["body", async () => ({ ...response(""), text: () => new Promise<string>(() => {}) })],
+  ])(
+    "with a timeout, the caller's abort ends a stall in the %s at once, even if it ignores the abort",
+    async (_, fetch) => {
+      // Nothing settles on abort, as with Expo's native fetch.
+      const controller = new AbortController();
+      const p = new ApiClient({ url: URL }, fetch as FetchLike)
+        .version({ signal: controller.signal, timeoutMs: 1000 })
+        .catch((e) => e);
+      await new Promise((r) => setTimeout(r, 20));
+      controller.abort();
+      const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+      expect(isAbort(err)).toBe(true);
+    },
+  );
+
+  it("does not count the key prompt against the timeout", async () => {
+    let key = "";
+    const keySource = {
+      get: () => key,
+      ask: () =>
+        new Promise<boolean>((r) =>
+          setTimeout(() => {
+            key = "sk-1";
+            r(true);
+          }, 100),
+        ),
+    };
+    const { fetch } = fakeFetch((_url, init) =>
+      init.headers?.authorization ? response('{"version":"0.1.0"}') : llmman401(),
+    );
+    const version = await new ApiClient({ url: URL }, fetch, { keySource }).version({ timeoutMs: 50 });
+    expect(version.version).toBe("0.1.0");
+  });
+
   it("rethrows the caller's own abort as an AbortError", async () => {
     const controller = new AbortController();
     const fetch = (_url: string, init?: { signal?: AbortSignal }) =>
@@ -131,6 +229,49 @@ describe("ApiClient.request", () => {
     const err = await p.catch((e) => e);
     expect(isAbort(err)).toBe(true);
   });
+
+  it("with a timeout too, rethrows the caller's own abort as an AbortError", async () => {
+    const controller = new AbortController();
+    const fetch = (_url: string, init?: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new TypeError("cancelled")));
+      });
+    const p = new ApiClient({ url: URL }, fetch).version({ signal: controller.signal, timeoutMs: 1000 });
+    controller.abort();
+    const err = await p.catch((e) => e);
+    expect(isAbort(err)).toBe(true);
+  });
+
+  it("with a timeout too, does not send a request whose signal is already aborted", async () => {
+    const { fetch, calls } = fakeFetch(() => response('{"version":"0.1.0"}'));
+    const controller = new AbortController();
+    controller.abort();
+    const err = await new ApiClient({ url: URL }, fetch)
+      .version({ signal: controller.signal, timeoutMs: 1000 })
+      .catch((e) => e);
+    expect(isAbort(err)).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    ["answers", () => response('{"version":"0.1.0"}')],
+    ["fails", () => Promise.reject(new TypeError("Network request failed"))],
+  ])(
+    "with a timeout, removes its listener from the caller's signal once the request %s",
+    async (_, reply) => {
+      const controller = new AbortController();
+      const addSpy = jest.spyOn(controller.signal, "addEventListener");
+      const removeSpy = jest.spyOn(controller.signal, "removeEventListener");
+      await new ApiClient({ url: URL }, async () => reply())
+        .version({ signal: controller.signal, timeoutMs: 1000 })
+        .catch(() => {});
+      const addedListeners = addSpy.mock.calls.map(([, listener]) => listener);
+      expect(addedListeners.length).toBeGreaterThan(0);
+      for (const listener of addedListeners) {
+        expect(removeSpy).toHaveBeenCalledWith("abort", listener);
+      }
+    },
+  );
 
   it("rejects a 200 that is not llmman as a protocol error", async () => {
     const { fetch } = fakeFetch(() => response("<html>router login</html>", { contentType: "text/html" }));

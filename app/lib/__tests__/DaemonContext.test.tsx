@@ -1,6 +1,9 @@
 import { act, renderHook } from "@testing-library/react-native";
 import type { ReactNode } from "react";
-import { AppState } from "react-native";
+import { AppState, Platform } from "react-native";
+
+import { ApiClient, type RequestOptions } from "@/api/client";
+import { response } from "@/test/fakeFetch";
 
 import { DaemonProvider, POLL_MS, UNREACHABLE_POLL_MS, useDaemon } from "../DaemonContext";
 
@@ -39,9 +42,11 @@ beforeEach(() => {
   mockDetect.mockResolvedValue(shellOn);
 });
 const appState = AppState.currentState;
+const os = Platform.OS;
 afterEach(() => {
   jest.useRealTimers();
   AppState.currentState = appState;
+  Platform.OS = os;
 });
 
 test("checkReachable polls in the background; the timer does not", async () => {
@@ -153,5 +158,54 @@ test("a recovery poll answering after the 15 s poll started still counts", async
   }
   expect(mockVersion).toHaveBeenCalledTimes(7);
   await act(async () => slow.resolve(answer));
+  expect(result.current.reachable).toBe(true);
+});
+
+test.each([
+  ["web", 2],
+  ["ios", 0],
+  ["android", 0],
+])("while unreachable in the background, %s sends %i retries", async (platform, polls) => {
+  const { result } = await connected();
+  mockVersion.mockRejectedValueOnce(new Error("refused"));
+  await act(async () => result.current.checkReachable());
+  Platform.OS = platform as typeof Platform.OS;
+  AppState.currentState = "background";
+  mockVersion.mockClear();
+
+  mockVersion.mockRejectedValue(new Error("refused"));
+  for (let t = 0; t < 2 * UNREACHABLE_POLL_MS; t += UNREACHABLE_POLL_MS) {
+    await act(async () => {
+      jest.advanceTimersByTime(UNREACHABLE_POLL_MS);
+    });
+  }
+  expect(mockVersion).toHaveBeenCalledTimes(polls);
+});
+
+test("a stalled /api/version body ends at the timeout, so the retries resume", async () => {
+  const { result } = await connected();
+  // The real client, over a network whose first body never settles, not even on abort.
+  let stall = true;
+  const fetch = async () => ({
+    ...response('{"version":"0.1.0"}'),
+    text: () =>
+      stall ? ((stall = false), new Promise<string>(() => {})) : Promise.resolve('{"version":"0.1.0"}'),
+  });
+  const client = new ApiClient({ url: "http://127.0.0.1:17434" }, fetch);
+  mockVersion.mockImplementation((opts: RequestOptions) => client.version(opts));
+
+  await act(async () => result.current.checkReachable());
+  // Before the 15 s poll: only a resumed 3 s retry can bring it back.
+  for (let t = 0; t < 8_000; t += 1000) {
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+    });
+  }
+  expect(result.current.reachable).toBe(false);
+  for (let t = 0; t < 4_000; t += 1000) {
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+    });
+  }
   expect(result.current.reachable).toBe(true);
 });
