@@ -6687,7 +6687,7 @@ async fn low_effort_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
         serde_json::json!({ "enable_thinking": true, "reasoning_effort": "low" })
     );
 
-    // The user set a server-wide --reasoning-budget-message.
+    // Set at load when LLMMAN_LLAMA_ARGS has --reasoning-budget-message.
     state
         .0
         .manager
@@ -6751,6 +6751,21 @@ async fn ollama_think_low_gets_a_thinking_budget_only_on_a_model_flagged_for_one
     send(serde_json::json!(true)).await;
     let sent = last();
     assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
+
+    // Set at load when LLMMAN_LLAMA_ARGS has --reasoning-budget-message.
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get_mut(&key)
+        .unwrap()
+        .effort_budget_message = false;
+    send(serde_json::json!("low")).await;
+    let sent = last();
+    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
+    assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
 }
 
 const ALTERNATION_REFUSAL: &str = "Unable to generate parser for this template. Automatic parser \
