@@ -5,7 +5,7 @@
 //!
 //! Writes the exact same on-disk format Go's `push`/`inspect` and
 //! `crate::storage`'s `build`/`tag`/`list`/`run`/`serve` already read
-//! and write (content-addressed `blobs/<alg>/<hex>`, `manifests/<ref>`
+//! and write (content-addressed `blobs/<alg>/<hex>`, `manifests-v2/<repo>/<tag>.json`
 //! pointer files, `oci-layout`) — a from-scratch equivalent, not a
 //! replacement, so a native pull never needs to call into Go.
 //!
@@ -365,51 +365,42 @@ impl std::io::Write for HashingWriter<'_> {
 // Manifest-ref bookkeeping — mirrors manifest_ref.go.
 // ---------------------------------------------------------------------------
 
-const MANIFESTS_DIR_NAME: &str = "manifests";
-
-fn sanitize_ref_segment(s: &str) -> String {
-    if s.is_empty() || s == "." || s == ".." {
-        return "__".to_string();
-    }
-    s.replace([':', '\\'], "_")
-}
-
-/// Splits `reference` into the path segments used to lay it out under
-/// `manifests/` — mirrors `refPathSegments`. A `:` only starts a tag if
-/// it comes after the last `/` (so a registry port, e.g.
-/// "host:5000/owner/repo", isn't mistaken for one); otherwise the tag
-/// defaults to "latest".
-fn ref_path_segments(reference: &str) -> Vec<String> {
-    let last_colon = reference.rfind(':').map(|i| i as isize).unwrap_or(-1);
-    let last_slash = reference.rfind('/').map(|i| i as isize).unwrap_or(-1);
-    let (name, tag) = if last_colon > last_slash {
-        (
-            &reference[..last_colon as usize],
-            &reference[last_colon as usize + 1..],
-        )
-    } else {
-        (reference, "latest")
-    };
-    let mut segs: Vec<String> = name
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(sanitize_ref_segment)
-        .collect();
-    segs.push(sanitize_ref_segment(tag));
-    segs
-}
-
 fn manifest_ref_path(layout_dir: &Path, reference: &str) -> PathBuf {
-    let mut p = layout_dir.join(MANIFESTS_DIR_NAME);
-    for seg in ref_path_segments(reference) {
-        p.push(seg);
-    }
-    p
+    crate::storage::oci::manifest_ref_path(layout_dir, reference)
 }
 
 pub fn read_manifest_ref(layout_dir: &Path, reference: &str) -> Result<Descriptor> {
-    let data = std::fs::read(manifest_ref_path(layout_dir, reference))?;
-    Ok(serde_json::from_slice(&data)?)
+    for (i, path) in [
+        manifest_ref_path(layout_dir, reference),
+        crate::storage::oci::legacy_manifest_ref_path(layout_dir, reference),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let desc: Descriptor = serde_json::from_slice(&data)?;
+                if desc
+                    .annotations
+                    .as_ref()
+                    .and_then(|ann| ann.get(ANNOTATION_REF_NAME))
+                    .is_some_and(|name| {
+                        crate::storage::default_tag(name) == crate::storage::default_tag(reference)
+                    })
+                {
+                    return Ok(desc);
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || (i == 1 && crate::storage::oci::missing_legacy_ref(&err)) =>
+            {
+                continue
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
 }
 
 /// Atomically records that `reference` now points at `manifest_desc` —
@@ -453,11 +444,11 @@ pub fn alias_manifest_ref(layout_dir: &Path, reference: &str, alias: &str) -> Re
     write_manifest_ref(layout_dir, alias, desc)
 }
 
-/// Initializes the OCI layout marker files and `manifests/` directory if
-/// not already present — mirrors `ensureLayout`.
+/// Initializes the OCI layout marker files and `manifests-v2/` directory if
+/// not already present — mirrors `ensureLayout`. The legacy tree is read-only.
 pub fn ensure_layout(layout_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(layout_dir)?;
-    std::fs::create_dir_all(layout_dir.join(MANIFESTS_DIR_NAME))?;
+    std::fs::create_dir_all(layout_dir.join("manifests-v2"))?;
     let marker = layout_dir.join("oci-layout");
     if !marker.exists() {
         std::fs::write(marker, br#"{"imageLayoutVersion":"1.0.0"}"#)?;
@@ -511,27 +502,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ref_path_segments_defaults_a_missing_tag_to_latest() {
-        assert_eq!(
-            ref_path_segments("owner/repo"),
-            vec!["owner", "repo", "latest"]
-        );
-    }
-
-    #[test]
-    fn ref_path_segments_splits_an_explicit_tag() {
-        assert_eq!(
-            ref_path_segments("owner/repo:v1"),
-            vec!["owner", "repo", "v1"]
-        );
-    }
-
-    #[test]
-    fn ref_path_segments_sanitizes_unsafe_characters() {
-        assert_eq!(
-            ref_path_segments("owner/repo:"),
-            vec!["owner", "repo", "__"]
-        );
+    fn staged_manifest_is_visible_to_local_store() {
+        let dir = tempfile();
+        let reference = "reg.example:5000/ns/model:t";
+        let desc = Descriptor {
+            media_type: MEDIA_TYPE_IMAGE_MANIFEST.into(),
+            digest: "sha256:deadbeef".into(),
+            size: 12,
+            ..Default::default()
+        };
+        write_manifest_ref(&dir, reference, desc).unwrap();
+        let store = crate::storage::oci::OciStore::open(&dir).unwrap();
+        assert_eq!(store.find(reference).unwrap().digest, "sha256:deadbeef");
     }
 
     #[test]
@@ -617,6 +599,55 @@ mod tests {
         write_manifest_ref(&dir, "owner/repo:tag", desc).unwrap();
         let got = read_manifest_ref(&dir, "owner/repo:tag").unwrap();
         assert_eq!(got.annotation(ANNOTATION_REF_NAME), Some("owner/repo:tag"));
+    }
+
+    #[test]
+    fn legacy_ancestor_file_does_not_block_staged_ref() {
+        let dir = tempfile();
+        ensure_layout(&dir).unwrap();
+        let reference = "reg.example/ns/model/sub:t";
+        let ancestor =
+            crate::storage::oci::legacy_manifest_ref_path(&dir, "reg.example/ns/model:sub");
+        std::fs::create_dir_all(ancestor.parent().unwrap()).unwrap();
+        std::fs::write(&ancestor, b"another pointer").unwrap();
+        assert!(read_manifest_ref(&dir, reference).is_err());
+
+        let desc = Descriptor {
+            digest: "sha256:abc".into(),
+            ..Default::default()
+        };
+        write_manifest_ref(&dir, reference, desc).unwrap();
+        assert_eq!(
+            read_manifest_ref(&dir, reference).unwrap().digest,
+            "sha256:abc"
+        );
+        assert_eq!(std::fs::read(&ancestor).unwrap(), b"another pointer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_opaque_key_ignores_unrepresentable_legacy_pointer() {
+        let dir = tempfile();
+        ensure_layout(&dir).unwrap();
+        let reference = format!("s3://bucket/{}", "a".repeat(256));
+        let legacy = crate::storage::oci::legacy_manifest_ref_path(&dir, &reference);
+        std::fs::create_dir_all(legacy.parent().unwrap().parent().unwrap()).unwrap();
+        assert!(read_manifest_ref(&dir, &reference).is_err());
+        write_manifest_ref(
+            &dir,
+            &reference,
+            Descriptor {
+                digest: "sha256:abc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_manifest_ref(&dir, &reference).unwrap().digest,
+            "sha256:abc"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
