@@ -184,17 +184,12 @@ test.each([
 
 test("a stalled /api/version body ends at the timeout, so the retries resume", async () => {
   const { result } = await connected();
-  // The real client, over a network whose first body stalls until aborted.
+  // The real client, over a network whose first body never settles, not even on abort.
   let stall = true;
-  const fetch = async (_url: string, init?: { signal?: AbortSignal }) => ({
+  const fetch = async () => ({
     ...response('{"version":"0.1.0"}'),
     text: () =>
-      stall
-        ? ((stall = false),
-          new Promise<string>((_, reject) =>
-            init?.signal?.addEventListener("abort", () => reject(new TypeError("aborted"))),
-          ))
-        : Promise.resolve('{"version":"0.1.0"}'),
+      stall ? ((stall = false), new Promise<string>(() => {})) : Promise.resolve('{"version":"0.1.0"}'),
   });
   const client = new ApiClient({ url: "http://127.0.0.1:17434" }, fetch);
   mockVersion.mockImplementation((opts: RequestOptions) => client.version(opts));

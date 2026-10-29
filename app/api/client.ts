@@ -388,17 +388,17 @@ export class ApiClient {
     const onCallerAbort = () => requestController.abort();
     if (opts.signal?.aborted) requestController.abort();
     opts.signal?.addEventListener("abort", onCallerAbort, { once: true });
-    let timedOut = false;
     let bodyTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const r = await this.request(path, {}, { ...opts, signal: requestController.signal });
-      bodyTimeout = setTimeout(() => {
-        timedOut = true;
-        requestController.abort();
-      }, opts.timeoutMs);
-      return await readJson<T>(r);
-    } catch (e) {
-      throw timedOut ? this.timeoutError() : e;
+      // Rejects on its own: Expo's native text() ignores the abort until the body completes.
+      const timeout = new Promise<never>((_, reject) => {
+        bodyTimeout = setTimeout(() => {
+          requestController.abort();
+          reject(this.timeoutError());
+        }, opts.timeoutMs);
+      });
+      return await Promise.race([readJson<T>(r), timeout]);
     } finally {
       clearTimeout(bodyTimeout);
       opts.signal?.removeEventListener("abort", onCallerAbort);

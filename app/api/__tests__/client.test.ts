@@ -121,14 +121,8 @@ describe("ApiClient.request", () => {
   });
 
   it("times out a body that never finishes", async () => {
-    // The headers arrive; the body stalls until the request is aborted.
-    const fetch = async (_url: string, init?: { signal?: AbortSignal }) => ({
-      ...response(""),
-      text: () =>
-        new Promise<string>((_, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(new TypeError("aborted")));
-        }),
-    });
+    // The headers arrive; the body never settles, not even on abort (as Expo's native text()).
+    const fetch = async () => ({ ...response(""), text: () => new Promise<string>(() => {}) });
     const p = new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
     const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
     expect(err).toBeInstanceOf(ApiError);
