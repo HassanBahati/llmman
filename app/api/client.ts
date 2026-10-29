@@ -362,7 +362,7 @@ export class ApiClient {
         headers,
         signal: relay?.controller.signal ?? outer,
       });
-      return await (timeout ? Promise.race([response, timeout.expired]) : response);
+      return await (relay && timeout ? Promise.race([response, timeout.expired, relay.aborted]) : response);
     } catch (e) {
       // On success the relay stays, so the caller's abort can still stop the body.
       relay?.release();
@@ -387,7 +387,7 @@ export class ApiClient {
     try {
       const r = await this.request(path, {}, { ...opts, signal: relay.controller.signal });
       timeout = expireAfter(opts.timeoutMs, relay.controller, () => this.timeoutError());
-      return await Promise.race([readJson<T>(r), timeout.expired]);
+      return await Promise.race([readJson<T>(r), timeout.expired, relay.aborted]);
     } finally {
       timeout?.clear();
       relay.release();
@@ -589,13 +589,23 @@ interface ChatChunk {
   }[];
 }
 
-/** An AbortController that follows `outer`; `release()` stops following it. */
+/**
+ * An AbortController that follows `outer`, and `aborted`, which rejects with
+ * an AbortError when `outer` aborts, so a race ends even where the abort
+ * can't stop the request. `release()` stops following `outer`.
+ */
 function relayAbort(outer: AbortSignal | undefined) {
   const controller = new AbortController();
-  const onOuterAbort = () => controller.abort();
-  if (outer?.aborted) controller.abort();
+  let rejectAborted: (e: Error) => void = () => {};
+  const aborted = new Promise<never>((_, reject) => (rejectAborted = reject));
+  aborted.catch(() => {}); // Only a race reads it.
+  const onOuterAbort = () => {
+    rejectAborted(abortError());
+    controller.abort();
+  };
+  if (outer?.aborted) onOuterAbort();
   outer?.addEventListener("abort", onOuterAbort, { once: true });
-  return { controller, release: () => outer?.removeEventListener("abort", onOuterAbort) };
+  return { controller, aborted, release: () => outer?.removeEventListener("abort", onOuterAbort) };
 }
 
 /**

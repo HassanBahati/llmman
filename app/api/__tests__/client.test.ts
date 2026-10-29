@@ -1,6 +1,15 @@
 /** @jest-environment node */
 
-import { ApiClient, ApiError, errorFrom, isAbort, lines, remoteRef, splitRemoteRef } from "../client";
+import {
+  ApiClient,
+  ApiError,
+  errorFrom,
+  isAbort,
+  lines,
+  remoteRef,
+  splitRemoteRef,
+  type FetchLike,
+} from "../client";
 import { chunked, fakeFetch, fixture, llmman401, response } from "@/test/fakeFetch";
 
 const URL = "http://10.0.0.5:17434";
@@ -171,6 +180,24 @@ describe("ApiClient.request", () => {
     // The abort reaches fetch, so the stalled connection is closed, not just abandoned.
     expect(fetchSignal?.aborted).toBe(true);
   });
+
+  it.each([
+    ["headers", async () => new Promise<never>(() => {})],
+    ["body", async () => ({ ...response(""), text: () => new Promise<string>(() => {}) })],
+  ])(
+    "with a timeout, the caller's abort ends a stall in the %s at once, even if it ignores the abort",
+    async (_, fetch) => {
+      // Nothing settles on abort, as with Expo's native fetch.
+      const controller = new AbortController();
+      const p = new ApiClient({ url: URL }, fetch as FetchLike)
+        .version({ signal: controller.signal, timeoutMs: 1000 })
+        .catch((e) => e);
+      await new Promise((r) => setTimeout(r, 20));
+      controller.abort();
+      const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+      expect(isAbort(err)).toBe(true);
+    },
+  );
 
   it("does not count the key prompt against the timeout", async () => {
     let key = "";
