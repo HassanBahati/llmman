@@ -8,20 +8,17 @@
 //! ```text
 //! <store-root>/
 //!   oci-layout             {"imageLayoutVersion":"1.0.0"}
-//!   manifests/<...>/<tag>  one small JSON OCI descriptor (mediaType/
-//!                          digest/size) per stored reference, pointing at
-//!                          the manifest blob under blobs/ — see
-//!                          `ref_path_segments`. One file per model,
-//!                          mirroring Ollama's per-model manifest layout,
-//!                          rather than a single shared index.json (a
-//!                          breaking change from older llmman versions —
-//!                          no migration is provided; re-pull instead).
+//!   manifests-v2/<host>/<repo>/<tag>.json
+//!                          one small JSON OCI descriptor per reference,
+//!                          pointing at the manifest blob under blobs/.
+//!   manifests/<...>/<tag>  legacy per-reference paths, read as a fallback.
 //!   blobs/
 //!     sha256/
 //!       <hex>              one file per blob — config, layers, and each
 //!                          manifest's own raw JSON bytes
 //! ```
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +31,8 @@ use sha2::{Digest as Sha2Digest, Sha256};
 /// Per-process counter used only to make `OciStore::write_ref`'s temp
 /// file name unique across concurrent writers — see there.
 static WRITE_REF_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const MANIFESTS_V2_DIR: &str = "manifests-v2";
 
 // ---------------------------------------------------------------------------
 // Minimal OCI spec types (no external crate needed)
@@ -170,7 +169,7 @@ impl OciStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         fs::create_dir_all(root.join("blobs").join("sha256"))?;
-        fs::create_dir_all(root.join("manifests"))?;
+        fs::create_dir_all(root.join(MANIFESTS_V2_DIR))?;
 
         // Write oci-layout marker if absent
         let marker = root.join("oci-layout");
@@ -198,20 +197,54 @@ impl OciStore {
     // `matching_index` only for a reference spelled differently than it
     // was stored (see `ref_matches_precise`).
 
-    /// The path `reference`'s manifest-pointer file lives (or would live)
-    /// at, under `manifests/` — see `ref_path_segments`.
+    /// The collision-resistant path for a reference's manifest pointer.
     fn ref_path(&self, reference: &str) -> PathBuf {
-        let mut path = self.root.join("manifests");
-        for seg in ref_path_segments(reference) {
-            path.push(seg);
-        }
-        path
+        manifest_ref_path(&self.root, reference)
     }
 
-    fn read_ref(&self, reference: &str) -> anyhow::Result<Descriptor> {
-        let data = fs::read(self.ref_path(reference))
-            .with_context(|| format!("read manifest ref {reference}"))?;
+    fn legacy_ref_path(&self, reference: &str) -> PathBuf {
+        legacy_manifest_ref_path(&self.root, reference)
+    }
+
+    fn read_ref_at(&self, path: &Path, reference: &str) -> anyhow::Result<Descriptor> {
+        let data = fs::read(path).with_context(|| format!("read manifest ref {reference}"))?;
         serde_json::from_slice(&data).context("parse manifest ref")
+    }
+
+    fn read_ref_if_present(
+        &self,
+        path: &Path,
+        reference: &str,
+    ) -> anyhow::Result<Option<Descriptor>> {
+        match self.read_ref_at(path, reference) {
+            Ok(desc) => Ok(Some(desc)),
+            Err(err)
+                if err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn read_legacy_ref(&self, reference: &str) -> anyhow::Result<Option<Descriptor>> {
+        let path = self.legacy_ref_path(reference);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Ok(None),
+            Ok(_) => {}
+            Err(err) if missing_legacy_ref(&err) => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("inspect manifest ref {reference}"))
+            }
+        }
+        match self.read_ref_if_present(&path, reference) {
+            Err(err) if err.chain().any(|cause| cause.is::<serde_json::Error>()) => Ok(None),
+            result => result,
+        }
     }
 
     fn write_ref(&self, reference: &str, desc: &Descriptor) -> anyhow::Result<()> {
@@ -240,20 +273,52 @@ impl OciStore {
         Ok(())
     }
 
-    fn remove_ref(&self, reference: &str) -> anyhow::Result<()> {
-        fs::remove_file(self.ref_path(reference))
-            .with_context(|| format!("remove manifest ref {reference}"))
+    fn remove_ref(&self, reference: &str) -> anyhow::Result<bool> {
+        let path = self.ref_path(reference);
+        let legacy = self.legacy_ref_path(reference);
+        // Explicit removal is the only operation allowed to delete an old
+        // pointer; normal writes leave the legacy tree untouched. Otherwise
+        // an old pointer would resurrect a model immediately after `rm`.
+        // Read both candidates before deleting either one, so a filesystem
+        // error on the legacy path cannot leave a partially removed ref.
+        let remove_new = match self.read_ref_if_present(&path, reference) {
+            Ok(desc) => desc
+                .as_ref()
+                .and_then(stored_ref_name)
+                .is_some_and(|stored| same_ref_name(stored, reference)),
+            // The current path names exactly one reference, so an
+            // unparsable pointer there is its own: let `rm` clear it.
+            Err(err) if err.chain().any(|cause| cause.is::<serde_json::Error>()) => true,
+            Err(err) => return Err(err),
+        };
+        let remove_legacy = self
+            .read_legacy_ref(reference)?
+            .as_ref()
+            .and_then(stored_ref_name)
+            .is_some_and(|stored| same_ref_name(stored, reference));
+        for candidate in [
+            remove_new.then_some(&path),
+            remove_legacy.then_some(&legacy),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fs::remove_file(candidate)
+                .with_context(|| format!("remove manifest ref {reference}"))?;
+        }
+        Ok(remove_new || remove_legacy)
     }
 
-    /// Every stored manifest descriptor, read from `manifests/` — each
+    /// Every stored manifest descriptor, read from current and legacy paths — each
     /// still carries its own reference name in its
     /// `org.opencontainers.image.ref.name` annotation. A single
     /// unreadable or unparsable entry is skipped rather than failing the
     /// whole walk.
     pub(crate) fn list_refs(&self) -> Vec<Descriptor> {
-        let root = self.root.join("manifests");
         let mut out = Vec::new();
-        collect_refs(&root, &mut out);
+        collect_refs(&self.root.join(MANIFESTS_V2_DIR), &mut out);
+        collect_refs(&self.root.join("manifests"), &mut out);
+        dedup_refs(&mut out);
         out
     }
 
@@ -263,12 +328,11 @@ impl OciStore {
     /// a reference dropped by the lossy `list_refs` would make that model's
     /// blobs look unreferenced and get swept, so GC must instead refuse to
     /// run at all when it can't enumerate every surviving reference. A
-    /// missing `manifests/` directory (a fresh store) is an empty list, not
-    /// an error.
+    /// missing pointer directory (a fresh store) is an empty list.
     pub(crate) fn list_refs_strict(&self) -> anyhow::Result<Vec<Descriptor>> {
-        let root = self.root.join("manifests");
         let mut out = Vec::new();
-        collect_refs_strict(&root, &mut out)?;
+        collect_refs_strict(&self.root.join(MANIFESTS_V2_DIR), &mut out)?;
+        collect_refs_strict(&self.root.join("manifests"), &mut out)?;
         Ok(out)
     }
 
@@ -371,10 +435,8 @@ impl OciStore {
     /// Records that `reference` now points at `desc`, replacing any prior
     /// entry stored under that exact reference. The full `reference`
     /// string is stored in the annotation so `list` shows it verbatim —
-    /// see `ref_path_segments` for how it's also encoded (with some loss:
-    /// a tagless reference and its `:latest` spelling collapse to the
-    /// same file, same as `ref_matches_precise` already treats them) into
-    /// the file's own path.
+    /// `manifest_ref_path` encodes the name into a portable readable tree;
+    /// a tagless reference and its `:latest` spelling share a pointer.
     pub fn tag(&self, mut desc: Descriptor, reference: &str) -> anyhow::Result<()> {
         let mut ann = desc.annotations.take().unwrap_or_default();
         ann.insert(
@@ -386,22 +448,27 @@ impl OciStore {
     }
 
     /// Find the descriptor stored for `reference` — see this type's own
-    /// doc comment on the fast path (`read_ref`) and its fallback
+    /// doc comment on the direct pointer path and its fallback
     /// (`matching_index` over every stored reference).
     pub fn find(&self, reference: &str) -> anyhow::Result<Descriptor> {
-        if self.ref_path(reference).exists() {
-            // Present but unparsable is a broken store, not a typo —
-            // surface that error rather than falling through to "not
-            // found".
-            let desc = self.read_ref(reference)?;
-            // A digest reference names content, and the pointer at its
-            // path answers for it only while it holds that content. One
-            // that holds another digest, from a `cp` of an older llmman
-            // to a digest-shaped destination or from a hand edit, is
-            // passed over, and the lookup by content below decides.
+        let path = self.ref_path(reference);
+        for current in [true, false] {
+            // A corrupt current pointer is a broken store, not a typo. The
+            // old lossy path may hold another name's pointer, a directory,
+            // or junk: skip it, and never return it just because the
+            // filename happens to match.
+            let found = if current {
+                self.read_ref_if_present(&path, reference)?
+            } else {
+                self.read_legacy_ref(reference)?
+            };
+            let Some(desc) = found else { continue };
+            let same_name =
+                stored_ref_name(&desc).is_some_and(|stored| same_ref_name(stored, reference));
             match split_ref_digest(reference).1 {
                 Some(digest) if !desc.digest.eq_ignore_ascii_case(digest) => {}
-                _ => return Ok(desc),
+                Some(_) | None if same_name => return Ok(desc),
+                _ => {}
             }
         }
         let refs = self.list_refs();
@@ -469,7 +536,7 @@ impl OciStore {
     /// `:latest` for a lookup: a removal takes the explicit form. Does not
     /// GC blobs.
     pub fn remove(&self, reference: &str) -> anyhow::Result<String> {
-        if self.remove_ref(reference).is_ok() {
+        if self.remove_ref(reference)? {
             return Ok(reference.to_owned());
         }
         let refs = self.list_refs();
@@ -500,7 +567,7 @@ impl OciStore {
         let Some(name) = stored_ref_name(&refs[i]) else {
             return Err(anyhow!("image not found: {}", reference));
         };
-        self.remove_ref(name)?;
+        anyhow::ensure!(self.remove_ref(name)?, "image not found: {reference}");
         Ok(name.to_owned())
     }
 
@@ -764,7 +831,7 @@ pub fn split_ref_digest(reference: &str) -> (&str, Option<&str>) {
 /// The repository part of a reference: everything before a tag or digest,
 /// so `docker.io/ai/m:v9`, `docker.io/ai/m` and `docker.io/ai/m@sha256:…`
 /// all give `docker.io/ai/m`. The tag is cut by the rule
-/// `ref_path_segments` lays paths out with, a `:` after the last `/`, so
+/// manifest references use, a `:` after the last `/`, so
 /// a host port stays.
 pub fn repo_name(reference: &str) -> &str {
     let (base, _) = split_ref_digest(reference);
@@ -811,21 +878,154 @@ fn stored_ref_name(desc: &Descriptor) -> Option<&str> {
         .map(|s| s.as_str())
 }
 
-/// Splits `reference` into the path segments used to lay it out under
-/// `manifests/` — one directory per "/"-delimited path segment, with an
-/// explicit (defaulted, if absent — see `default_tag`) tag as the final
-/// segment. Mirrors Ollama's `model.Name.Filepath()`
-/// (`types/model/name.go`: `{host}/{namespace}/{model}/{tag}`),
-/// generalized to also cover llmman's broader reference space
-/// (HuggingFace-style `host/owner/repo:tag` references — already the same
-/// shape — and non-registry sources, which `default_tag` already knows to
-/// leave untouched since they never carry a tag).
-///
-/// Each segment is sanitized for safe use as a single path component: an
-/// empty, "." or ".." segment (e.g. an empty tag from "repo:") becomes
-/// "__" instead, since any of those would otherwise produce a malformed
-/// or unintended path — see `sanitize_ref_segment`.
-fn ref_path_segments(reference: &str) -> Vec<String> {
+fn dedup_refs(refs: &mut Vec<Descriptor>) {
+    let mut seen = HashSet::new();
+    refs.retain(|desc| {
+        stored_ref_name(desc)
+            .map(|name| seen.insert(default_tag(name)))
+            .unwrap_or(true)
+    });
+}
+
+fn same_ref_name(stored: &str, requested: &str) -> bool {
+    default_tag(stored) == default_tag(requested)
+}
+
+pub(crate) fn manifest_ref_path(root: &Path, reference: &str) -> PathBuf {
+    let key = default_tag(reference);
+    let opaque = reference.starts_with('/') || reference.contains("://");
+    let mut path = root.join(MANIFESTS_V2_DIR);
+    if opaque {
+        // `~` cannot be emitted by escape_ref_segment, so opaque names cannot
+        // collide with a registry named "~" or with its ordinary repo tree.
+        path.push("~");
+    }
+    let (name, tag) = if opaque {
+        key.rsplit_once('/')
+            .map_or(("", key.as_str()), |(name, tag)| (name, tag))
+    } else {
+        let pos = key
+            .rfind(':')
+            .expect("canonical registry reference has a tag");
+        (&key[..pos], &key[pos + 1..])
+    };
+    if !name.is_empty() || opaque {
+        for segment in name.split('/') {
+            push_ref_segment(&mut path, segment, true);
+        }
+    }
+    push_ref_segment(&mut path, tag, false);
+    path
+}
+
+// Percent encoding can triple a long uppercase component. Keep each filesystem
+// component below common 255-byte limits without losing any source bytes.
+// `~` and `~~` are reserved markers: ordinary escaped names cannot emit them.
+fn push_ref_segment(path: &mut PathBuf, segment: &str, directory: bool) {
+    let encoded = escape_ref_segment(segment, directory);
+    if encoded.len() <= 200 {
+        path.push(if directory {
+            encoded
+        } else {
+            format!("{encoded}.json")
+        });
+    } else {
+        for chunk in encoded.as_bytes().chunks(180) {
+            let chunk = std::str::from_utf8(chunk).expect("escaped ASCII");
+            path.push(format!("~{}", escape_chunk_trailing_dot(chunk)));
+        }
+        path.push(if directory { "~~" } else { "~~.json" });
+    }
+}
+
+fn escape_chunk_trailing_dot(chunk: &str) -> String {
+    chunk
+        .strip_suffix('.')
+        .map_or_else(|| chunk.to_owned(), |rest| format!("{rest}%2E"))
+}
+
+/// Percent-escape unsafe bytes and uppercase letters so paths stay distinct
+/// even on case-insensitive filesystems. A repo component may never end in
+/// `.json`: pointer files do, preventing file-as-ancestor collisions.
+fn escape_ref_segment(segment: &str, directory: bool) -> String {
+    if segment.is_empty() {
+        return "~".to_owned();
+    }
+    let reserved = matches!(
+        segment
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    let mut out = String::new();
+    for (i, byte) in segment.bytes().enumerate() {
+        let safe = byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'-' | b'_' | b'.');
+        if safe && !(reserved && i == 0) && !(matches!(segment, "." | "..") && byte == b'.') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if directory && (out.ends_with(".json") || out.ends_with('.')) {
+        let dot = out.rfind('.').expect("suffix contains a dot");
+        out.replace_range(dot..=dot, "%2E");
+    }
+    out
+}
+
+pub(crate) fn legacy_manifest_ref_path(root: &Path, reference: &str) -> PathBuf {
+    let mut path = root.join("manifests");
+    for segment in legacy_ref_path_segments(reference) {
+        path.push(segment);
+    }
+    path
+}
+
+pub(crate) fn missing_legacy_ref(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ENAMETOOLONG) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(206) {
+        return true; // ERROR_FILENAME_EXCED_RANGE
+    }
+    false
+}
+
+fn legacy_ref_path_segments(reference: &str) -> Vec<String> {
     let tagged = default_tag(reference);
     let (name, tag): (&str, &str) = match tagged.rfind(':') {
         Some(pos) if pos > tagged.rfind('/').unwrap_or(0) => (&tagged[..pos], &tagged[pos + 1..]),
@@ -833,19 +1033,13 @@ fn ref_path_segments(reference: &str) -> Vec<String> {
     };
     name.split('/')
         .filter(|s| !s.is_empty())
-        .map(sanitize_ref_segment)
-        .chain(std::iter::once(sanitize_ref_segment(tag)))
+        .map(legacy_sanitize_ref_segment)
+        .chain(std::iter::once(legacy_sanitize_ref_segment(tag)))
         .collect()
 }
 
-/// Neutralizes characters that would be unsafe or misleading as a single
-/// path segment: a literal `:` or `\` (a Windows path separator, or a
-/// drive-letter colon, that could otherwise land inside what's meant to
-/// be one segment — e.g. an absolute Windows path, or a URI scheme's
-/// `://`) becomes `_`, and a segment that's exactly `..` is neutralized,
-/// so no reference can ever escape the `manifests/` tree it's rooted
-/// under.
-fn sanitize_ref_segment(s: &str) -> String {
+/// The pre-fix mapper, needed only to locate already-written pointers.
+fn legacy_sanitize_ref_segment(s: &str) -> String {
     if s.is_empty() || s == "." || s == ".." {
         return "__".to_string();
     }
@@ -1324,34 +1518,242 @@ mod tests {
     #[test]
     fn ref_path_segments_mirrors_ollama_host_namespace_model_tag() {
         assert_eq!(
-            ref_path_segments("docker.io/ai/qwen3.5:0.8b"),
+            legacy_ref_path_segments("docker.io/ai/qwen3.5:0.8b"),
             vec!["docker.io", "ai", "qwen3.5", "0.8b"]
         );
         assert_eq!(
-            ref_path_segments("docker.io/ai/qwen3.5"),
+            legacy_ref_path_segments("docker.io/ai/qwen3.5"),
             vec!["docker.io", "ai", "qwen3.5", "latest"]
         );
     }
 
     #[test]
-    fn ref_path_segments_sanitizes_unsafe_characters() {
-        // A URI-scheme source's "://" and a bare ".." must never produce
-        // a path component that could escape manifests/ or break on
-        // Windows.
+    fn current_paths_are_portable_and_distinct() {
+        let root = Path::new("store");
+        let path = manifest_ref_path(root, "s3://bucket/key");
         assert_eq!(
-            ref_path_segments("s3://bucket/key"),
-            vec!["s3_", "bucket", "key", "latest"]
+            path,
+            root.join(MANIFESTS_V2_DIR)
+                .join("~")
+                .join("s3%3A")
+                .join("~")
+                .join("bucket")
+                .join("key.json")
         );
         assert_eq!(
-            ref_path_segments("../../etc/passwd"),
-            vec!["__", "__", "etc", "passwd", "latest"]
+            manifest_ref_path(root, "reg.example:5000/ns/model:t"),
+            root.join(MANIFESTS_V2_DIR)
+                .join("reg.example%3A5000/ns/model/t.json")
         );
-        // An empty tag ("repo:") must not vanish: an empty final segment
-        // would collapse into the repo directory itself.
-        assert_eq!(
-            ref_path_segments("docker.io/ai/x:"),
-            vec!["docker.io", "ai", "x", "__"]
+        assert_ne!(path, manifest_ref_path(root, "../../etc/passwd"));
+        assert_ne!(path, manifest_ref_path(root, "S3://bucket/key"));
+        assert_ne!(path, manifest_ref_path(root, "s3://bucket/key:latest"));
+        assert_ne!(
+            manifest_ref_path(root, "reg.example/ns/model:Prod"),
+            manifest_ref_path(root, "reg.example/ns/model:prod")
         );
+        assert_ne!(
+            manifest_ref_path(root, "reg.example/ns/model:t"),
+            manifest_ref_path(root, "reg.example/ns/model/t.json:x")
+        );
+    }
+
+    #[test]
+    fn manifest_ref_paths_match_shared_golden_vectors() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            reference: String,
+            path: String,
+        }
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../tests/fixtures/manifest-ref-paths.json"))
+                .unwrap();
+        for vector in vectors {
+            assert_eq!(
+                manifest_ref_path(Path::new("store"), &vector.reference),
+                Path::new("store").join(vector.path),
+                "{}",
+                vector.reference
+            );
+        }
+    }
+
+    #[test]
+    fn new_store_does_not_create_legacy_tree() {
+        let dir = temp_store_dir("new-v2-only");
+        let store = OciStore::open(&dir).unwrap();
+        assert!(store.root().join(MANIFESTS_V2_DIR).is_dir());
+        assert!(!store.root().join("manifests").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_escaped_tags_stay_within_component_limits() {
+        let root = Path::new("store");
+        let ref_name = format!("reg.example/ns/model:{}", "A".repeat(128));
+        let path = manifest_ref_path(root, &ref_name);
+        for part in path.components() {
+            assert!(part.as_os_str().len() <= 255);
+        }
+        assert!(path.ends_with("~~.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_opaque_key_ignores_unrepresentable_legacy_pointer() {
+        let dir = temp_store_dir("long-opaque-key");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = format!("s3://bucket/{}", "a".repeat(256));
+        fs::create_dir_all(
+            store
+                .legacy_ref_path(&reference)
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        store.tag(desc_with_ref(&reference), &reference).unwrap();
+        assert_eq!(store.find(&reference).unwrap().digest, "sha256:deadbeef");
+        store.remove(&reference).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opaque_reference_and_literal_latest_suffix_remain_distinct() {
+        let dir = temp_store_dir("opaque-latest");
+        let store = OciStore::open(&dir).unwrap();
+        let first = "s3://bucket/key";
+        let second = "s3://bucket/key:latest";
+        let mut first_desc = desc_with_ref(first);
+        first_desc.digest = "sha256:first".into();
+        let mut second_desc = desc_with_ref(second);
+        second_desc.digest = "sha256:second".into();
+        store.tag(first_desc, first).unwrap();
+        store.tag(second_desc, second).unwrap();
+        assert_eq!(store.find(first).unwrap().digest, "sha256:first");
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn distinct_references_never_share_a_manifest_pointer() {
+        let dir = temp_store_dir("distinct-refs");
+        let store = OciStore::open(&dir).unwrap();
+        let first = "reg.example:5000/ns/model:t";
+        let second = "reg.example_5000/ns/model:t";
+        assert!(crate::shortnames::validate_reference(first).is_ok());
+        assert!(crate::shortnames::validate_reference(second).is_ok());
+        assert_eq!(store.legacy_ref_path(first), store.legacy_ref_path(second));
+        assert_ne!(store.ref_path(first), store.ref_path(second));
+        assert_ne!(
+            store.ref_path("docker.io/ai/model:Prod"),
+            store.ref_path("docker.io/ai/model:prod")
+        );
+
+        let mut first_desc = desc_with_ref(first);
+        first_desc.digest = "sha256:first".into();
+        let mut second_desc = desc_with_ref(second);
+        second_desc.digest = "sha256:second".into();
+        store.tag(first_desc, first).unwrap();
+        store.tag(second_desc, second).unwrap();
+        assert_eq!(store.find(first).unwrap().digest, "sha256:first");
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        store.remove(first).unwrap();
+        assert!(store.find(first).is_err());
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_pointer_is_read_and_preserved_without_hiding_a_v2_reference() {
+        let dir = temp_store_dir("legacy-collision");
+        let store = OciStore::open(&dir).unwrap();
+        let first = "reg.example:5000/ns/model:t";
+        let second = "reg.example_5000/ns/model:t";
+        let legacy = store.legacy_ref_path(first);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, serde_json::to_vec(&desc_with_ref(first)).unwrap()).unwrap();
+        assert_eq!(store.find(first).unwrap().digest, "sha256:deadbeef");
+
+        let mut second_desc = desc_with_ref(second);
+        second_desc.digest = "sha256:second".into();
+        store.tag(second_desc, second).unwrap();
+        assert!(
+            legacy.exists(),
+            "the other reference's old pointer must survive"
+        );
+        assert_eq!(store.find(first).unwrap().digest, "sha256:deadbeef");
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        assert_eq!(store.list_refs().len(), 2);
+        assert_eq!(store.list_refs_strict().unwrap().len(), 2);
+
+        let mut updated = desc_with_ref(first);
+        updated.digest = "sha256:updated".into();
+        store.tag(updated, first).unwrap();
+        assert!(legacy.exists(), "the old tree remains a read-only fallback");
+        assert_eq!(store.find(first).unwrap().digest, "sha256:updated");
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        assert_eq!(store.list_refs_strict().unwrap().len(), 3);
+        store.remove(first).unwrap();
+        assert!(store.find(first).is_err());
+        assert!(!legacy.exists());
+        assert_eq!(store.find(second).unwrap().digest, "sha256:second");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_legacy_pointer_does_not_block_tag_or_remove() {
+        let dir = temp_store_dir("malformed-legacy");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "docker.io/ai/model:latest";
+        let legacy = store.legacy_ref_path(reference);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"not JSON").unwrap();
+
+        store.tag(desc_with_ref(reference), reference).unwrap();
+        assert!(store.ref_path(reference).is_file());
+        assert_eq!(fs::read(&legacy).unwrap(), b"not JSON");
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert_eq!(fs::read(&legacy).unwrap(), b"not JSON");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_directory_does_not_block_writing_or_removing() {
+        let dir = temp_store_dir("legacy-directory");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "docker.io/ai/model:latest";
+        let legacy = store.legacy_ref_path(reference);
+        fs::create_dir_all(&legacy).unwrap();
+        let nested = legacy.join("another-tag");
+        fs::write(&nested, b"another model's pointer").unwrap();
+
+        store.tag(desc_with_ref(reference), reference).unwrap();
+        assert!(store.ref_path(reference).exists());
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert!(legacy.is_dir());
+        assert!(nested.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_ancestor_file_does_not_block_tag_or_remove() {
+        let dir = temp_store_dir("legacy-ancestor-file");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "reg.example/ns/model/sub:t";
+        let ancestor = store.legacy_ref_path("reg.example/ns/model:sub");
+        fs::create_dir_all(ancestor.parent().unwrap()).unwrap();
+        fs::write(&ancestor, b"another pointer").unwrap();
+
+        store.tag(desc_with_ref(reference), reference).unwrap();
+        assert!(store.ref_path(reference).is_file());
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!store.ref_path(reference).exists());
+        assert_eq!(fs::read(&ancestor).unwrap(), b"another pointer");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Core regression test for this change: two different references
@@ -1577,6 +1979,40 @@ mod tests {
 
         let err = store.find("docker.io/ai/broken:latest").unwrap_err();
         assert!(!err.to_string().contains("not found"), "got: {err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `rm` is the way out of a corrupt pointer: the current path names
+    /// exactly one reference, so an unparsable file there is its own.
+    #[test]
+    fn corrupt_current_pointer_can_be_removed() {
+        let dir = temp_store_dir("corrupt-remove");
+        let store = OciStore::open(&dir).unwrap();
+        let reference = "docker.io/ai/broken:latest";
+        let path = store.ref_path(reference);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+
+        assert_eq!(store.remove(reference).unwrap(), reference);
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Another reference's old pointer can make this reference's legacy
+    /// path a directory; that is absence, not a broken store.
+    #[test]
+    fn find_ignores_a_legacy_directory_of_another_reference() {
+        let dir = temp_store_dir("find-legacy-dir");
+        let store = OciStore::open(&dir).unwrap();
+        let nested = "reg.example/ns/model/sub:t";
+        let legacy = store.legacy_ref_path(nested);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_vec(&desc_with_ref(nested)).unwrap()).unwrap();
+
+        let err = store.find("reg.example/ns/model:sub").unwrap_err();
+        assert!(err.downcast_ref::<NotFound>().is_some(), "got: {err}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
