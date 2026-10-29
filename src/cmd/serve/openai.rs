@@ -397,38 +397,50 @@ fn apply_reasoning_effort(req: &mut serde_json::Value) {
     }
 }
 
-/// The levels [`apply_effort_budget`] bounds, and the token limit's
+/// The levels [`effort_budget_tokens`] bounds, and the token limit's
 /// divisor for each.
 const EFFORT_BUDGET_SHARES: [(&str, u64); 2] = [("minimal", 8), ("low", 4)];
 
 /// What llama-server writes to end thinking when the budget runs out.
 /// Without it, a small model cut off mid-thought keeps reasoning in its
 /// answer.
-const EFFORT_BUDGET_MESSAGE: &str = "Okay, I have to answer now.";
+pub(super) const EFFORT_BUDGET_MESSAGE: &str = "Okay, I have to answer now.";
 
-/// Gives a `minimal` or `low` `reasoning_effort` a thinking budget, for a
-/// template where the level alone leaves thinking unbounded: a share of
-/// the token limit ([`EFFORT_BUDGET_SHARES`]), at least 1 (0 makes a small
-/// model reason in its answer), at most the level's [`THINKING_BUDGETS`].
-/// A caller's budget, or thinking switched off, is left alone; `message`
-/// adds [`EFFORT_BUDGET_MESSAGE`] unless the caller sent one.
+/// The thinking budget for a `minimal` or `low` level: a share of the
+/// token `limit` ([`EFFORT_BUDGET_SHARES`]), at least 1 (0 makes a small
+/// model reason in its answer), at most the level's [`THINKING_BUDGETS`],
+/// which is also the budget without a limit. `None` for any other level.
 ///
 /// [`THINKING_BUDGETS`]: super::anthropic::THINKING_BUDGETS
+pub(super) fn effort_budget_tokens(effort: &str, limit: Option<u64>) -> Option<u64> {
+    let effort = effort.trim();
+    let &(_, share) = EFFORT_BUDGET_SHARES.iter().find(|(l, _)| *l == effort)?;
+    let &(_, cap) = super::anthropic::THINKING_BUDGETS
+        .iter()
+        .find(|(l, _)| *l == effort)?;
+    let cap = u64::from(cap);
+    Some(limit.map_or(cap, |limit| (limit / share).clamp(1, cap)))
+}
+
+/// `Some` when the model behind `target` takes [`effort_budget_tokens`]
+/// (`RunningModel::effort_budget`), holding whether
+/// [`EFFORT_BUDGET_MESSAGE`] goes with it.
+pub(super) async fn effort_budget_for(state: &AppState, target: &Target) -> Option<bool> {
+    local_model(state, target, |m| {
+        m.effort_budget.then_some(m.effort_budget_message)
+    })
+    .await
+    .flatten()
+}
+
+/// [`effort_budget_tokens`] for a `/v1/chat/completions` request. A
+/// caller's budget, or thinking switched off, is left alone; `message`
+/// adds [`EFFORT_BUDGET_MESSAGE`] unless the caller sent one.
 fn apply_effort_budget(req: &mut serde_json::Value, message: bool) {
     let Some(o) = req.as_object_mut() else {
         return;
     };
     let Some(effort) = o.get("reasoning_effort").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let effort = effort.trim();
-    let Some(&(_, share)) = EFFORT_BUDGET_SHARES.iter().find(|(l, _)| *l == effort) else {
-        return;
-    };
-    let Some(&(_, cap)) = super::anthropic::THINKING_BUDGETS
-        .iter()
-        .find(|(l, _)| *l == effort)
-    else {
         return;
     };
     let thinking_off = o
@@ -448,8 +460,9 @@ fn apply_effort_budget(req: &mut serde_json::Value, message: bool) {
         .and_then(|v| v.as_f64())
         .filter(|n| *n >= 1.0)
         .map(|n| n as u64);
-    let cap = u64::from(cap);
-    let budget = limit.map_or(cap, |limit| (limit / share).clamp(1, cap));
+    let Some(budget) = effort_budget_tokens(effort, limit) else {
+        return;
+    };
     o.insert("reasoning_budget_tokens".into(), budget.into());
     if send_message {
         o.insert(
@@ -618,10 +631,7 @@ async fn proxy_openai_generation_to(
             if llama_path == CHAT_COMPLETIONS_ROUTE {
                 apply_reasoning_effort(&mut req);
                 if req.get("reasoning_effort").is_some() {
-                    let budget = local_model(state, &target, |m| {
-                        m.effort_budget.then_some(m.effort_budget_message)
-                    });
-                    if let Some(message) = budget.await.flatten() {
+                    if let Some(message) = effort_budget_for(state, &target).await {
                         apply_effort_budget(&mut req, message);
                     }
                 }

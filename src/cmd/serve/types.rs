@@ -626,6 +626,12 @@ pub(super) struct OAIChatRequest {
     /// on Ollama's `done` chunk come from the usage chunk it buys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) stream_options: Option<serde_json::Value>,
+    // llama-server's thinking budget and its closing message; see
+    // `openai::effort_budget_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_budget_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_budget_message: Option<&'static str>,
 }
 
 /// Ollama's actual default for `repeat_penalty`: `DefaultOptions()` in
