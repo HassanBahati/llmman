@@ -350,31 +350,29 @@ export class ApiClient {
     const outer = opts.signal ?? init.signal;
     if (outer?.aborted) throw abortError();
 
-    let signal = outer;
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    if (opts.timeoutMs && opts.timeoutMs > 0) {
-      const controller = new AbortController();
-      outer?.addEventListener("abort", () => controller.abort(), { once: true });
-      timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, opts.timeoutMs);
-      signal = controller.signal;
-    }
-
+    const timeoutMs = opts.timeoutMs ?? 0;
+    const relay = timeoutMs > 0 ? relayAbort(outer) : undefined;
+    const timeout = relay ? expireAfter(timeoutMs, relay.controller, () => this.timeoutError()) : undefined;
     try {
       // Called unbound: on the web expo/fetch is the browser's fetch, which
       // throws "Illegal invocation" when called as a method of the client.
       const fetchImpl = this.fetchImpl;
-      return await fetchImpl(this.urlFor(path), { ...init, headers, signal });
+      const response = fetchImpl(this.urlFor(path), {
+        ...init,
+        headers,
+        signal: relay?.controller.signal ?? outer,
+      });
+      return await (timeout ? Promise.race([response, timeout.expired]) : response);
     } catch (e) {
-      if (timedOut) throw this.timeoutError();
+      // On success the relay stays, so the caller's abort can still stop the body.
+      relay?.release();
+      // Only the timeout throws an ApiError here.
+      if (e instanceof ApiError) throw e;
       if (outer?.aborted || isAbort(e)) throw abortError();
       const detail = e instanceof Error && e.message ? `: ${e.message}` : "";
       throw new ApiError(`could not reach ${this.url}${detail}`, 0, "network");
     } finally {
-      if (timer) clearTimeout(timer);
+      timeout?.clear();
     }
   }
 
@@ -384,24 +382,15 @@ export class ApiClient {
 
   async getJson<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     if (!opts.timeoutMs) return readJson<T>(await this.request(path, {}, opts));
-    const requestController = new AbortController();
-    const onCallerAbort = () => requestController.abort();
-    if (opts.signal?.aborted) requestController.abort();
-    opts.signal?.addEventListener("abort", onCallerAbort, { once: true });
-    let bodyTimeout: ReturnType<typeof setTimeout> | undefined;
+    const relay = relayAbort(opts.signal);
+    let timeout: ReturnType<typeof expireAfter> | undefined;
     try {
-      const r = await this.request(path, {}, { ...opts, signal: requestController.signal });
-      // Rejects on its own: Expo's native text() ignores the abort until the body completes.
-      const timeout = new Promise<never>((_, reject) => {
-        bodyTimeout = setTimeout(() => {
-          requestController.abort();
-          reject(this.timeoutError());
-        }, opts.timeoutMs);
-      });
-      return await Promise.race([readJson<T>(r), timeout]);
+      const r = await this.request(path, {}, { ...opts, signal: relay.controller.signal });
+      timeout = expireAfter(opts.timeoutMs, relay.controller, () => this.timeoutError());
+      return await Promise.race([readJson<T>(r), timeout.expired]);
     } finally {
-      clearTimeout(bodyTimeout);
-      opts.signal?.removeEventListener("abort", onCallerAbort);
+      timeout?.clear();
+      relay.release();
     }
   }
 
@@ -598,6 +587,31 @@ interface ChatChunk {
     delta?: { content?: string; reasoning_content?: string; reasoning?: string; thinking?: string };
     finish_reason?: string | null;
   }[];
+}
+
+/** An AbortController that follows `outer`; `release()` stops following it. */
+function relayAbort(outer: AbortSignal | undefined) {
+  const controller = new AbortController();
+  const onOuterAbort = () => controller.abort();
+  if (outer?.aborted) controller.abort();
+  outer?.addEventListener("abort", onOuterAbort, { once: true });
+  return { controller, release: () => outer?.removeEventListener("abort", onOuterAbort) };
+}
+
+/**
+ * After `ms`, rejects `expired` with `error()` and aborts `controller`. It
+ * rejects on its own: Expo's native fetch body ignores an abort until it completes.
+ */
+function expireAfter(ms: number, controller: AbortController, error: () => Error) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      // Rejecting first wins the race over whatever the abort rejects.
+      reject(error());
+      controller.abort();
+    }, ms);
+  });
+  return { expired, clear: () => clearTimeout(timer) };
 }
 
 async function readJson<T>(r: ResponseLike): Promise<T> {

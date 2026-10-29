@@ -120,6 +120,29 @@ describe("ApiClient.request", () => {
     expect(err.kind).toBe("timeout");
   });
 
+  it("times out a request whose fetch ignores the abort", async () => {
+    const fetch = () => new Promise<never>(() => {});
+    const p = new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+  });
+
+  it("with a timeout, request() removes its listener from the caller's signal when the request fails", async () => {
+    const controller = new AbortController();
+    const addSpy = jest.spyOn(controller.signal, "addEventListener");
+    const removeSpy = jest.spyOn(controller.signal, "removeEventListener");
+    const fetch = () => Promise.reject(new TypeError("Network request failed"));
+    await new ApiClient({ url: URL }, fetch)
+      .request("api/version", {}, { signal: controller.signal, timeoutMs: 1000 })
+      .catch(() => {});
+    const addedListeners = addSpy.mock.calls.map(([, listener]) => listener);
+    expect(addedListeners.length).toBeGreaterThan(0);
+    for (const listener of addedListeners) {
+      expect(removeSpy).toHaveBeenCalledWith("abort", listener);
+    }
+  });
+
   it("times out a body that never finishes", async () => {
     // The headers arrive; the body never settles, not even on abort (as Expo's native text()).
     const fetch = async () => ({ ...response(""), text: () => new Promise<string>(() => {}) });
@@ -127,6 +150,26 @@ describe("ApiClient.request", () => {
     const err = await Promise.race([p, new Promise((r) => setTimeout(() => r("still waiting"), 500))]);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).kind).toBe("timeout");
+  });
+
+  it("times out a body that stalls until aborted, as on the web", async () => {
+    // The headers arrive; the body rejects only when the request is aborted.
+    let fetchSignal: AbortSignal | undefined;
+    const fetch = async (_url: string, init?: { signal?: AbortSignal }) => {
+      fetchSignal = init?.signal;
+      return {
+        ...response(""),
+        text: () =>
+          new Promise<string>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new TypeError("aborted")));
+          }),
+      };
+    };
+    const err = await new ApiClient({ url: URL }, fetch).version({ timeoutMs: 20 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).kind).toBe("timeout");
+    // The abort reaches fetch, so the stalled connection is closed, not just abandoned.
+    expect(fetchSignal?.aborted).toBe(true);
   });
 
   it("does not count the key prompt against the timeout", async () => {
