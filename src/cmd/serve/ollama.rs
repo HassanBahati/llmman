@@ -1283,16 +1283,7 @@ async fn ollama_chat_to(
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
-    // Unlike `apply_effort_budget`, nothing to leave alone: Ollama has no
-    // budget fields, and a level always turns thinking on.
-    if let Some(effort) = req.think.as_ref().and_then(|t| t.as_str()) {
-        if let Some(message) = effort_budget_for(state, &target).await {
-            oai.reasoning_budget_tokens =
-                effort_budget_tokens(effort, oai.max_tokens.map(u64::from));
-            oai.reasoning_budget_message =
-                (message && oai.reasoning_budget_tokens.is_some()).then_some(EFFORT_BUDGET_MESSAGE);
-        }
-    }
+    apply_think_budget(state, &target, &req.think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),
@@ -1317,6 +1308,27 @@ async fn ollama_chat_to(
         },
     )
     .await
+}
+
+/// Gives a `think` level the thinking budget `/v1/chat/completions` gives
+/// `reasoning_effort` (see `openai::effort_budget_tokens`), sized from
+/// `num_predict`. Unlike `apply_effort_budget`, nothing to leave alone:
+/// Ollama has no budget fields, and a level always turns thinking on.
+async fn apply_think_budget(
+    state: &AppState,
+    target: &Target,
+    think: &Option<serde_json::Value>,
+    oai: &mut OAIChatRequest,
+) {
+    let Some(effort) = think.as_ref().and_then(|t| t.as_str()) else {
+        return;
+    };
+    let Some(message) = effort_budget_for(state, target).await else {
+        return;
+    };
+    oai.reasoning_budget_tokens = effort_budget_tokens(effort, oai.max_tokens.map(u64::from));
+    oai.reasoning_budget_message =
+        (message && oai.reasoning_budget_tokens.is_some()).then_some(EFFORT_BUDGET_MESSAGE);
 }
 
 /// Ollama's `options` under their OpenAI (or llama-server) names. The
@@ -1478,7 +1490,7 @@ async fn ollama_generate_to(
         .into_iter()
         .chain(std::iter::once(ollama_message_to_oai(&user)))
         .collect();
-    let oai = OAIChatRequest {
+    let mut oai = OAIChatRequest {
         model: wire_model,
         messages,
         stream: true,
@@ -1487,6 +1499,7 @@ async fn ollama_generate_to(
         response_format: format_to_response_format(&req.format),
         ..options_to_oai(&req.options)
     };
+    apply_think_budget(state, &target, &req.think, &mut oai).await;
     stream_ollama(
         req.stream,
         state.0.client.clone(),

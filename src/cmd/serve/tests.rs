@@ -6665,16 +6665,7 @@ async fn low_effort_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
     assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
     assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
 
-    let key = running_key(&state, "qwen3:0.6b");
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .get_mut(&key)
-        .unwrap()
-        .effort_budget = true;
+    change_loaded(&state, "qwen3:0.6b", |m| m.effort_budget = true).await;
     send().await;
     let sent = last();
     assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
@@ -6688,84 +6679,79 @@ async fn low_effort_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
     );
 
     // Set at load when LLMMAN_LLAMA_ARGS has --reasoning-budget-message.
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .get_mut(&key)
-        .unwrap()
-        .effort_budget_message = false;
+    change_loaded(&state, "qwen3:0.6b", |m| m.effort_budget_message = false).await;
     send().await;
     let sent = last();
     assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
     assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
 }
 
-/// `/api/chat`'s `think: "low"` gets the budget `/v1/chat/completions`
-/// gives `low`, sized from `num_predict`; `think: true` names no level.
+async fn change_loaded(state: &AppState, model: &str, change: impl FnOnce(&mut RunningModel)) {
+    let key = running_key(state, model);
+    change(state.0.manager.lock().await.running.get_mut(&key).unwrap());
+}
+
+/// `/api/chat` and `/api/generate` give a `think` level the budget
+/// `/v1/chat/completions` gives `reasoning_effort`, sized from
+/// `num_predict`; `think: true` names no level.
 #[tokio::test(flavor = "multi_thread")]
-async fn ollama_think_low_gets_a_thinking_budget_only_on_a_model_flagged_for_one() {
-    let standin = RoleStandin::new(None);
-    let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
-    let send = |think: serde_json::Value| {
-        post_with(
-            &base,
-            "/api/chat",
-            serde_json::json!({
+async fn ollama_think_levels_get_a_thinking_budget_only_on_a_model_flagged_for_one() {
+    for (route, input) in [("/api/chat", "messages"), ("/api/generate", "prompt")] {
+        let standin = RoleStandin::new(None);
+        let (base, state) = serve_over_state("qwen3:0.6b", standin.router.clone(), false).await;
+        let send = |think: serde_json::Value| {
+            let mut body = serde_json::json!({
                 "model": "qwen3:0.6b",
-                "messages": [{ "role": "user", "content": "hi" }],
                 "stream": false,
                 "think": think,
                 "options": { "num_predict": 120 },
-            }),
-            serde_json::json!({}),
-        )
-    };
-    let last = || standin.seen.lock().unwrap().last().unwrap().clone();
+            });
+            body[input] = if input == "messages" {
+                serde_json::json!([{ "role": "user", "content": "hi" }])
+            } else {
+                serde_json::json!("hi")
+            };
+            post_with(&base, route, body, serde_json::json!({}))
+        };
+        let last = || standin.seen.lock().unwrap().last().unwrap().clone();
 
-    send(serde_json::json!("low")).await;
-    let sent = last();
-    assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
+        send(serde_json::json!("low")).await;
+        let sent = last();
+        assert!(
+            sent.get("reasoning_budget_tokens").is_none(),
+            "{route}: {sent}"
+        );
 
-    let key = running_key(&state, "qwen3:0.6b");
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .get_mut(&key)
-        .unwrap()
-        .effort_budget = true;
-    send(serde_json::json!("low")).await;
-    let sent = last();
-    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
-    assert_eq!(sent["reasoning_budget_message"], EFFORT_BUDGET_MESSAGE);
-    assert_eq!(
-        sent["chat_template_kwargs"],
-        serde_json::json!({ "enable_thinking": true, "reasoning_effort": "low" })
-    );
+        change_loaded(&state, "qwen3:0.6b", |m| m.effort_budget = true).await;
+        send(serde_json::json!("low")).await;
+        let sent = last();
+        assert_eq!(sent["reasoning_budget_tokens"], 30, "{route}: {sent}");
+        assert_eq!(sent["reasoning_budget_message"], EFFORT_BUDGET_MESSAGE);
+        assert_eq!(
+            sent["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": true, "reasoning_effort": "low" })
+        );
 
-    send(serde_json::json!(true)).await;
-    let sent = last();
-    assert!(sent.get("reasoning_budget_tokens").is_none(), "{sent}");
+        send(serde_json::json!("minimal")).await;
+        assert_eq!(last()["reasoning_budget_tokens"], 15, "{route}");
 
-    // Set at load when LLMMAN_LLAMA_ARGS has --reasoning-budget-message.
-    state
-        .0
-        .manager
-        .lock()
-        .await
-        .running
-        .get_mut(&key)
-        .unwrap()
-        .effort_budget_message = false;
-    send(serde_json::json!("low")).await;
-    let sent = last();
-    assert_eq!(sent["reasoning_budget_tokens"], 30, "{sent}");
-    assert!(sent.get("reasoning_budget_message").is_none(), "{sent}");
+        send(serde_json::json!(true)).await;
+        let sent = last();
+        assert!(
+            sent.get("reasoning_budget_tokens").is_none(),
+            "{route}: {sent}"
+        );
+
+        // Set at load when LLMMAN_LLAMA_ARGS has --reasoning-budget-message.
+        change_loaded(&state, "qwen3:0.6b", |m| m.effort_budget_message = false).await;
+        send(serde_json::json!("low")).await;
+        let sent = last();
+        assert_eq!(sent["reasoning_budget_tokens"], 30, "{route}: {sent}");
+        assert!(
+            sent.get("reasoning_budget_message").is_none(),
+            "{route}: {sent}"
+        );
+    }
 }
 
 const ALTERNATION_REFUSAL: &str = "Unable to generate parser for this template. Automatic parser \
