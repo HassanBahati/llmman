@@ -1975,24 +1975,46 @@ fn docker_agent_retries_only_its_own_degenerate_loop_guard() {
     assert!(!docker_agent_stopped_a_degenerate_loop(""));
 }
 
-/// Whether the model's *reply* was "pong", ignoring the reasoning
-/// docker-agent prints above it.
-///
-/// A thinking model reasons about the prompt, so the word appears in its
-/// reasoning whether or not it ever answers — `stdout.contains("pong")`
-/// passes on a run that produced no reply. The reply is the last
-/// non-empty line.
+/// Whether the model's *reply* was "pong", not just reasoning that
+/// mentions it. docker-agent streams reasoning and reply with no
+/// separator, so a reply is the last line alone or glued onto the end of
+/// the reasoning's last sentence (`...no extra text.pong`).
 fn docker_agent_reply_is_pong(stdout: &str) -> bool {
-    stdout
-        .lines()
-        .map(str::trim)
-        .rev()
-        .find(|line| !line.is_empty())
-        .is_some_and(|reply| {
-            reply
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .eq_ignore_ascii_case("pong")
-        })
+    let Some(last) = stdout.lines().map(str::trim).rev().find(|l| !l.is_empty()) else {
+        return false;
+    };
+    let alone = last.trim_matches(|c: char| !c.is_alphanumeric());
+    let tail = last.len().saturating_sub("pong".len());
+    alone.eq_ignore_ascii_case("pong")
+        || (last
+            .get(tail..)
+            .is_some_and(|t| t.eq_ignore_ascii_case("pong"))
+            && last[..tail].ends_with(['.', '!', '?']))
+}
+
+#[test]
+fn docker_agent_reply_is_pong_tells_a_reply_from_reasoning() {
+    for reply in [
+        "pong\n",
+        "Pong.\n",
+        "Thinking.\n\npong\n",
+        "I just need to output \"pong\".pong\n",
+        "no extra text or punctuation.pong",
+    ] {
+        assert!(docker_agent_reply_is_pong(reply), "{reply:?}");
+    }
+    for reasoning in [
+        "",
+        "po",
+        "The word is pong.\n",
+        "They said \"say the word: pong\"\n",
+        "I should say pong",
+        "I should say \"pong\"",
+        "I should avoid saying pingpong",
+        "I should say &#39;pong",
+    ] {
+        assert!(!docker_agent_reply_is_pong(reasoning), "{reasoning:?}");
+    }
 }
 
 /// Checks what `launch_docker_agent` promises: it writes its own agent
