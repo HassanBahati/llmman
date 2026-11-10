@@ -9,7 +9,9 @@ use std::ptr;
 use anyhow::{bail, Result};
 
 use super::super::backend::{Backend, Graph};
-use super::super::ffi::{self, Api, LlamaContextParams, LlamaModel, LlamaModelParams, Tensor};
+use super::super::ffi::{
+    self, Api, LlamaContextParams, LlamaModel, LlamaModelParams, Tensor, TensorPtr,
+};
 use super::{attention, feed_forward, rms, rope_tables, AttnWeights, Model, Rope, TextCond};
 
 /// The LTX-2 system prompt for prompt enhancement (Lightricks, Apache-2.0):
@@ -53,7 +55,7 @@ pub struct TextEncoder {
 
 unsafe impl Send for TextEncoder {}
 
-unsafe extern "C" fn cb_eval(t: Tensor, ask: bool, user_data: *mut c_void) -> bool {
+unsafe extern "C" fn cb_eval(t: TensorPtr, ask: bool, user_data: *mut c_void) -> bool {
     let enc = &*(user_data as *const TextEncoder);
     if enc.capture.is_null() {
         return false;
@@ -435,19 +437,19 @@ fn clean_response(s: &str) -> String {
     s[start..].trim_end().to_string()
 }
 
-fn connector(
-    g: &Graph,
-    model: &Model,
+fn connector<'g>(
+    g: &'g Graph<'g>,
+    model: &'g Model,
     prefix: &str,
-    mut x: Tensor,
-    reg_idx: Option<Tensor>,
-    rope: Rope,
+    mut x: Tensor<'g>,
+    reg_idx: Option<Tensor<'g>>,
+    rope: Rope<'g>,
     n_heads: i64,
     flash: bool,
-) -> Result<Tensor> {
+) -> Result<Tensor<'g>> {
     let hp = &model.hp;
     let w = &model.dit;
-    let ctx = &g.ctx;
+    let ctx = &g;
     if let Some(idx) = reg_idx {
         // learnable registers fill the padded tail
         let regs = ctx.get_rows(w.get(&format!("{prefix}.learnable_registers"))?, idx);
@@ -480,7 +482,7 @@ pub fn build_text_cond(
     if n_tokens > n_tot {
         bail!("{n_tokens} tokens exceed the maximum of {n_tot}");
     }
-    let mut g = Graph::new(be.api, 4096)?;
+    let g = Graph::new(be.api, 4096)?;
     let inp = g.input_f32(&[n_hidden * n_states, n_tokens], packed, "text_hidden");
     let reg_idx: Vec<i32> = (n_tokens..n_tot)
         .map(|p| (p % hp.connector_regs) as i32)
@@ -500,7 +502,7 @@ pub fn build_text_cond(
         cos: g.input_f32(&[hp.a_dim / 2, n_tot], &ac, "a_cos"),
         sin: g.input_f32(&[hp.a_dim / 2, n_tot], &as_, "a_sin"),
     };
-    let ctx = &g.ctx;
+    let ctx = &g;
     let v_in = ctx.scale(inp, (hp.v_dim as f32 / hp.text_hidden_size as f32).sqrt());
     let a_in = ctx.scale(inp, (hp.a_dim as f32 / hp.text_hidden_size as f32).sqrt());
     let v = ctx.linear(

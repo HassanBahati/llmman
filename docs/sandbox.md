@@ -1,11 +1,13 @@
 # Sandboxed launches
 
-`llmman launch --sandbox <sandbox>` runs the integration inside a sandbox
-instead of directly on your machine. The model setup is the same with or
-without it: `--model`, `--provider` and `--overflow-*` work as usual, and
-the integration still talks to `llmman serve`.
+`llmman launch <integration> --sandbox [sandbox]` runs the integration inside
+a sandbox instead of directly on your machine. Without a name it is `sbx`. For
+every sandbox but `sbx`, the model setup is the same with or without it:
+`--model`, `--provider` and `--overflow-*` work as usual, and the integration
+still talks to `llmman serve`. `sbx` serves the model itself, see below.
 
 ```sh
+llmman launch claude --model qwen3.8 --sandbox
 llmman launch claude --model qwen3.8 --sandbox docker
 llmman launch opencode --provider openrouter --model qwen/qwen3-coder --sandbox podman
 llmman launch codex --model qwen3.8 --sandbox microsandbox -- exec "Explain this repository"
@@ -22,6 +24,10 @@ llmman launch codex --model qwen3.8 --sandbox microsandbox -- exec "Explain this
 | `openshell` | The same, in an NVIDIA OpenShell sandbox, with the workspace uploaded | Wherever the OpenShell gateway runs |
 
 Windows is not supported except through `sbx`.
+
+`--optimizer tk` is refused with every sandbox: its hook runs this
+machine's `llmman`, which a sandbox does not have. See
+[optimizers.md](optimizers.md).
 
 ## What the integration can reach
 
@@ -141,6 +147,10 @@ Mac restarts. Run the command again after a restart.
   change the labels of your own files.
 - **microsandbox** mounts with `host-perms=mirror`, so files the
   integration creates get their real permissions on the host.
+- **openshell** creates the sandbox with OpenShell's default filesystem
+  policy plus a writable `/home/agent`, since the default hides the
+  integration in the image's home. Names are `llm-<time>-<pid>`: the Docker
+  driver rejects more than 19 characters.
 - **openshell** can only pass the integration's environment on its
   command line (`--env`), and it stores that environment with the sandbox.
   So it refuses any launch that would hand the integration a real key:

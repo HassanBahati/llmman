@@ -5,11 +5,12 @@
 //! Also decodes Qwen-Image 2.1's image specialization (2-D kernels, RGBA).
 //! Activations are `[W, H, C, T]` in ggml order.
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::mediagen::backend::{Backend, Ctx, Graph, Resident};
+use crate::mediagen::backend::{Backend, Graph, Resident};
 use crate::mediagen::ffi::{self, Tensor};
 use crate::mediagen::weights::{read_safetensors_raw, write_safetensors_raw, Weights};
 
@@ -51,7 +52,11 @@ impl Layout {
 /// chunk's graph, swapped between chunks. Unfilled slots read as zeros.
 struct Caches<'b> {
     be: &'b Backend,
-    slots: Vec<Option<CacheSlot>>,
+    /// Behind a `RefCell` so a builder that holds the caches shared can
+    /// still allocate a slot on first use. A slot is set once and never
+    /// dropped or replaced while the caches live, so a handle borrowed
+    /// from the caches stays valid across later allocations.
+    slots: RefCell<Vec<Option<CacheSlot>>>,
     /// Which of the two tensors of each slot the next chunk reads.
     read: usize,
     /// Slots the last chunk left holding data (vs zeros).
@@ -67,35 +72,49 @@ impl<'b> Caches<'b> {
     fn new(be: &'b Backend) -> Caches<'b> {
         Caches {
             be,
-            slots: Vec::new(),
+            slots: RefCell::new(Vec::new()),
             read: 0,
             filled: Vec::new(),
         }
     }
 
     /// The tensor holding `slot`'s frames for the chunk being built, if any.
-    fn get(&self, slot: usize) -> Option<Tensor> {
-        match (self.slots.get(slot), self.filled.get(slot)) {
-            (Some(Some(s)), Some(true)) => Some(s.pair.tensors[self.read]),
+    fn get(&self, slot: usize) -> Option<Tensor<'_>> {
+        let slots = self.slots.borrow();
+        match (slots.get(slot), self.filled.get(slot)) {
+            (Some(Some(s)), Some(true)) => {
+                let ptr = s.pair.tensor(self.read).as_ptr();
+                // SAFETY: the tensor belongs to a `Resident` this struct
+                // owns and never drops or replaces before itself.
+                Some(unsafe { Tensor::from_raw(ptr, self) })
+            }
             _ => None,
         }
     }
 
     /// The tensor the chunk being built writes `slot` into, allocated on first use.
-    fn target(&mut self, slot: usize, ne: [i64; 4]) -> Result<Tensor> {
-        if self.slots.len() <= slot {
-            self.slots.resize_with(slot + 1, || None);
+    fn target(&self, slot: usize, ne: [i64; 4]) -> Result<Tensor<'_>> {
+        let mut slots = self.slots.borrow_mut();
+        if slots.len() <= slot {
+            slots.resize_with(slot + 1, || None);
         }
-        if let Some(s) = &self.slots[slot] {
+        if let Some(s) = &slots[slot] {
             if s.ne != ne {
                 bail!("cache slot {slot}: shape {ne:?} does not match {:?}", s.ne);
             }
         } else {
             let pair = Resident::new(self.be, ffi::ty::F32, &[&ne, &ne])
                 .with_context(|| format!("cache slot {slot} {ne:?}"))?;
-            self.slots[slot] = Some(CacheSlot { pair, ne });
+            slots[slot] = Some(CacheSlot { pair, ne });
         }
-        Ok(self.slots[slot].as_ref().unwrap().pair.tensors[1 - self.read])
+        let ptr = slots[slot]
+            .as_ref()
+            .unwrap()
+            .pair
+            .tensor(1 - self.read)
+            .as_ptr();
+        // SAFETY: as in `get`: the slot's `Resident` lives as long as self.
+        Ok(unsafe { Tensor::from_raw(ptr, self) })
     }
 
     /// After a chunk's graph ran: the written set becomes the one to read.
@@ -106,32 +125,32 @@ impl<'b> Caches<'b> {
 }
 
 struct Build<'a, 'b> {
-    gr: &'a mut Graph,
+    gr: &'a Graph<'a>,
     w: &'a Weights,
     /// Use `ggml_conv_2d_direct` instead of im2col + matmul.
     direct: bool,
-    caches: &'a mut Caches<'b>,
+    caches: &'a Caches<'b>,
     slot: usize,
     /// Per slot: does this chunk leave data (vs zeros) for the next one?
     filled: Vec<bool>,
     first_chunk: bool,
 }
 
-impl Build<'_, '_> {
-    fn g(&self) -> &Ctx {
-        &self.gr.ctx
+impl<'a> Build<'a, '_> {
+    fn g(&self) -> &'a Graph<'a> {
+        self.gr
     }
 
-    fn zeros(&mut self, ne: [i64; 4], name: &str) -> Tensor {
+    fn zeros(&self, ne: [i64; 4], name: &str) -> Tensor<'a> {
         let n = ne.iter().product::<i64>() as usize;
         self.gr.input_f32(&ne, &vec![0f32; n], name)
     }
 
     /// The `[C]` affine weight as F32.
-    fn vec_f32(&self, t: Tensor) -> Tensor {
+    fn vec_f32(&self, t: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let n: i64 = ffi::shape(t).iter().product();
-        let t = if unsafe { (*t).type_ } == ffi::ty::F32 {
+        let n: i64 = t.shape().iter().product();
+        let t = if t.dtype() == ffi::ty::F32 {
             t
         } else {
             g.cast(t, ffi::ty::F32)
@@ -140,7 +159,7 @@ impl Build<'_, '_> {
     }
 
     /// `WanRMS_norm`: normalize over the channels, times gamma.
-    fn norm(&self, x: Tensor, gamma: &str) -> Result<Tensor> {
+    fn norm(&self, x: Tensor<'a>, gamma: &str) -> Result<Tensor<'a>> {
         let gm = self.vec_f32(self.w.get(gamma)?);
         let g = self.g();
         let p = g.cont(g.permute(x, 1, 2, 0, 3)); // [C, W, H, T]
@@ -148,40 +167,48 @@ impl Build<'_, '_> {
         Ok(g.cont(g.permute(p, 2, 0, 1, 3)))
     }
 
-    fn bias(&self, y: Tensor, name: &str) -> Result<Tensor> {
+    fn bias(&self, y: Tensor<'a>, name: &str) -> Result<Tensor<'a>> {
         let g = self.g();
         let b = self.w.get(name)?;
-        let oc = ffi::shape(y)[2];
+        let oc = y.shape()[2];
         Ok(g.add(y, g.reshape_4d(b, 1, 1, oc, 1)))
     }
 
     /// 1x1 conv (shortcuts, quant convs, attention projections): no padding, no cache.
-    fn conv1(&self, prefix: &str, x: Tensor) -> Result<Tensor> {
+    fn conv1(&self, prefix: &str, x: Tensor<'a>) -> Result<Tensor<'a>> {
         let k = self.w.get(&format!("{prefix}.weight"))?;
         let y = self.conv2(k, x, 1, 0);
         self.bias(y, &format!("{prefix}.bias"))
     }
 
     /// 2-D 3x3 conv (`resample.1`) over every frame.
-    fn conv2d(&self, prefix: &str, x: Tensor) -> Result<Tensor> {
+    fn conv2d(&self, prefix: &str, x: Tensor<'a>) -> Result<Tensor<'a>> {
         let k = self.w.get(&format!("{prefix}.weight"))?;
-        let y = self.conv_frames(k, x, 1, ffi::shape(x)[3])?;
+        let y = self.conv_frames(k, x, 1, x.shape()[3])?;
         self.bias(y, &format!("{prefix}.bias"))
     }
 
     /// A 2-D conv: direct when the backend has it, else im2col + matmul.
-    fn conv2(&self, k: Tensor, x: Tensor, s: i32, pad: i32) -> Tensor {
-        match (self.direct, self.g().api.ggml_conv_2d_direct) {
-            (true, Some(f)) => unsafe { f(self.g().raw, k, x, s, s, pad, pad, 1, 1) },
-            _ => self.g().conv_2d(k, x, s, s, pad, pad, 1, 1),
-        }
+    fn conv2(&self, k: Tensor<'a>, x: Tensor<'a>, s: i32, pad: i32) -> Tensor<'a> {
+        let direct = if self.direct {
+            self.g().conv_2d_direct(k, x, s, pad)
+        } else {
+            None
+        };
+        direct.unwrap_or_else(|| self.g().conv_2d(k, x, s, s, pad, pad, 1, 1))
     }
 
     /// `conv_2d` over the first `nframes` frames, batched so im2col stays under budget.
-    fn conv_frames(&self, k: Tensor, x: Tensor, pad: i32, nframes: i64) -> Result<Tensor> {
+    fn conv_frames(
+        &self,
+        k: Tensor<'a>,
+        x: Tensor<'a>,
+        pad: i32,
+        nframes: i64,
+    ) -> Result<Tensor<'a>> {
         let g = self.g();
-        let [w, h, c, _] = ffi::shape(x);
-        let kw = ffi::shape(k)[0];
+        let [w, h, c, _] = x.shape();
+        let kw = k.shape()[0];
         let per_frame = kw * kw * c * w * h * 2;
         if !self.direct && pad > 0 && per_frame > IM2COL_BUDGET {
             return Ok(self.conv_bands(k, x, pad as i64, nframes));
@@ -191,8 +218,8 @@ impl Build<'_, '_> {
         } else {
             (IM2COL_BUDGET / per_frame.max(1)).clamp(1, nframes)
         };
-        let nb = ffi::strides(x);
-        let mut out: Option<Tensor> = None;
+        let nb = x.strides();
+        let mut out: Option<Tensor<'a>> = None;
         let mut f0 = 0;
         while f0 < nframes {
             let nf = group.min(nframes - f0);
@@ -209,15 +236,15 @@ impl Build<'_, '_> {
 
     /// [`Self::conv_frames`] in bands of rows (plus `pad` halo rows) when one
     /// frame's im2col is over budget; same result as one conv.
-    fn conv_bands(&self, k: Tensor, x: Tensor, pad: i64, nframes: i64) -> Tensor {
+    fn conv_bands(&self, k: Tensor<'a>, x: Tensor<'a>, pad: i64, nframes: i64) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, _] = ffi::shape(x);
-        let kw = ffi::shape(k)[0];
+        let [w, h, c, _] = x.shape();
+        let kw = k.shape()[0];
         let rows = (IM2COL_BUDGET / (kw * kw * c * w * 2)).clamp(1, h);
-        let nb = ffi::strides(x);
-        let mut out: Option<Tensor> = None;
+        let nb = x.strides();
+        let mut out: Option<Tensor<'a>> = None;
         for f in 0..nframes {
-            let mut frame: Option<Tensor> = None;
+            let mut frame: Option<Tensor<'a>> = None;
             let mut y0 = 0;
             while y0 < h {
                 let y1 = (y0 + rows).min(h);
@@ -241,32 +268,30 @@ impl Build<'_, '_> {
     }
 
     /// Takes the next cache slot: its frames of shape `ne`, or zeros when unfilled.
-    fn take_cache(&mut self, prefix: &str, ne: [i64; 4]) -> Result<(usize, Tensor)> {
+    fn take_cache(&mut self, prefix: &str, ne: [i64; 4]) -> Result<(usize, Tensor<'a>)> {
         let slot = self.slot;
         self.slot += 1;
-        let t = match self.caches.get(slot) {
-            Some(t) => {
-                if ffi::shape(t) != ne {
-                    bail!(
-                        "{prefix}: cache shape {:?} does not match {ne:?}",
-                        ffi::shape(t)
-                    );
-                }
-                t
-            }
-            None => self.zeros(ne, &format!("zcache{slot}")),
+        let Some(t) = self.caches.get(slot) else {
+            let zeros = self.zeros(ne, &format!("zcache{slot}"));
+            return Ok((slot, zeros));
         };
+        if t.shape() != ne {
+            bail!(
+                "{prefix}: cache shape {:?} does not match {ne:?}",
+                t.shape()
+            );
+        }
         Ok((slot, t))
     }
 
     /// Records `t` (or zeros when `None`) as what `slot` holds for the next chunk:
     /// a copy into the slot's write tensor, part of this chunk's graph.
-    fn keep_cache(&mut self, slot: usize, t: Option<Tensor>) -> Result<()> {
+    fn keep_cache(&mut self, slot: usize, t: Option<Tensor<'a>>) -> Result<()> {
         if self.filled.len() <= slot {
             self.filled.resize(slot + 1, false);
         }
         if let Some(t) = t {
-            let dst = self.caches.target(slot, ffi::shape(t))?;
+            let dst = self.caches.target(slot, t.shape())?;
             self.gr.store(t, dst);
         }
         self.filled[slot] = t.is_some();
@@ -276,27 +301,28 @@ impl Build<'_, '_> {
     /// The chunk's frames with the two before each stacked along the channels:
     /// `[w, h, 3c, n]` where channel block `k` holds frame `t + k - 2` of the stream.
     /// A 3x3x3 causal conv is then one 2-D conv with a `[3, 3, 3c, oc]` kernel.
-    fn stack_taps(&self, xx: Tensor, n: i64) -> Tensor {
+    fn stack_taps(&self, xx: Tensor<'a>, n: i64) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, _] = ffi::shape(xx);
-        let nb = ffi::strides(xx);
+        let [w, h, c, _] = xx.shape();
+        let nb = xx.strides();
         let tap = |k: usize| g.view_4d(xx, w, h, c, n, nb[1], nb[2], nb[3], k * nb[3]);
         g.concat(g.concat(tap(0), tap(1), 2), tap(2), 2)
     }
 
     /// Causal 3x3x3 (or 3x1x1) conv over the chunk with the cached two frames
     /// before it; a 2-D kernel is a plain per-frame conv.
-    fn cconv(&mut self, prefix: &str, x: Tensor, spatial_pad: i32) -> Result<Tensor> {
-        let [w, h, c, n] = ffi::shape(x);
+    fn cconv(&mut self, prefix: &str, x: Tensor<'a>, spatial_pad: i32) -> Result<Tensor<'a>> {
+        let [w, h, c, n] = x.shape();
         let k = self.w.get(&format!("{prefix}.weight"))?;
-        if ffi::shape(k)[2] == c {
+        if k.shape()[2] == c {
             let y = self.conv_frames(k, x, spatial_pad, n)?;
             return self.bias(y, &format!("{prefix}.bias"));
         }
-        let (slot, cache) = self.take_cache(prefix, [w, h, c, 2])?;
         let g = self.g();
+        // The cached handle borrows the caches; the concat consumes it.
+        let (slot, cache) = self.take_cache(prefix, [w, h, c, 2])?;
         let xx = g.concat(cache, x, 3); // [w, h, c, n + 2]
-        let nb = ffi::strides(xx);
+        let nb = xx.strides();
         let keep = g.view_4d(xx, w, h, c, 2, nb[1], nb[2], nb[3], (n as usize) * nb[3]);
         self.keep_cache(slot, Some(keep))?;
         let stacked = self.stack_taps(xx, n);
@@ -305,7 +331,7 @@ impl Build<'_, '_> {
     }
 
     /// `WanResidualBlock`
-    fn resnet(&mut self, prefix: &str, x: Tensor) -> Result<Tensor> {
+    fn resnet(&mut self, prefix: &str, x: Tensor<'a>) -> Result<Tensor<'a>> {
         let short = if self.w.has(&format!("{prefix}.conv_shortcut.weight")) {
             self.conv1(&format!("{prefix}.conv_shortcut"), x)?
         } else {
@@ -319,14 +345,14 @@ impl Build<'_, '_> {
     }
 
     /// `WanAttentionBlock`: single-head spatial attention within each frame.
-    fn attention(&mut self, prefix: &str, x: Tensor) -> Result<Tensor> {
-        let [w, h, c, n] = ffi::shape(x);
+    fn attention(&mut self, prefix: &str, x: Tensor<'a>) -> Result<Tensor<'a>> {
+        let [w, h, c, n] = x.shape();
         let hn = self.norm(x, &format!("{prefix}.norm.gamma"))?;
         let qkv = self.conv1(&format!("{prefix}.to_qkv"), hn)?; // [w, h, 3c, n]
         let g = self.g();
         let hw = w * h;
         let qkv = g.reshape_3d(qkv, hw, 3 * c, n);
-        let nb = ffi::strides(qkv);
+        let nb = qkv.strides();
         let q = g.view_3d(qkv, hw, c, n, nb[1], nb[2], 0);
         let k = g.view_3d(qkv, hw, c, n, nb[1], nb[2], (c as usize) * nb[1]);
         let v = g.view_3d(qkv, hw, c, n, nb[1], nb[2], (2 * c as usize) * nb[1]);
@@ -335,7 +361,7 @@ impl Build<'_, '_> {
         let kc = g.cont(g.permute(k, 1, 0, 2, 3));
         let vc = g.cont(v); // [hw, c, n]
         let scores = g.mul_mat(kc, qc); // [hw_k, hw_q, n]
-        let scores = g.soft_max_ext(scores, std::ptr::null_mut(), 1.0 / (c as f32).sqrt(), 0.0);
+        let scores = g.soft_max_ext(scores, None, 1.0 / (c as f32).sqrt(), 0.0);
         let o = g.mul_mat(vc, scores); // [c, hw_q, n]
         let o = g.cont(g.permute(o, 1, 0, 2, 3)); // [hw, c, n]
         let o = g.reshape_4d(o, w, h, c, n);
@@ -346,10 +372,10 @@ impl Build<'_, '_> {
     /// `WanResample` upsample2d/upsample3d: optional causal time conv that
     /// doubles the frames (never the first latent frame), then nearest 2x
     /// spatial upsampling and a 3x3 conv.
-    fn upsample(&mut self, prefix: &str, x: Tensor, time: bool) -> Result<Tensor> {
+    fn upsample(&mut self, prefix: &str, x: Tensor<'a>, time: bool) -> Result<Tensor<'a>> {
         let mut x = x;
         if time {
-            let [w, h, c, n] = ffi::shape(x);
+            let [w, h, c, n] = x.shape();
             if self.first_chunk {
                 // `Rep`: frame 0 passes through; the next chunk starts from zero padding
                 let slot = self.slot;
@@ -361,7 +387,7 @@ impl Build<'_, '_> {
                 x = self.g().reshape_4d(y, w, h, c, 2 * n);
             }
         }
-        let [w, h, c, n] = ffi::shape(x);
+        let [w, h, c, n] = x.shape();
         let g = self.g();
         let up = g.interpolate(x, 2 * w, 2 * h, c, n, ffi::GGML_SCALE_MODE_NEAREST);
         self.conv2d(&format!("{prefix}.resample.1"), up)
@@ -369,12 +395,12 @@ impl Build<'_, '_> {
 
     /// `DupUp3D` with `factor_t = factor_s = 2`: nearest duplication in t, h and w
     /// (`repeats == factor`), dropping the first frame on the first chunk.
-    fn dup_up_3d(&self, x: Tensor) -> Tensor {
+    fn dup_up_3d(&self, x: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, n] = ffi::shape(x);
+        let [w, h, c, n] = x.shape();
         let up = g.interpolate(x, 2 * w, 2 * h, c, 2 * n, ffi::GGML_SCALE_MODE_NEAREST);
         if self.first_chunk {
-            let nb = ffi::strides(up);
+            let nb = up.strides();
             g.cont(g.view_4d(up, 2 * w, 2 * h, c, 2 * n - 1, nb[1], nb[2], nb[3], nb[3]))
         } else {
             up
@@ -383,9 +409,9 @@ impl Build<'_, '_> {
 
     /// `DupUp3D` with `factor_t = 1, factor_s = 2, repeats = 2`:
     /// `out[oc, 2h + j, 2w + k] = x[2oc + j, h, w]`.
-    fn dup_up_2d(&self, x: Tensor) -> Tensor {
+    fn dup_up_2d(&self, x: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, n] = ffi::shape(x);
+        let [w, h, c, n] = x.shape();
         let up = g.interpolate(x, 2 * w, h, c, n, ffi::GGML_SCALE_MODE_NEAREST);
         // channel = j + 2*oc: split off j and move it under h
         let s = g.reshape_4d(up, 2 * w, h, 2, (c / 2) * n);
@@ -395,8 +421,8 @@ impl Build<'_, '_> {
 
     /// `DupUp3D` (`factor_s = 2`) from `x`'s channels to `out_c`:
     /// `repeats = out_c * factor / in_c` picks the variant.
-    fn dup_up(&self, x: Tensor, time: bool, out_c: i64) -> Result<Tensor> {
-        let c = ffi::shape(x)[2];
+    fn dup_up(&self, x: Tensor<'a>, time: bool, out_c: i64) -> Result<Tensor<'a>> {
+        let c = x.shape()[2];
         let factor = if time { 8 } else { 4 };
         match (time, out_c * factor / c) {
             (true, 8) => Ok(self.dup_up_3d(x)),
@@ -408,20 +434,20 @@ impl Build<'_, '_> {
 
     /// `DupUp3D` with `factor_t = factor_s = 2, repeats = 4` on the first chunk
     /// (its first frame dropped): `out[oc, 2h + j, 2w + k] = x[2oc + 1, h, w]`.
-    fn dup_up_3d_halve(&self, x: Tensor) -> Tensor {
+    fn dup_up_3d_halve(&self, x: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, n] = ffi::shape(x);
+        let [w, h, c, n] = x.shape();
         let s = g.reshape_4d(x, w * h, 2, c / 2, n);
-        let nb = ffi::strides(s);
+        let nb = s.strides();
         let odd = g.cont(g.view_4d(s, w * h, 1, c / 2, n, nb[1], nb[2], nb[3], nb[1]));
         let odd = g.reshape_4d(odd, w, h, c / 2, n);
         g.interpolate(odd, 2 * w, 2 * h, c / 2, n, ffi::GGML_SCALE_MODE_NEAREST)
     }
 
     /// `[W, H, 12, F]` -> `[2W, 2H, 3, F]`: `out[c, 2h + pb, 2w + pa] = x[4c + 2pa + pb]`.
-    fn unpatchify(&self, x: Tensor) -> Result<Tensor> {
+    fn unpatchify(&self, x: Tensor<'a>) -> Result<Tensor<'a>> {
         let g = self.g();
-        let [w, h, c12, f] = ffi::shape(x);
+        let [w, h, c12, f] = x.shape();
         if c12 != 12 {
             bail!("decoder.conv_out has {c12} channels, expected 12");
         }
@@ -435,9 +461,9 @@ impl Build<'_, '_> {
     }
 
     /// `[2W, 2H, 3, F]` -> `[W, H, 12, F]`, the inverse of [`Self::unpatchify`].
-    fn patchify(&self, img: Tensor) -> Tensor {
+    fn patchify(&self, img: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let [w2, h2, c, f] = ffi::shape(img);
+        let [w2, h2, c, f] = img.shape();
         debug_assert_eq!(c, 3);
         let (w, h) = (w2 / 2, h2 / 2);
         let s = g.reshape_4d(img, 2, w, h2, 3 * f); // [pa, w, h', 3f]
@@ -448,15 +474,15 @@ impl Build<'_, '_> {
     }
 
     /// 2x2 average pooling of every frame.
-    fn pool2(&self, x: Tensor) -> Tensor {
+    fn pool2(&self, x: Tensor<'a>) -> Tensor<'a> {
         let g = self.g();
-        let [w, h, c, n] = ffi::shape(x);
+        let [w, h, c, n] = x.shape();
         let s = g.reshape_4d(x, 2, w / 2, h, c * n);
-        let nb = ffi::strides(s);
+        let nb = s.strides();
         let a = g.view_4d(s, 1, w / 2, h, c * n, nb[1], nb[2], nb[3], 0);
         let b = g.view_4d(s, 1, w / 2, h, c * n, nb[1], nb[2], nb[3], nb[0]);
         let s = g.reshape_4d(g.add(a, b), w / 2, 2, h / 2, c * n);
-        let nb = ffi::strides(s);
+        let nb = s.strides();
         let a = g.view_4d(s, w / 2, 1, h / 2, c * n, nb[1], nb[2], nb[3], 0);
         let b = g.view_4d(s, w / 2, 1, h / 2, c * n, nb[1], nb[2], nb[3], nb[1]);
         g.scale(g.reshape_4d(g.add(a, b), w / 2, h / 2, c, n), 0.25)
@@ -465,12 +491,12 @@ impl Build<'_, '_> {
     /// `AvgDown3D` with `factor_s = 2` and `factor_t` 1 or 2: pooled frames, and for
     /// `factor_t = 2` frame pairs `(2t', 2t'+1)` stacked into channels `2c + i` (the
     /// first chunk's single frame is paired with a zero frame in front of it).
-    fn avg_down(&mut self, x: Tensor, time: bool) -> Tensor {
+    fn avg_down(&mut self, x: Tensor<'a>, time: bool) -> Tensor<'a> {
         let p = self.pool2(x);
         if !time {
             return p;
         }
-        let [w, h, c, n] = ffi::shape(p);
+        let [w, h, c, n] = p.shape();
         let (p, n) = if n % 2 == 1 {
             let z = self.zeros([w, h, c, 1], "avgpad");
             (self.g().concat(z, p, 3), n + 1)
@@ -486,24 +512,24 @@ impl Build<'_, '_> {
     /// `WanResample` downsample2d/downsample3d: zero-pad right/bottom by one and a
     /// stride-2 3x3 conv, then (3-D) a stride-2 causal time conv that skips the
     /// first latent frame and halves the rest.
-    fn downsample(&mut self, prefix: &str, x: Tensor, time: bool) -> Result<Tensor> {
+    fn downsample(&mut self, prefix: &str, x: Tensor<'a>, time: bool) -> Result<Tensor<'a>> {
         let g = self.g();
         let padded = g.pad(x, 1, 1, 0, 0);
         let k = self.w.get(&format!("{prefix}.resample.1.weight"))?;
         let y = self.conv2(k, padded, 2, 0);
         let mut x = self.bias(y, &format!("{prefix}.resample.1.bias"))?;
         if time {
-            let [w, h, c, n] = ffi::shape(x);
+            let [w, h, c, n] = x.shape();
             if self.first_chunk {
                 // the first frame passes through and becomes the next chunk's context
                 let slot = self.slot;
                 self.slot += 1;
                 self.keep_cache(slot, Some(x))?;
             } else {
-                let (slot, cache) = self.take_cache(prefix, [w, h, c, 1])?;
                 let g = self.g();
+                let (slot, cache) = self.take_cache(prefix, [w, h, c, 1])?;
                 let xx = g.concat(cache, x, 3); // [w, h, c, n + 1]
-                let nb = ffi::strides(xx);
+                let nb = xx.strides();
                 let last = g.view_4d(xx, w, h, c, 1, nb[1], nb[2], nb[3], (n as usize) * nb[3]);
                 self.keep_cache(slot, Some(last))?;
                 let g = self.g();
@@ -521,7 +547,7 @@ impl Build<'_, '_> {
 
     /// The encoder over one chunk of pixel frames `[W, H, 3, F]` (F = 1, then 4):
     /// the mean of the posterior, `[W/16, H/16, 48, T]`.
-    fn encoder(&mut self, img: Tensor) -> Result<Tensor> {
+    fn encoder(&mut self, img: Tensor<'a>) -> Result<Tensor<'a>> {
         let mut x = self.patchify(img);
         x = self.cconv("encoder.conv_in", x, 1)?;
         for b in 0..4 {
@@ -551,12 +577,12 @@ impl Build<'_, '_> {
         let x = self.cconv("encoder.conv_out", self.g().silu(x), 1)?;
         let x = self.conv1("quant_conv", x)?; // [w, h, 96, t]: mean, then log-variance
         let g = self.g();
-        let [w, h, _, t] = ffi::shape(x);
-        let nb = ffi::strides(x);
+        let [w, h, _, t] = x.shape();
+        let nb = x.strides();
         Ok(g.cont(g.view_4d(x, w, h, 48, t, nb[1], nb[2], nb[3], 0)))
     }
 
-    fn decoder(&mut self, z: Tensor, layout: &Layout) -> Result<Tensor> {
+    fn decoder(&mut self, z: Tensor<'a>, layout: &Layout) -> Result<Tensor<'a>> {
         let mut x = self.conv1("post_quant_conv", z)?;
         x = self.cconv("decoder.conv_in", x, 1)?;
         x = self.resnet("decoder.mid_block.resnets.0", x)?;
@@ -574,7 +600,7 @@ impl Build<'_, '_> {
             if self.w.has(&format!("{p}.upsampler.resample.1.weight")) {
                 let time = layout.temporal_up.get(b).copied().unwrap_or(false);
                 x = self.upsample(&format!("{p}.upsampler"), x, time)?;
-                let short = self.dup_up(x_copy, time, ffi::shape(x)[2])?;
+                let short = self.dup_up(x_copy, time, x.shape()[2])?;
                 x = self.g().add(x, short);
             }
         }
@@ -610,7 +636,7 @@ pub fn decode(
     wd: i64,
     layout: &Layout,
 ) -> Result<Chunk> {
-    let want = ffi::shape(w.get("post_quant_conv.weight")?)[2];
+    let want = w.get("post_quant_conv.weight")?.shape()[2];
     if c != want {
         bail!("expected {want} latent channels, got {c}");
     }
@@ -626,7 +652,7 @@ pub fn decode(
     let direct = direct_conv(be);
     for (i, frame) in z.iter().enumerate() {
         let t_start = std::time::Instant::now();
-        let mut gr = Graph::new(be.api, 16 * 1024)?;
+        let gr = Graph::new(be.api, 16 * 1024)?;
         // torch [C][H][W] -> ggml [W, H, C, 1]
         let mut x = vec![0f32; (wd * h * c) as usize];
         for ci in 0..c as usize {
@@ -639,10 +665,10 @@ pub fn decode(
         }
         let zt = gr.input_f32(&[wd, h, c, 1], &x, "z");
         let mut b = Build {
-            gr: &mut gr,
+            gr: &gr,
             w,
             direct,
-            caches: &mut caches,
+            caches: &caches,
             slot: 0,
             filled: Vec::new(),
             first_chunk: i == 0,
@@ -655,7 +681,7 @@ pub fn decode(
         let t_built = t_start.elapsed();
         gr.compute(be)?;
         let t_computed = t_start.elapsed();
-        let [ow, oh, nc, of] = ffi::shape(rgb);
+        let [ow, oh, nc, of] = rgb.shape();
         let data = gr.output_f32(rgb);
         if out.frames == 0 {
             out.width = ow;
@@ -721,13 +747,13 @@ pub fn encode(
                 }
             }
         }
-        let mut gr = Graph::new(be.api, 16 * 1024)?;
+        let gr = Graph::new(be.api, 16 * 1024)?;
         let img = gr.input_f32(&[wd, h, 3, n as i64], &x, "img");
         let mut b = Build {
-            gr: &mut gr,
+            gr: &gr,
             w,
             direct,
-            caches: &mut caches,
+            caches: &caches,
             slot: 0,
             filled: Vec::new(),
             first_chunk: first,
@@ -737,7 +763,7 @@ pub fn encode(
         let filled = std::mem::take(&mut b.filled);
         drop(b);
         gr.compute(be)?;
-        let [lw, lh, c, lt] = ffi::shape(z);
+        let [lw, lh, c, lt] = z.shape();
         let data = gr.output_f32(z);
         let (lw, lh, c) = (lw as usize, lh as usize, c as usize);
         for t in 0..lt as usize {

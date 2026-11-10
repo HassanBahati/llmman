@@ -12,14 +12,14 @@
 //! second half-step feed-forward and a LayerNorm.
 
 use std::ffi::c_int;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
 
+use super::graph_nodes;
 use super::model::{CanaryModel, EncBlock};
-use crate::mediagen::backend::{Backend, Ctx, Graph};
-use crate::mediagen::ffi::{self, ty, Tensor};
+use crate::mediagen::backend::{Backend, Graph};
+use crate::mediagen::ffi::{ty, Tensor};
 
 /// `nn.BatchNorm1d` default `eps`, the value NeMo's conv module uses.
 const BN_EPS: f32 = 1e-5;
@@ -73,7 +73,7 @@ impl Encoder {
     /// each block's BatchNorm, reading the four `conv.bn.*` vectors back
     /// from the backend.
     pub fn new(model: &CanaryModel, be: &Backend) -> Result<Encoder> {
-        let hp = &model.hp;
+        let hp = model.hp();
         if hp.enc_subsampling_factor != 8 {
             bail!(
                 "encoder: subsampling factor {} (the dw_striding graph is 8x)",
@@ -103,7 +103,7 @@ impl Encoder {
             );
         }
         let bn = model
-            .tensors
+            .tensors()?
             .enc_blocks
             .iter()
             .map(|b| {
@@ -159,9 +159,10 @@ impl Encoder {
         }
         let frames = mel.len() / self.n_mels;
         let t_enc = subsampled_len(frames);
-        let pre = &model.tensors.pre_encode;
+        let tensors = model.tensors()?;
+        let pre = &tensors.pre_encode;
 
-        let mut gr = Graph::new(be.api, graph_nodes(model.tensors.enc_blocks.len()))?;
+        let gr = Graph::new(be.api, graph_nodes(tensors.enc_blocks.len()))?;
         let x = gr.input_f32(&[self.n_mels as i64, frames as i64, 1, 1], mel, "mel");
         let pos = gr.input_f32(
             &[self.d_model as i64, 2 * t_enc as i64 - 1],
@@ -180,8 +181,8 @@ impl Encoder {
                 )
             })
             .collect();
-        let g = &gr.ctx;
-        let bias = |b: Tensor| g.reshape_4d(b, 1, 1, ffi::shape(b)[0], 1);
+        let g = &gr;
+        let bias = |b| g.reshape_4d(b, 1, 1, b.shape()[0], 1);
         let mut cur = g.conv_2d(pre.conv0, x, 2, 2, 1, 1, 1, 1);
         cur = g.relu(g.add(cur, bias(pre.conv0_b)));
         cur = g.conv_2d_dw_direct(pre.conv2, cur, 2, 2, 1, 1, 1, 1);
@@ -194,8 +195,8 @@ impl Encoder {
         cur = g.relu(g.add(cur, bias(pre.conv6_b)));
         // [mel, time, chan] -> [mel, chan, time]
         cur = g.cont(g.permute(cur, 0, 2, 1, 3));
-        let [n_freq, n_chan, n_time, _] = ffi::shape(cur);
-        let in_dim = ffi::shape(pre.out)[0];
+        let [n_freq, n_chan, n_time, _] = cur.shape();
+        let in_dim = pre.out.shape()[0];
         if n_time != t_enc as i64 || n_freq * n_chan != in_dim {
             bail!(
                 "encoder: subsampler produced [{n_freq}, {n_chan}, {n_time}] for {frames} frames, \
@@ -205,9 +206,9 @@ impl Encoder {
         cur = g.reshape_2d(cur, in_dim, n_time);
         let pre_out = g.linear(cur, pre.out, Some(pre.out_b));
 
-        let mut blocks = Vec::with_capacity(model.tensors.enc_blocks.len());
+        let mut blocks = Vec::with_capacity(tensors.enc_blocks.len());
         cur = pre_out;
-        for (b, &(bn_scale, bn_shift)) in model.tensors.enc_blocks.iter().zip(&bn) {
+        for (b, &(bn_scale, bn_shift)) in tensors.enc_blocks.iter().zip(&bn) {
             cur = feed_forward(
                 g,
                 cur,
@@ -261,20 +262,25 @@ impl Encoder {
 
 /// `nn.LayerNorm` over `d_model`: `norm(x) * w + b` on `[d_model, t]`;
 /// the decoder's norms share it.
-pub(super) fn layer_norm(g: &Ctx, x: Tensor, w: Tensor, b: Tensor) -> Tensor {
+pub(super) fn layer_norm<'g>(
+    g: &'g Graph<'g>,
+    x: Tensor<'g>,
+    w: Tensor<'g>,
+    b: Tensor<'g>,
+) -> Tensor<'g> {
     g.add(g.mul(g.norm(x, LN_EPS), w), b)
 }
 
 /// Macaron half-step feed-forward with its residual:
 /// `x + 0.5 * linear2(silu(linear1(norm(x))))`. Each pair is
 /// `[weight, bias]`.
-fn feed_forward(
-    g: &Ctx,
-    x: Tensor,
-    norm: [Tensor; 2],
-    linear1: [Tensor; 2],
-    linear2: [Tensor; 2],
-) -> Tensor {
+fn feed_forward<'g>(
+    g: &'g Graph<'g>,
+    x: Tensor<'g>,
+    norm: [Tensor<'g>; 2],
+    linear1: [Tensor<'g>; 2],
+    linear2: [Tensor<'g>; 2],
+) -> Tensor<'g> {
     let h = layer_norm(g, x, norm[0], norm[1]);
     let h = g.silu(g.linear(h, linear1[0], Some(linear1[1])));
     let h = g.linear(h, linear2[0], Some(linear2[1]));
@@ -295,13 +301,19 @@ fn feed_forward(
 /// `t - 1`, so the zero column is never read and is not built. The
 /// scores are summed, scaled by `1 / sqrt(d_head)` and softmaxed over
 /// the keys; no mask, batch 1 attends to every frame.
-fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Tensor {
-    let [d_model, t, _, _] = ffi::shape(x);
+fn attention<'g>(
+    g: &'g Graph<'g>,
+    b: &EncBlock<'g>,
+    x: Tensor<'g>,
+    pos: Tensor<'g>,
+    n_heads: i64,
+) -> Tensor<'g> {
+    let [d_model, t, _, _] = x.shape();
     let d_head = d_model / n_heads;
-    let n_pos = ffi::shape(pos)[1];
+    let n_pos = pos.shape()[1];
     let h = layer_norm(g, x, b.norm_attn, b.norm_attn_b);
     // [d_head, head, t]
-    let heads = |y: Tensor| g.reshape_3d(y, d_head, n_heads, t);
+    let heads = |y| g.reshape_3d(y, d_head, n_heads, t);
     let q = heads(g.linear(h, b.attn_q, Some(b.attn_q_b)));
     let k = heads(g.linear(h, b.attn_k, Some(b.attn_k_b)));
     let v = heads(g.linear(h, b.attn_v, Some(b.attn_v_b)));
@@ -315,7 +327,7 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
     // [t_k, t_q, head] and [2t - 1, t_q, head]
     let ac = g.prec_f32(g.mul_mat(k, q_u));
     let bd = g.prec_f32(g.mul_mat(p, q_v));
-    let nb = ffi::strides(bd);
+    let nb = bd.strides();
     let shifted = g.view_3d(
         bd,
         t,
@@ -326,7 +338,7 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
         (t - 1) as usize * nb[0],
     );
     let scores = g.add(ac, g.cont(shifted));
-    let probs = g.soft_max_ext(scores, ptr::null_mut(), 1.0 / (d_head as f32).sqrt(), 0.0);
+    let probs = g.soft_max_ext(scores, None, 1.0 / (d_head as f32).sqrt(), 0.0);
     // [t_k, d_head, head] so that probs . v gives [t_q, d_head, head]
     let v = g.cont(g.permute(v, 1, 2, 0, 3));
     let o = g.prec_f32(g.mul_mat(probs, v));
@@ -342,23 +354,29 @@ fn attention(g: &Ctx, b: &EncBlock, x: Tensor, pos: Tensor, n_heads: i64) -> Ten
 /// zero-padded transpose, its bias, the folded BatchNorm `scale` and
 /// `shift`, SiLU and pointwise2. `ggml_ssm_conv` reads an F32 kernel,
 /// so an F16 `conv.depthwise.weight` is cast in the graph.
-fn conv_module(g: &Ctx, b: &EncBlock, x: Tensor, bn_scale: Tensor, bn_shift: Tensor) -> Tensor {
-    let [d_model, t, _, _] = ffi::shape(x);
+fn conv_module<'g>(
+    g: &'g Graph<'g>,
+    b: &EncBlock<'g>,
+    x: Tensor<'g>,
+    bn_scale: Tensor<'g>,
+    bn_shift: Tensor<'g>,
+) -> Tensor<'g> {
+    let [d_model, t, _, _] = x.shape();
     let h = layer_norm(g, x, b.norm_conv, b.norm_conv_b);
-    let [_, pw_in, pw_out, _] = ffi::shape(b.pointwise1);
+    let [_, pw_in, pw_out, _] = b.pointwise1.shape();
     let pw1 = g.reshape_2d(b.pointwise1, pw_in, pw_out);
     // [2 * d_model, t]
     let h = g.linear(h, pw1, Some(b.pointwise1_b));
-    let nb = ffi::strides(h);
+    let nb = h.strides();
     let signal = g.view_2d(h, d_model, t, nb[1], 0);
     let gate = g.view_2d(h, d_model, t, nb[1], d_model as usize * nb[0]);
     let h = g.mul(signal, g.sigmoid(gate));
     // [t, d_model], padded on the time axis for a same-length conv
     let h = g.cont(g.transpose(h));
-    let [k, _, _, _] = ffi::shape(b.depthwise);
+    let [k, _, _, _] = b.depthwise.shape();
     let pad = ((k - 1) / 2) as c_int;
     let h = g.pad_ext(h, pad, pad, 0, 0, 0, 0, 0, 0);
-    let kernel = if ffi::dtype(b.depthwise) == ty::F32 {
+    let kernel = if b.depthwise.dtype() == ty::F32 {
         b.depthwise
     } else {
         g.cast(b.depthwise, ty::F32)
@@ -369,7 +387,7 @@ fn conv_module(g: &Ctx, b: &EncBlock, x: Tensor, bn_scale: Tensor, bn_shift: Ten
     let h = g.add(g.reshape_2d(h, d_model, t), b.depthwise_b);
     let h = g.add(g.mul(h, bn_scale), bn_shift);
     let h = g.silu(h);
-    let [_, pw_in, pw_out, _] = ffi::shape(b.pointwise2);
+    let [_, pw_in, pw_out, _] = b.pointwise2.shape();
     let pw2 = g.reshape_2d(b.pointwise2, pw_in, pw_out);
     g.add(x, g.linear(h, pw2, Some(b.pointwise2_b)))
 }
@@ -393,13 +411,6 @@ pub fn subsampled_len(frames: usize) -> usize {
     (0..3).fold(frames, |len, _| {
         (len + 2).checked_sub(3).map_or(0, |n| n / 2 + 1)
     })
-}
-
-/// Graph nodes the encoder over `n_blocks` blocks needs, with room to
-/// spare; the scheduler of the `Backend` must be sized at least this
-/// large (see `Backend::new`).
-pub fn graph_nodes(n_blocks: usize) -> usize {
-    1024 + n_blocks * 128
 }
 
 /// NeMo `RelPositionalEncoding` table for `t_enc` encoder frames, row

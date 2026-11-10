@@ -127,6 +127,28 @@ pub(super) fn gguf_goes_to_ds4(
         && ds4_serves_gguf(engine, arch, embedding, decision, ds4_on_path)
 }
 
+/// How a [`ModelPath::Gguf`] is served once `ensure_model` has decided
+/// `ds4` and `speech` (see `resolve_target`): ds4 first, since it runs
+/// from PATH under any runtime; then the speech worker; then llama-server.
+/// `container` is whether a container runtime resolved, which the speech
+/// and llama-server arms honour and ds4 ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GgufArm {
+    Ds4,
+    Speech { container: bool },
+    LlamaServer { container: bool },
+}
+
+pub(super) fn gguf_arm(ds4: bool, speech: bool, container: bool) -> GgufArm {
+    if ds4 {
+        GgufArm::Ds4
+    } else if speech {
+        GgufArm::Speech { container }
+    } else {
+        GgufArm::LlamaServer { container }
+    }
+}
+
 /// [`gguf_goes_to_ds4`] for a model already known to be a GGUF.
 pub(super) fn ds4_serves_gguf(
     engine: GgufEngine,
@@ -539,17 +561,43 @@ pub(super) fn vllm_serve_args(
     args
 }
 
-/// [`vllm_serve_args`] plus `LLMMAN_VLLM_ARGS`, `--port` and `--host` (see
-/// [`append_extra_args`]). Shared with `container::spawn_engine`, which
-/// passes its `/models` mount and `0.0.0.0`.
+/// The parsers vllm needs to serve a model family to an agent, by the
+/// `model_type` in `model_dir`'s `config.json` (a host path). Agents send
+/// `tool_choice: "auto"`, which vllm rejects with a 400 without them.
+/// They come before `LLMMAN_VLLM_ARGS`, so a flag set there wins.
+pub(super) fn vllm_family_args(model_dir: &Path) -> Vec<String> {
+    let model_type = std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+    match model_type.as_deref() {
+        Some("qwen3_5" | "qwen3_5_moe") => [
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--reasoning-parser",
+            "qwen3",
+        ]
+        .map(String::from)
+        .to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`vllm_serve_args`], then `family` (see [`vllm_family_args`]), then
+/// `LLMMAN_VLLM_ARGS`, `--port` and `--host` (see [`append_extra_args`]).
+/// Shared with `container::spawn_engine`, which passes its `/models` mount
+/// and `0.0.0.0`.
 pub(super) fn vllm_serve_args_from_env(
     model_dir: &str,
     host: &str,
     port: u16,
     model_name: &str,
     max_model_len: Option<u32>,
+    family: &[String],
 ) -> Vec<String> {
     let mut args = vllm_serve_args(model_dir, model_name, max_model_len);
+    args.extend(family.iter().cloned());
     append_extra_args(&mut args, extra_args_from_env(VLLM_ARGS_VAR), host, port);
     args
 }
@@ -578,6 +626,7 @@ pub(super) async fn spawn_vllm_server(
         port,
         model_name,
         max_model_len,
+        &vllm_family_args(model_dir),
     );
     let mut cmd = grouped_command(&vllm, args);
     crate::debug_log!("spawning {}: {:?}", vllm.display(), cmd);
@@ -959,10 +1008,13 @@ fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
     crate::find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
-/// [`wait_for_ready`]'s default deadline — longer than Ollama's own 5m
-/// default since vllm can take several minutes to load a large model.
-/// Overridable via `LLMMAN_LOAD_TIMEOUT`.
-const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// [`wait_for_ready`]'s default deadline — four times Ollama's own 5m
+/// default, since vllm can take many minutes to load a large model: a
+/// cold start of Qwen 3.8 27B (NVFP4) on a DGX Spark spends about ten
+/// minutes in `torch.compile` and FlashInfer's JIT before it serves, which
+/// the previous 10 minutes did not outlast. Overridable via
+/// `LLMMAN_LOAD_TIMEOUT`.
+const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// `None` = wait forever, from an `LLMMAN_LOAD_TIMEOUT` of 0 or
 /// negative (mirrors Ollama's `OLLAMA_LOAD_TIMEOUT`).
@@ -1194,6 +1246,11 @@ mod tests {
     }
 
     #[test]
+    fn the_default_load_timeout_is_twenty_minutes() {
+        assert_eq!(DEFAULT_LOAD_TIMEOUT, Duration::from_secs(20 * 60));
+    }
+
+    #[test]
     fn parse_load_timeout_treats_zero_or_negative_as_infinite() {
         // Unlike keep_alive (where 0 means "unload immediately"),
         // OLLAMA_LOAD_TIMEOUT documents 0 as meaning "wait forever", same
@@ -1243,6 +1300,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vllm_gets_the_parsers_qwen3_5_needs_before_the_users_args() {
+        let _env = EXTRA_ARGS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let family_of = |config: &str| {
+            std::fs::write(dir.path().join("config.json"), config).unwrap();
+            vllm_family_args(dir.path())
+        };
+        let qwen = family_of(r#"{"model_type": "qwen3_5"}"#);
+        assert_eq!(
+            qwen,
+            [
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_coder",
+                "--reasoning-parser",
+                "qwen3"
+            ]
+        );
+        assert_eq!(family_of(r#"{"model_type": "qwen3_5_moe"}"#), qwen);
+        // Other families, and a model with no readable config, are left alone.
+        assert!(family_of(r#"{"model_type": "llama"}"#).is_empty());
+        assert!(family_of("not json").is_empty());
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        assert!(vllm_family_args(dir.path()).is_empty());
+
+        // After the model and before whatever LLMMAN_VLLM_ARGS holds, which
+        // vllm lets win by keeping each flag's last value.
+        let args = vllm_serve_args_from_env("/m", "0.0.0.0", 8000, "m", None, &qwen);
+        assert_eq!(&args[4..9], qwen.as_slice());
+        assert_eq!(
+            &args[args.len() - 4..],
+            ["--port", "8000", "--host", "0.0.0.0"]
+        );
+    }
+
     /// Whatever `LLMMAN_*_ARGS` holds, every builder ends with llmman's
     /// `--port` and `--host`.
     #[test]
@@ -1256,7 +1351,14 @@ mod tests {
         }
         for host in ["127.0.0.1", "0.0.0.0"] {
             assert_eq!(
-                tail(vllm_serve_args_from_env("/m", host, 41234, "m", Some(4096))),
+                tail(vllm_serve_args_from_env(
+                    "/m",
+                    host,
+                    41234,
+                    "m",
+                    Some(4096),
+                    &[]
+                )),
                 expect(host)
             );
             assert_eq!(
@@ -1303,7 +1405,7 @@ mod tests {
             );
             assert_eq!(without_dir_and_host(local), without_dir_and_host(container));
         };
-        pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096)));
+        pair(&|dir, host| vllm_serve_args_from_env(dir, host, 8000, "m", Some(4096), &[]));
         pair(&|dir, host| vllm_omni_serve_args_from_env(dir, host, 8000, "m"));
         pair(&|dir, host| sglang_serve_args_from_env(dir, host, 30000, "m", Some(4096)));
     }
@@ -1334,7 +1436,8 @@ mod tests {
                 "127.0.0.1",
                 41234,
                 "m",
-                None
+                None,
+                &[]
             )),
             expected
         );
@@ -1736,5 +1839,29 @@ mod tests {
         std::fs::write(&script, b"\x7fELF\x02\x01\x01").unwrap();
         assert_eq!(console_script_interpreter(&script), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ds4 wins, then the speech worker, then llama-server; the two
+    /// latter follow the runtime, ds4 runs from PATH either way.
+    #[test]
+    fn gguf_arm_picks_ds4_then_speech_then_llama_server_by_runtime() {
+        assert_eq!(gguf_arm(true, false, true), GgufArm::Ds4);
+        assert_eq!(gguf_arm(true, true, false), GgufArm::Ds4);
+        assert_eq!(
+            gguf_arm(false, true, true),
+            GgufArm::Speech { container: true }
+        );
+        assert_eq!(
+            gguf_arm(false, true, false),
+            GgufArm::Speech { container: false }
+        );
+        assert_eq!(
+            gguf_arm(false, false, true),
+            GgufArm::LlamaServer { container: true }
+        );
+        assert_eq!(
+            gguf_arm(false, false, false),
+            GgufArm::LlamaServer { container: false }
+        );
     }
 }

@@ -331,6 +331,28 @@ To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
 flags you type still win. See [launch defaults](docs/configuration.md#launch-defaults).
 
+`--optimizer tk` (`claude` only) compacts the output of the shell commands the agent
+runs (`git status`, `cargo test`, ...) before the agent reads it, preserving
+exit codes and keeping error text; `--optimizer none` is the default and
+changes nothing. See [docs/optimizers.md](docs/optimizers.md).
+
+```
+llmman launch claude --model qwen3.8 --optimizer tk
+```
+
+Claude Code is told the model's context window in
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so it doesn't warn that it doesn't recognize
+the model. llmman sets it when it knows a window for the launched model, the
+session runs that model (no `--model`, an alias, or the same model), and you
+haven't set it yourself.
+
+Codex runs with a profile llmman writes to `~/.codex/llmman.config.toml`,
+keeping what Codex saves there. The project it runs in (its repository root,
+or the directory; `--cd`/`-C` is followed) is marked trusted, so Codex doesn't
+ask every time. That lets Codex load the repository's own `.codex/config.toml`,
+so review a project before launching Codex in it. A decision Codex already has
+for the project, there or in `~/.codex/config.toml`, is kept.
+
 GitHub Copilot uses the standalone `copilot` CLI (`npm install -g
 @github/copilot`) in BYOK mode, so a local-model launch does not
 require a GitHub login.
@@ -410,7 +432,7 @@ so it works from any client on every inference endpoint. Details in
 
 ### Sandboxes
 
-`--sandbox` runs the integration inside a sandbox. It can write to the
+`--sandbox` runs the integration inside a sandbox, `sbx` if none is named. It can write to the
 current Git work tree and to its own settings, but not to the rest of your
 files. Under seatbelt it can also write to the temporary and cache
 directories.
@@ -440,5 +462,6 @@ in [docs/sandbox.md](docs/sandbox.md).
 | [docs/configuration.md](docs/configuration.md) | `llmman.conf`, `llmman config`, registry mirrors, environment variables, store layout |
 | [docs/providers.md](docs/providers.md) | Hosted providers, API keys, and which integrations can use them |
 | [docs/sandbox.md](docs/sandbox.md) | `launch --sandbox`: what each sandbox shares and how it reaches the daemon |
+| [docs/optimizers.md](docs/optimizers.md) | `launch --optimizer`: what `none` and `tk` do, what `tk` filters, and its limits |
 | [docs/verification.md](docs/verification.md) | Signing models and pull-time trust policy |
 | [docs/metrics.md](docs/metrics.md) | The Prometheus `/metrics` families |

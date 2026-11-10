@@ -6,8 +6,8 @@
 
 use anyhow::{bail, Result};
 
-use super::super::backend::{Backend, Ctx, Graph};
-use super::super::ffi::{self, Tensor};
+use super::super::backend::{Backend, Graph};
+use super::super::ffi::Tensor;
 use super::super::weights::Weights;
 use super::{Hparams, Model, VideoLatent};
 
@@ -51,9 +51,15 @@ fn conv3d_nodes(wd: i64, h: i64, c: i64, t: i64) -> usize {
 }
 
 /// 3x3x3 conv, replicate padded in time, as the sum of three 2-D convs over the temporal taps.
-fn conv3d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Result<Tensor> {
-    let [wd, h, c, t] = ffi::shape(x);
-    let nb = ffi::strides(x);
+fn conv3d<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    causal: bool,
+) -> Result<Tensor<'g>> {
+    let [wd, h, c, t] = x.shape();
+    let nb = x.strides();
     let ks = [
         w.get(&format!("{prefix}.weight.t0"))?,
         w.get(&format!("{prefix}.weight.t1"))?,
@@ -75,19 +81,25 @@ fn conv3d(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Result
     }
     let mut y = y.unwrap();
     if let Some(b) = w.opt(&format!("{prefix}.bias")) {
-        y = g.add(y, g.reshape_4d(b, 1, 1, ffi::shape(b)[0], 1));
+        y = g.add(y, g.reshape_4d(b, 1, 1, b.shape()[0], 1));
     }
     Ok(y)
 }
 
 /// Normalize over the channel dim.
-fn pixel_norm(g: &Ctx, x: Tensor) -> Tensor {
+fn pixel_norm<'g>(g: &'g Graph<'g>, x: Tensor<'g>) -> Tensor<'g> {
     let p = g.cont(g.permute(x, 1, 2, 0, 3)); // [C, W, H, T]
     let p = g.rms_norm(p, 1e-8);
     g.cont(g.permute(p, 2, 0, 1, 3))
 }
 
-fn resblock(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Result<Tensor> {
+fn resblock<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    causal: bool,
+) -> Result<Tensor<'g>> {
     let h = g.silu(pixel_norm(g, x));
     let h = conv3d(g, w, &format!("{prefix}.conv1.conv"), h, causal)?;
     let h = g.silu(pixel_norm(g, h));
@@ -96,39 +108,39 @@ fn resblock(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, causal: bool) -> Resu
 }
 
 /// Innermost channel factor `p` into the width: [W, H, p*R, T] -> [p*W, H, R, T]
-fn shuffle_w(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+fn shuffle_w<'g>(g: &'g Graph<'g>, y: Tensor<'g>, p: i64) -> Tensor<'g> {
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w * h, p, c / p, t);
     let v = g.cont(g.permute(v, 1, 0, 2, 3));
     g.reshape_4d(v, p * w, h, c / p, t)
 }
 
 /// Innermost channel factor `p` into the height: [W, H, p*R, T] -> [W, p*H, R, T]
-fn shuffle_h(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+fn shuffle_h<'g>(g: &'g Graph<'g>, y: Tensor<'g>, p: i64) -> Tensor<'g> {
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w, h, p, (c / p) * t);
     let v = g.cont(g.permute(v, 0, 2, 1, 3));
     g.reshape_4d(v, w, p * h, c / p, t)
 }
 
 /// Innermost channel factor `p` into time: [W, H, p*R, T] -> [W, H, R, p*T]
-fn shuffle_t(g: &Ctx, y: Tensor, p: i64) -> Tensor {
-    let [w, h, c, t] = ffi::shape(y);
+fn shuffle_t<'g>(g: &'g Graph<'g>, y: Tensor<'g>, p: i64) -> Tensor<'g> {
+    let [w, h, c, t] = y.shape();
     let v = g.reshape_4d(y, w * h, p, c / p, t);
     let v = g.cont(g.permute(v, 0, 2, 1, 3));
     g.reshape_4d(v, w, h, c / p, p * t)
 }
 
 /// DepthToSpaceUpsample: conv, pixel shuffle (pt, ps, ps), drop the first frame when pt == 2.
-fn upsample(
-    g: &Ctx,
-    w: &Weights,
+fn upsample<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
     prefix: &str,
-    x: Tensor,
+    x: Tensor<'g>,
     pt: i64,
     ps: i64,
     causal: bool,
-) -> Result<Tensor> {
+) -> Result<Tensor<'g>> {
     let mut y = conv3d(g, w, &format!("{prefix}.conv.conv"), x, causal)?;
     // channel index = c*(pt*ps*ps) + t*(ps*ps) + h*ps + w
     if ps > 1 {
@@ -137,8 +149,8 @@ fn upsample(
     }
     if pt > 1 {
         y = shuffle_t(g, y, pt);
-        let [wd, h, c, t] = ffi::shape(y);
-        let nb = ffi::strides(y);
+        let [wd, h, c, t] = y.shape();
+        let nb = y.strides();
         y = g.cont(g.view_4d(y, wd, h, c, t - 1, nb[1], nb[2], nb[3], nb[3]));
     }
     Ok(y)
@@ -171,7 +183,7 @@ fn count_nodes(w: &Weights, lat: &VideoLatent) -> Result<usize> {
     let mut n = 1; // the input
     let conv = |n: &mut usize, prefix: &str, wd, h, c, t| -> Result<i64> {
         *n += conv3d_nodes(wd, h, c, t);
-        Ok(ffi::shape(w.get(&format!("{prefix}.weight.t0"))?)[3])
+        Ok(w.get(&format!("{prefix}.weight.t0"))?.shape()[3])
     };
     c = conv(&mut n, "decoder.conv_in.conv", wd, h, c, t)?;
     for (i, b) in BLOCKS.iter().enumerate() {
@@ -200,9 +212,23 @@ fn count_nodes(w: &Weights, lat: &VideoLatent) -> Result<usize> {
     Ok(n + 8) // unpatchify
 }
 
-/// Builds the decoder graph for one (tile of) latent, returning its output
-/// tensor `[W, H, 3, T]`.
-fn build(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<(Graph, Tensor)> {
+/// A graph sized for the decoder over one (tile of) latent, for
+/// [`build`] to fill; the caller owns it, so it can outlive the build.
+fn new_graph<'o>(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<Graph<'o>> {
+    let w = model
+        .vae
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no video VAE loaded"))?;
+    let nodes = count_nodes(w, lat)?;
+    if nodes + 1024 > be.max_nodes() {
+        bail!("the decoder graph would have {nodes} nodes, more than the scheduler can take");
+    }
+    Graph::new(be.api, nodes + 1024)
+}
+
+/// Builds the decoder for one (tile of) latent on `g` (from
+/// [`new_graph`]), returning the index of its output tensor `[W, H, 3, T]`.
+fn build<'o>(g: &'o Graph<'o>, model: &'o Model, lat: &VideoLatent) -> Result<usize> {
     let hp = &model.hp;
     let w = model
         .vae
@@ -230,13 +256,8 @@ fn build(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<(Graph, Tenso
         }
     }
 
-    let nodes = count_nodes(w, lat)?;
-    if nodes + 1024 > be.max_nodes() {
-        bail!("the decoder graph would have {nodes} nodes, more than the scheduler can take");
-    }
-    let mut g = Graph::new(be.api, nodes + 1024)?;
     let mut cur = g.input_f32(&[wl, hl, c, f], &x, "latent");
-    let ctx = &g.ctx;
+    let ctx = g;
     cur = conv3d(ctx, w, "decoder.conv_in.conv", cur, causal)?;
     for (i, b) in BLOCKS.iter().enumerate() {
         let bp = format!("decoder.up_blocks.{i}");
@@ -256,15 +277,16 @@ fn build(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<(Graph, Tenso
     let p = hp.vae_patch_size;
     cur = shuffle_h(ctx, cur, p);
     cur = shuffle_w(ctx, cur, p);
-    g.mark_output(cur);
-    Ok((g, cur))
+    Ok(g.mark_output(cur))
 }
 
 /// Decodes one (tile of) latent to RGB floats in [-1, 1], frame-major `[f][h][w][3]`.
 fn decode_tile(model: &Model, be: &Backend, lat: &VideoLatent) -> Result<Vec<f32>> {
-    let (g, cur) = build(model, be, lat)?;
+    let g = new_graph(model, be, lat)?;
+    let out = build(&g, model, lat)?;
+    let cur = g.output(out);
     g.compute(be)?;
-    let [ow, oh, oc, of] = ffi::shape(cur);
+    let [ow, oh, oc, of] = cur.shape();
     let (want_f, want_h, want_w) = output_dims(&model.hp, lat);
     if (of, oh, ow, oc) != (want_f, want_h, want_w, 3) {
         bail!("decoder produced {of} frames of {ow}x{oh}x{oc}, expected {want_f} of {want_w}x{want_h}x3");
@@ -561,9 +583,13 @@ pub fn decode(
         for (j, plan) in plans.iter().enumerate() {
             i = j;
             // too many nodes: try the next plan, the last one reports the error
-            let Ok((g, _)) = build(model, be, &plan.largest_tile(lat)) else {
+            let tile = plan.largest_tile(lat);
+            let Ok(g) = new_graph(model, be, &tile) else {
                 continue;
             };
+            if build(&g, model, &tile).is_err() {
+                continue;
+            }
             let need = g.measure(be)?;
             note = format!(" ({} MiB of {} MiB free)", need >> 20, free >> 20);
             if need <= budget {

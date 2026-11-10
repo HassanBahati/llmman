@@ -45,10 +45,12 @@ mod kimi;
 mod omp;
 mod openclaw;
 mod opencode;
+mod optimizer;
 mod pi;
 mod qwen;
 mod sandbox;
 
+pub use optimizer::Optimizer;
 pub use sandbox::Sandbox;
 
 // ---------------------------------------------------------------------------
@@ -82,14 +84,27 @@ pub struct LaunchArgs {
     #[arg(long, value_name = "MODEL")]
     pub overflow_model: Option<String>,
 
-    /// Run the integration in a sandbox. See docs/sandbox.md.
-    #[arg(long, value_enum, value_name = "SANDBOX")]
+    /// Run the integration in a sandbox, sbx unless one is named. See
+    /// docs/sandbox.md.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SANDBOX",
+        num_args = 0..=1,
+        default_missing_value = "sbx"
+    )]
     pub sandbox: Option<Sandbox>,
 
     /// Start at this variant of the model (see `llmman show`), as
     /// opencode's `run --variant`.
     #[arg(long, value_name = "VARIANT", value_parser = super::run::variant_parser())]
     pub variant: Option<String>,
+
+    /// What to launch with to make the session cheaper: none (the default)
+    /// launches as is; tk compacts the output of the shell commands the
+    /// agent runs (claude only). See docs/optimizers.md.
+    #[arg(long, value_enum, value_name = "OPTIMIZER", default_value = "none")]
+    pub optimizer: Optimizer,
 
     /// Extra arguments forwarded to the integration binary (after --)
     #[arg(last = true, value_name = "ARGS")]
@@ -139,6 +154,13 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             "--variant needs the model as llmman's --model, not after --"
         );
         spell_variant(name, variant)?;
+    }
+
+    // Before sbx returns below, which would never reach it, and before the
+    // daemon starts. An unknown name is left to the check that reports it.
+    if let Some(id) = canonical_integration(name) {
+        args.optimizer
+            .check(id, args.sandbox.is_some(), &args.extra_args)?;
     }
 
     // sbx serves the model itself and validates its own flags, so none
@@ -272,10 +294,14 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
             // Resolved once, and only for an integration that has
             // somewhere to put it: reading the live window loads the
             // model (see `local_context_window`), which every other
-            // launch would wait for and never use.
-            let local_window = (declares_context_window(name) && !model.is_empty())
-                .then(|| local_context_window(&model, context_length))
-                .flatten();
+            // launch would wait for and never use. That includes claude
+            // given another model, which drops the window.
+            let local_window = (declares_context_window(name)
+                && !model.is_empty()
+                && (!name.eq_ignore_ascii_case("claude")
+                    || claude::runs_model(&model, &args.extra_args)))
+            .then(|| local_context_window(&model, context_length))
+            .flatten();
             match overflow {
                 // The hosted half is validated and keyed exactly as a
                 // bare --provider model would be, then paired with the
@@ -317,6 +343,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         context_window,
         max_output,
         &args.extra_args,
+        args.optimizer,
     )
 }
 
@@ -572,7 +599,7 @@ const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
 fn declares_context_window(integration: &str) -> bool {
     matches!(
         integration.to_lowercase().as_str(),
-        "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
+        "claude" | "opencode" | "codex" | "pi" | "omp" | "kimi" | "openclaw"
     )
 }
 
@@ -880,7 +907,7 @@ fn print_integrations() {
         println!("  {:<14} {}{}", i.name, i.description, how);
     }
     println!(
-        "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox <sandbox>]"
+        "\nUsage: llmman launch <integration> [--model <model>] [--provider <provider>] [--sandbox [sandbox]]"
     );
     println!("       llmman providers   (the providers --provider accepts)");
 }
@@ -1133,6 +1160,7 @@ fn launch(
     context_window: Option<u64>,
     max_output: Option<u32>,
     extra_args: &[String],
+    optimizer: Optimizer,
 ) -> anyhow::Result<()> {
     let name = name.to_lowercase();
     // Unknown levels are a guess: add the one asked for, don't refuse it.
@@ -1163,7 +1191,7 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => claude::launch_claude(model, api_key, extra_args),
+        "claude" => claude::launch_claude(model, api_key, context_window, extra_args, optimizer),
         "opencode" => opencode::launch_opencode(
             model,
             api_key,
@@ -1844,7 +1872,8 @@ mod tests {
         assert!(declares_context_window("omp"));
         assert!(declares_context_window("kimi"));
         assert!(declares_context_window("openclaw"));
-        assert!(!declares_context_window("claude"));
+        // claude is told it through CLAUDE_CODE_MAX_CONTEXT_TOKENS
+        assert!(declares_context_window("claude"));
         assert!(!declares_context_window("aider"));
     }
 
@@ -2112,6 +2141,137 @@ mod tests {
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("openshell cannot run opencode"), "{err}");
+    }
+
+    /// A bare `--sandbox` is `--sandbox sbx`, and a named one is kept.
+    #[test]
+    fn a_bare_sandbox_is_sbx() {
+        assert_eq!(launch_args(&["claude"]).sandbox, None);
+        assert_eq!(
+            launch_args(&["claude", "--sandbox"]).sandbox,
+            Some(Sandbox::Sbx)
+        );
+        assert_eq!(
+            launch_args(&["claude", "--sandbox", "docker"]).sandbox,
+            Some(Sandbox::Docker)
+        );
+        // Another flag after a bare one is not taken as its value.
+        let args = launch_args(&["claude", "--sandbox", "--model", "qwen3.8", "--", "hi"]);
+        assert_eq!(args.sandbox, Some(Sandbox::Sbx));
+        assert_eq!(args.model.as_deref(), Some("qwen3.8"));
+        assert_eq!(args.extra_args, ["hi"]);
+    }
+
+    /// `--optimizer` defaults to none, and takes none or tk.
+    #[test]
+    fn the_optimizer_defaults_to_none_and_takes_none_or_tk() {
+        assert_eq!(launch_args(&["claude"]).optimizer, Optimizer::None);
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "none"]).optimizer,
+            Optimizer::None
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer", "tk"]).optimizer,
+            Optimizer::Tk
+        );
+        assert_eq!(
+            launch_args(&["claude", "--optimizer=tk", "--", "-p", "hi"]).optimizer,
+            Optimizer::Tk
+        );
+        // The flag is not an alias for anything after `--`.
+        let args = launch_args(&["claude", "--", "--optimizer", "tk"]);
+        assert_eq!(args.optimizer, Optimizer::None);
+        assert_eq!(args.extra_args, ["--optimizer", "tk"]);
+    }
+
+    #[test]
+    fn a_bad_optimizer_is_rejected_by_the_parser() {
+        #[derive(clap::Parser, Debug)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        for bad in ["TK", "turbo", "", "none,tk"] {
+            let err = <Cli as clap::Parser>::try_parse_from(["l", "claude", "--optimizer", bad])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--optimizer"), "{bad}: {err}");
+        }
+        // The help says what each choice does.
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--optimizer <OPTIMIZER>"), "{help}");
+        assert!(help.contains("none"), "{help}");
+        assert!(help.contains("tk"), "{help}");
+        assert!(help.contains("[default: none]"), "{help}");
+    }
+
+    /// The refusals are `run`'s own errors, so the daemon is never started
+    /// and no model is pulled: a launch that got past them would try both.
+    #[test]
+    fn tk_is_refused_for_other_integrations_before_anything_starts() {
+        for name in [
+            "opencode",
+            "codex",
+            "aider",
+            "goose",
+            "cline",
+            "gemini",
+            "docker-agent",
+            "copilot-cli",
+        ] {
+            let args = launch_args(&[name, "--model", "m", "--optimizer", "tk"]);
+            let err = run(&args).unwrap_err().to_string();
+            let canonical = canonical_integration(name).unwrap();
+            assert!(
+                err.contains(&format!("does not work with {canonical}")),
+                "{name}: {err}"
+            );
+            assert!(err.contains("only claude can use it"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn tk_is_refused_with_a_sandbox_before_sbx_is_reached() {
+        for sandbox in [
+            &["--sandbox"][..],
+            &["--sandbox", "sbx"],
+            &["--sandbox", "docker"],
+        ] {
+            let mut argv = vec!["claude", "--model", "m", "--optimizer", "tk"];
+            argv.extend_from_slice(sandbox);
+            let err = run(&launch_args(&argv)).unwrap_err().to_string();
+            assert!(
+                err.contains("--optimizer tk does not work with --sandbox"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tk_is_refused_beside_claude_flags_it_cannot_honor() {
+        let args = launch_args(&[
+            "claude",
+            "--model",
+            "m",
+            "--optimizer",
+            "tk",
+            "--",
+            "--settings",
+            "mine.json",
+        ]);
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("--settings"), "{err}");
+    }
+
+    /// The optimizer is not one of the flags `[launch.<integration>]` fills.
+    #[test]
+    fn configured_defaults_leave_the_optimizer_alone() {
+        let (args, _) = applied(&["claude", "--optimizer", "tk"], &sonnet());
+        assert_eq!(args.optimizer, Optimizer::Tk);
+        let (args, _) = applied(&["claude"], &sonnet());
+        assert_eq!(args.optimizer, Optimizer::None);
     }
 
     /// `llmman launch <argv...>` as the command line parses it.

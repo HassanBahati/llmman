@@ -7,7 +7,7 @@
 use anyhow::{bail, Result};
 
 use super::Hparams;
-use crate::mediagen::backend::{Backend, Ctx, Graph};
+use crate::mediagen::backend::{Backend, Graph};
 use crate::mediagen::ffi::{self, Tensor};
 use crate::mediagen::ltx::rms;
 use crate::mediagen::weights::Weights;
@@ -123,11 +123,17 @@ pub fn timestep_embedding(t: f32) -> Vec<f32> {
 }
 
 /// Rotate-half RoPE on `x: [n_heads * hd, T]` with a `[hd/2, T]` table shared by all heads.
-pub fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+pub fn rope<'g>(
+    g: &'g Graph<'g>,
+    x: Tensor<'g>,
+    cos: Tensor<'g>,
+    sin: Tensor<'g>,
+    n_heads: i64,
+) -> Tensor<'g> {
+    let [dim, t, ..] = x.shape();
     let hd = dim / n_heads;
     let x4 = g.reshape_4d(g.cont(x), hd / 2, 2, n_heads, t);
-    let nb = ffi::strides(x4);
+    let nb = x4.strides();
     let x1 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], 0));
     let x2 = g.cont(g.view_4d(x4, hd / 2, 1, n_heads, t, nb[1], nb[2], nb[3], nb[1]));
     let c = g.reshape_4d(cos, hd / 2, 1, 1, t);
@@ -138,27 +144,33 @@ pub fn rope(g: &Ctx, x: Tensor, cos: Tensor, sin: Tensor, n_heads: i64) -> Tenso
 }
 
 /// RMSNorm over each head of `x: [n_heads * head_dim, T]` with a `[head_dim]` weight.
-pub fn head_rms(g: &Ctx, x: Tensor, hd: i64, eps: f32, w: Option<Tensor>) -> Tensor {
-    let [dim, t, ..] = ffi::shape(x);
+pub fn head_rms<'g>(
+    g: &'g Graph<'g>,
+    x: Tensor<'g>,
+    hd: i64,
+    eps: f32,
+    w: Option<Tensor<'g>>,
+) -> Tensor<'g> {
+    let [dim, t, ..] = x.shape();
     let x3 = g.reshape_3d(g.cont(x), hd, dim / hd, t);
     let y = rms(g, x3, eps, w);
     g.reshape_2d(y, dim, t)
 }
 
 /// Grouped-query attention: q `[n_heads*hd, Tq]`, k/v `[n_kv*hd, Tk]` -> `[n_heads*hd, Tq]`.
-pub fn sdpa_gqa(
-    g: &Ctx,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+pub fn sdpa_gqa<'g>(
+    g: &'g Graph<'g>,
+    q: Tensor<'g>,
+    k: Tensor<'g>,
+    v: Tensor<'g>,
     n_heads: i64,
     n_kv: i64,
-    mask: Option<Tensor>,
+    mask: Option<Tensor<'g>>,
     flash: bool,
-) -> Tensor {
-    let tq = ffi::shape(q)[1];
-    let tk = ffi::shape(k)[1];
-    let hd = ffi::shape(q)[0] / n_heads;
+) -> Tensor<'g> {
+    let tq = q.shape()[1];
+    let tk = k.shape()[1];
+    let hd = q.shape()[0] / n_heads;
     let scale = 1.0 / (hd as f32).sqrt();
     let q3 = g.permute(g.reshape_3d(g.cont(q), hd, n_heads, tq), 0, 2, 1, 3);
     let k3 = g.permute(g.reshape_3d(g.cont(k), hd, n_kv, tk), 0, 2, 1, 3);
@@ -166,20 +178,26 @@ pub fn sdpa_gqa(
         let v3 = g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 0, 2, 1, 3);
         let k3 = g.cast(k3, ffi::ty::F16);
         let v3 = g.cast(v3, ffi::ty::F16);
-        let cur = g.flash_attn_ext(q3, k3, v3, std::ptr::null_mut(), scale, 0.0, 0.0);
-        unsafe { (g.api.ggml_flash_attn_ext_set_prec)(cur, ffi::GGML_PREC_F32) };
+        let cur = g.flash_attn_ext(q3, k3, v3, None, scale, 0.0, 0.0);
+        unsafe { (g.api().ggml_flash_attn_ext_set_prec)(cur.as_ptr(), ffi::GGML_PREC_F32) };
         g.reshape_2d(cur, hd * n_heads, tq)
     } else {
         let v3 = g.cont(g.permute(g.reshape_3d(g.cont(v), hd, n_kv, tk), 1, 2, 0, 3));
         let kq = g.mul_mat(k3, q3);
-        let kq = g.soft_max_ext(kq, mask.unwrap_or(std::ptr::null_mut()), scale, 0.0);
+        let kq = g.soft_max_ext(kq, mask, scale, 0.0);
         let kqv = g.mul_mat(v3, kq);
         g.cont_2d(g.permute(kqv, 0, 2, 1, 3), hd * n_heads, tq)
     }
 }
 
 /// `Cosmos3VLTextMLP`: `down(silu(gate) * up)` or `down(relu(up)^2)`.
-fn mlp(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, relu2: bool) -> Result<Tensor> {
+fn mlp<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
+    prefix: &str,
+    x: Tensor<'g>,
+    relu2: bool,
+) -> Result<Tensor<'g>> {
     let up = g.linear(x, w.get(&format!("{prefix}.up_proj.weight"))?, None);
     let h = if relu2 {
         g.sqr(g.clamp(up, 0.0, f32::INFINITY))
@@ -193,13 +211,13 @@ fn mlp(g: &Ctx, w: &Weights, prefix: &str, x: Tensor, relu2: bool) -> Result<Ten
 /// The Qwen3-VL text decoder over `ids`, calling `on_layer(graph, k, v)` with
 /// every layer's keys (normed for the generation stream, roped) and values;
 /// returns the last layer's output, before the final norm.
-fn text_decoder(
+fn text_decoder<'g>(
     hp: &Hparams,
-    w: &Weights,
-    gr: &mut Graph,
+    w: &'g Weights,
+    gr: &'g Graph<'g>,
     ids: &[u32],
-    mut on_layer: impl FnMut(&Graph, Tensor, Tensor),
-) -> Result<Tensor> {
+    mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
+) -> Result<Tensor<'g>> {
     let n = ids.len() as i64;
     if n == 0 || n > MAX_PROMPT_TOKENS {
         bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
@@ -212,7 +230,7 @@ fn text_decoder(
     let sin_t = gr.input_f32(&[half, n], &sin, "sin");
     let mask_t = gr.input_f32(&[n, n], &causal_mask(n), "mask");
 
-    let g = &gr.ctx;
+    let g = &gr;
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     let mut x = g.get_rows(w.get("embed_tokens.weight")?, ids_t);
@@ -277,16 +295,16 @@ pub fn causal_mask(n: i64) -> Vec<f32> {
     mask
 }
 
-fn text_graph(be: &Backend, hp: &Hparams) -> Result<Graph> {
+fn text_graph<'o>(be: &Backend, hp: &Hparams) -> Result<Graph<'o>> {
     Graph::new(be.api, 4 * 1024 + hp.n_layers as usize * 96)
 }
 
 /// The understanding stream over the prompt tokens.
 pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<UndCache> {
-    let mut gr = text_graph(be, hp)?;
+    let gr = text_graph(be, hp)?;
     let (mut ks, mut vs) = (Vec::new(), Vec::new());
-    text_decoder(hp, w, &mut gr, ids, |gr, k, v| {
-        let (k, v) = (gr.ctx.cont(k), gr.ctx.cont(v));
+    text_decoder(hp, w, &gr, ids, |gr, k, v| {
+        let (k, v) = (gr.cont(k), gr.cont(v));
         gr.mark_output(k);
         gr.mark_output(v);
         ks.push(k);
@@ -302,9 +320,9 @@ pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
 
 /// A Qwen3-VL text model's last hidden states `[n][hidden]`, before the final norm.
 pub fn text_hidden(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<Vec<f32>> {
-    let mut gr = text_graph(be, hp)?;
-    let x = text_decoder(hp, w, &mut gr, ids, |_, _, _| {})?;
-    let x = gr.ctx.cont(x);
+    let gr = text_graph(be, hp)?;
+    let x = text_decoder(hp, w, &gr, ids, |_, _, _| {})?;
+    let x = gr.cont(x);
     gr.mark_output(x);
     gr.compute(be)?;
     Ok(gr.output_f32(x))
@@ -342,14 +360,14 @@ pub struct GenOutputs {
 }
 
 /// `DomainAwareLinear`: one domain's weight `[in, out]` and bias `[out]` from the embedding tables.
-fn domain_linear(
-    g: &Ctx,
-    w: &Weights,
+fn domain_linear<'g>(
+    g: &'g Graph<'g>,
+    w: &'g Weights,
     prefix: &str,
-    domain: Tensor,
+    domain: Tensor<'g>,
     n_in: i64,
     n_out: i64,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<(Tensor<'g>, Tensor<'g>)> {
     let row = g.get_rows(w.get(&format!("{prefix}.fc.weight"))?, domain); // [in*out, 1]
                                                                           // the row is `[in][out]` (out fastest); mul_mat wants `[in, out]` in ggml order
     let wt = g.cont(g.transpose(g.reshape_2d(row, n_out, n_in)));
@@ -364,7 +382,7 @@ pub fn gen_forward(hp: &Hparams, w: &Weights, be: &Backend, inp: &GenInputs) -> 
     let ns = inp.sound.as_ref().map_or(0, |s| s.n);
     let na = inp.action.as_ref().map_or(0, |(s, _)| s.n);
     let n = nv + ns + na;
-    let mut gr = Graph::new(be.api, 4 * 1024 + hp.n_layers as usize * 128)?;
+    let gr = Graph::new(be.api, 4 * 1024 + hp.n_layers as usize * 128)?;
     let half = hp.head_dim / 2;
     let v_tok = gr.input_f32(&[hp.patch_dim, nv], inp.vision.tokens, "vision");
     let s_tok = inp
@@ -410,7 +428,7 @@ pub fn gen_forward(hp: &Hparams, w: &Weights, be: &Backend, inp: &GenInputs) -> 
         .map(|l| gr.input_f32(&[kv_dim, nt], &inp.und.v[l], &format!("und_v{l}")))
         .collect();
 
-    let g = &gr.ctx;
+    let g = &gr;
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     // embed every modality, then pack them in order: vision, sound, action
@@ -512,7 +530,7 @@ pub fn gen_forward(hp: &Hparams, w: &Weights, be: &Backend, inp: &GenInputs) -> 
         x = g.add(x, mlp(g, w, &format!("{p}.mlp_moe_gen"), h2, hp.relu2)?);
     }
     let out = g.cont(rms(g, x, eps, Some(w.get("norm_moe_gen.weight")?)));
-    let nb = ffi::strides(out);
+    let nb = out.strides();
     let part = |off: i64, len: i64| g.view_2d(out, hp.hidden, len, nb[1], (off as usize) * nb[1]);
     let v_out = g.cont(g.linear(
         part(0, nv),
